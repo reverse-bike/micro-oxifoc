@@ -1,0 +1,28 @@
+[mcp_servers.binja]
+url = "http://127.0.0.1:42069/mcp"
+bearer_token_env_var = "BINJA_MCP_TOKEN"
+
+[mcp_servers.binja.tools.binja_guide]
+approval_mode = "approve"
+
+[mcp_servers.binja.tools.define_lib_function]
+approval_mode = "approve"
+
+[mcp_servers.binja.tools.list_lib_functions]
+approval_mode = "approve"
+
+[mcp_servers.binja.tools.execute]
+approval_mode = "approve"
+
+[mcp_servers.binja.tools.remove_lib_function]
+approval_mode = "approve"
+
+[mcp_servers.binja.tools.rebase_view]
+approval_mode = "approve"
+
+
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+network_access = true

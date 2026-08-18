@@ -6,10 +6,10 @@ description = "Platform-agnostic FOC (Field-Oriented Control) algorithms and mot
 
 [dependencies]
 # Math library for no_std (sin, cos, sqrt, etc)
-libm = { version = "0.2.16", default-features = false }
+libm = { version = "0.2.16", default-features = false, optional = true }
 
 # no_std data structures
-heapless = { version = "0.9", default-features = false, features = ["serde"] }
+heapless = { version = "0.9", default-features = false, features = ["serde"], optional = true }
 
 # Optional defmt support for embedded logging
 defmt = { version = "1.1", optional = true }
@@ -25,9 +25,9 @@ microfft = { version = "0.6", default-features = false, features = ["size-32"], 
 # Optional persistent storage
 sequential-storage = { version = "8.0", default-features = false, features = ["postcard"], optional = true }
 
-# Serialization (always required for shared types)
-serde = { version = "1.0", default-features = false, features = ["derive"] }
-postcard-schema = { version = "0.2.5", features = ["derive", "heapless-v0_9"] }
+# Serialization for the floating-point runtime and shared protocol types
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+postcard-schema = { version = "0.2.5", features = ["derive", "heapless-v0_9"], optional = true }
 
 # Ergot protocol framework (for icd feature)
 ergot = { workspace = true, optional = true }
@@ -45,7 +45,7 @@ embedded-io-async = { version = "0.7", optional = true }
 # Lock-free queue for ISR → async telemetry transfer (runtime feature)
 bbqueue = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
-bitflags = { version = "2", default-features = false, features = ["serde"] }
+bitflags = { version = "2", default-features = false, features = ["serde"], optional = true }
 embedded-storage-async = { version = "0.4", optional = true }
 cortex-m = { version = "0.7.8", optional = true }
 dsp-fixedpoint = { version = "0.2.1", default-features = false, optional = true }
@@ -62,10 +62,15 @@ path = "src/lib.rs"
 [features]
 default = ["algorithms", "detection", "offset-diagnostics"]
 
+# Allocation-free Q16.16 instantiation of the shared generic FOC path. Device
+# crates select this without the async runtime, protocol, storage, or motor
+# detection features.
+fixed-point = []
+
 # Runtime current-offset comparison (undriven / per-phase / all-phases).
 # Boot calibration remains unconditional; flash-tight devices can omit this
 # host-triggered path and enable it only in a bench build.
-offset-diagnostics = []
+offset-diagnostics = ["algorithms"]
 
 # Motor parameter detection: R/L/λ measurement sweeps, HFI inductance (FFT),
 # voltage-pulse fallback and the shared async detect
@@ -82,13 +87,13 @@ detection = ["algorithms", "dep:embassy-futures"]
 # size-optimized device crates, where opt-level "z" machine-outlines the
 # ISR into cross-calls and memcpy'd struct returns (tier-3 PC sampling,
 # 2026-07-07). Device crates enable this; host builds don't need it.
-isr-speed = []
+isr-speed = ["algorithms"]
 
 # Bench estimator forensics: repurpose three fast-frame columns with
 # observer internals (velocity/erpm <- PLL omega-hat, angle <- phase_pll,
 # vd <- instantaneous PLL error). Wire format unchanged — the capture just
 # has to be read with the mapping in mind. Debug builds only.
-obs-debug-telem = []
+obs-debug-telem = ["algorithms"]
 
 # Runtime HFI sensorless observer (carrier injection + synchronous demod for
 # low/zero-speed commutation on salient motors). Independent of `hfi-detect`
@@ -96,7 +101,7 @@ obs-debug-telem = []
 # (drone ESCs like B-G431B-ESC1) — the `PhaseSource` enum keeps its Hfi*
 # variants for wire compatibility, but commanding one is rejected at runtime
 # (`PhaseSourceError::HfiNotConfigured`).
-hfi = []
+hfi = ["algorithms"]
 
 # HFI-based inductance/saliency detection: rotating HF injection + FFT
 # (microfft). Builds on `detection`. When off, `measure_inductance_auto`
@@ -112,7 +117,7 @@ hfi-detect = ["detection", "dep:microfft"]
 impedance-sweep = ["hfi-detect"]
 
 # Interface Control Document - ergot endpoints and wire types
-icd = ["dep:ergot"]
+icd = ["algorithms", "dep:ergot"]
 
 # Delivery semantics — typed at-most/at-least/effectively-once ladder over ergot.
 # Contract + pure retry policy + server-side dedup. The client driver is generic
@@ -120,13 +125,18 @@ icd = ["dep:ergot"]
 # embassy-futures is used only for its runtime-agnostic `select` (per-attempt timeout).
 delivery = ["icd", "dep:embassy-futures"]
 
-# FOC algorithms (transforms, SVPWM, PI controllers, etc.)
-# This is the core motor control math, no extra dependencies
-algorithms = []
+# Floating-point FOC stack (drivers, estimators, transforms, protocols, etc.)
+algorithms = [
+    "dep:bitflags",
+    "dep:heapless",
+    "dep:libm",
+    "dep:postcard-schema",
+    "dep:serde",
+]
 
 # Pod (bytemuck) views of the wire types — FastTelemetry raw-byte batches.
 # Host crates that only decode telemetry want this without the whole runtime.
-pod = ["dep:bytemuck"]
+pod = ["algorithms", "dep:bytemuck"]
 
 # Async runtime with state management and protocol servers
 # Requires icd for endpoints and algorithms for control logic
@@ -134,26 +144,26 @@ runtime = ["icd", "algorithms", "pod", "dep:embassy-sync", "dep:embassy-futures"
 
 # Virtual motor simulation for testing without hardware
 # Useful for host-side integration tests and GUI simulation mode
-virtual-motor = []
+virtual-motor = ["algorithms"]
 
 # std support (enables std-dependent features)
 std = ["critical-section?/std"]
 
 # defmt support for embedded logging
-defmt = ["dep:defmt", "heapless/defmt"]
+defmt = ["algorithms", "dep:defmt", "heapless/defmt"]
 # Per-section DWT cycle counters inside the shared ISR path (run_foc_cycle /
 # FocDriver::step) — device-only (reads the Cortex-M DWT directly). ~30
 # cycles of overhead per ISR; the platform stats task reports the sums.
-isr-profiling = ["dep:cortex-m"]
+isr-profiling = ["algorithms", "dep:cortex-m"]
 
 # log crate support for std logging
 log = ["dep:log"]
 
 # Persistent configuration storage
-storage = ["dep:sequential-storage", "dep:embedded-storage-async"]
+storage = ["algorithms", "dep:sequential-storage", "dep:embedded-storage-async"]
 
 # Embassy async support (timer, current sensor calibration, hall state management)
-embassy = ["dep:embassy-time", "dep:embassy-sync", "dep:critical-section"]
+embassy = ["algorithms", "dep:embassy-time", "dep:embassy-sync", "dep:critical-section"]
 
 # Embassy HAL support (UART I/O wrappers, requires embassy-stm32 chip feature from consuming crate)
 embassy-hal = ["embassy", "dep:embassy-stm32", "dep:embedded-io-async"]

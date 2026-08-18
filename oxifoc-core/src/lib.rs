@@ -11,7 +11,8 @@
 //!
 //! ## Feature Flags
 //!
-//! - **`algorithms`** (default): FOC math algorithms
+//! - **`algorithms`** (default): floating-point FOC, drivers, and phase estimators
+//! - **`fixed-point`**: synchronous shared FOC instantiated with Q16.16 values
 //! - **`icd`**: Interface Control Document with ergot endpoints
 //! - **`runtime`**: Async runtime with servers
 //! - **`virtual-motor`**: Motor simulation for testing
@@ -31,14 +32,21 @@
 //! oxifoc-core = { version = "0.1", features = ["runtime", "defmt"] }
 //! ```
 //!
+//! ### Flash-constrained synchronous firmware
+//! ```toml
+//! oxifoc-core = { version = "0.1", default-features = false, features = ["fixed-point"] }
+//! ```
+//!
 //! ### Testing with virtual motor
 //! ```toml
 //! oxifoc-core = { version = "0.1", features = ["virtual-motor"] }
 //! ```
 //!
-//! ## FOC Algorithm Example
+//! ## Floating-point FOC Algorithm Example
 //!
 //! ```rust
+//! # #[cfg(feature = "algorithms")]
+//! # {
 //! use oxifoc_core::foc::{transforms, svpwm, pi_controller::PIController};
 //!
 //! // Example: Current control loop
@@ -67,6 +75,7 @@
 //! let (v_alpha, v_beta) = transforms::inverse_park(vd, vq, sin_theta, cos_theta);
 //! let duties = svpwm::space_vector_pwm(v_alpha, v_beta, max_duty);
 //! assert_eq!(duties.len(), 3);
+//! # }
 //! ```
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
@@ -96,15 +105,19 @@
 
 /// Logging macros abstraction (defmt/log/none)
 #[macro_use]
+#[cfg(feature = "algorithms")]
 mod fmt;
 
 /// Timer abstraction for async delays
+#[cfg(feature = "algorithms")]
 pub mod timer;
 
 /// Per-section ISR cycle profiling (feature `isr-profiling`, device-only)
+#[cfg(feature = "algorithms")]
 pub mod isr_prof;
 
 /// High-level motor driver combining FOC with sensors and PWM
+#[cfg(feature = "algorithms")]
 pub mod motor;
 
 /// Race-free clear of selected **rc_w0** status flags (STM32 `TIMx_SR` and
@@ -151,6 +164,7 @@ macro_rules! clear_rc_w0 {
 /// - Motor state and control types (MotorState, ControlMode)
 /// - Telemetry types (HallSensorData, AdcSample, MotorStatus)
 /// - Device info and events
+#[cfg(feature = "algorithms")]
 pub mod types;
 
 /// Interface Control Document with ergot endpoints (requires `icd` feature)
@@ -198,12 +212,14 @@ pub mod runtime;
 
 /// Field-Oriented Control algorithms
 pub mod foc {
+    #[cfg(feature = "algorithms")]
     use core::f32::consts::TAU;
 
     /// Panic-free f32 clamp. Equivalent to `f32::clamp()` but without the
     /// `debug_assert!(min <= max)` that pulls in `core::fmt::float` (~4KB)
     /// when `opt-level = "z"` changes inlining decisions.
     #[inline(always)]
+    #[cfg(feature = "algorithms")]
     pub fn clamp_f32(val: f32, min: f32, max: f32) -> f32 {
         if val < min {
             min
@@ -223,6 +239,7 @@ pub mod foc {
     /// ~100+ cycles — 2026-07-06 ISR PC-profiling caught it at ~1% of the
     /// whole CPU) only runs for arbitrary out-of-range inputs.
     #[inline]
+    #[cfg(feature = "algorithms")]
     pub fn wrap_angle(angle: f32) -> f32 {
         let mut a = angle;
         if !(-TAU..=TAU).contains(&a) {
@@ -245,6 +262,7 @@ pub mod foc {
     /// `libm::remainderf` (which cost ~1% of the ISR CPU) stays as the cold
     /// fallback for arbitrary inputs.
     #[inline]
+    #[cfg(feature = "algorithms")]
     pub fn angle_difference(a: f32, b: f32) -> f32 {
         let mut diff = a - b;
         if !(-TAU..=TAU).contains(&diff) {
@@ -259,73 +277,132 @@ pub mod foc {
         diff
     }
 
+    /// Scalar and angle backends for shared FOC algorithms.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod numeric;
+
+    /// Generic αβ/dq vectors and concrete PWM compares.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod control_types;
+
+    /// Electrical-angle trigonometry backends.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod angle;
+
+    /// Per-control-period PI law used by the compact controller.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod discrete_pi;
+
+    /// Shared compact current-loop controller.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod kernel;
+
+    /// Undriven current-offset drift tracker.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod offset_tracker;
+
+    /// Cycle-counted target slew limiter.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod ramp;
+
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub use control_types::{AlphaBeta, Dq, PwmDuty};
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub use discrete_pi::Pi;
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub use kernel::FocKernel;
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub use numeric::{Fixed, Scalar};
+
     /// Board configuration and ADC utilities
+    #[cfg(feature = "algorithms")]
     pub mod config;
 
     /// Mathematical constants (√3, 1/√3, etc.)
+    #[cfg(feature = "algorithms")]
     pub mod constants;
 
     /// High-level FOC control loop
+    #[cfg(feature = "algorithms")]
     pub mod controller;
 
     /// Fault registry shared across targets
+    #[cfg(feature = "algorithms")]
     pub mod fault;
 
     /// Shunt resistor current sensing
+    #[cfg(feature = "algorithms")]
     pub mod current_sense;
 
     /// ISR-owned current-sensor offset calibration
+    #[cfg(feature = "algorithms")]
     pub mod current_offset;
 
     /// Phase-terminal voltage sensing (back-EMF / undriven rotation detection)
+    #[cfg(feature = "algorithms")]
     pub mod phase_voltage;
 
     /// Sector-based phase current reconstruction for unipolar shunt sensing
+    #[cfg(feature = "algorithms")]
     pub mod current_reconstruction;
 
     /// Hall sensor calibration algorithm
+    #[cfg(feature = "algorithms")]
     pub mod hall_calibration;
 
     /// Hall sensor angle estimation
+    #[cfg(feature = "algorithms")]
     pub mod hall_sensor;
 
     /// PI controller with anti-windup
+    #[cfg(feature = "algorithms")]
     pub mod pi_controller;
 
     /// Phase PWM trait for platform drivers
+    #[cfg(feature = "algorithms")]
     pub mod pwm;
 
     /// Sensor trait definitions (CurrentSensor, AngleSensor)
+    #[cfg(feature = "algorithms")]
     pub mod sensors;
 
     /// Space Vector PWM modulation
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod svpwm;
 
     /// Coordinate transformations (Clarke, Park, and their inverses)
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod transforms;
 
     /// Fast-telemetry fixed-point codec + shared raw→engineering enrichment
+    #[cfg(feature = "algorithms")]
     pub mod telemetry;
 
     /// Fast hot-path scalar math (hardware sqrt, polynomial atan2)
+    #[cfg(feature = "algorithms")]
     pub mod fast_math;
 
     /// Trigonometric abstractions (SinCos trait, q1.31 helpers for CORDIC)
+    #[cfg(feature = "algorithms")]
     pub mod trig;
 
     /// Velocity control loop building block (slew-limited reference + PI)
+    #[cfg(feature = "algorithms")]
     pub mod velocity;
 
     /// Motor parameter detection (R, L, λ)
+    #[cfg(feature = "algorithms")]
     pub mod detection;
 
     /// Phase management (PhaseProvider, PhaseManager, Observer)
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod phase;
 
     /// Shared Hall sensor state management for embassy-based platforms
-    #[cfg(feature = "embassy")]
+    #[cfg(all(feature = "algorithms", feature = "embassy"))]
     pub mod hall_embassy;
 
     /// 16-bit timer capture → 64-bit timestamp extension (hall edge timebase)
+    #[cfg(feature = "algorithms")]
     pub mod capture_timebase;
 }

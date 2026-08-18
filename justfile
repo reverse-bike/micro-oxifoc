@@ -1,10 +1,7 @@
 # oxifoc — FOC motor controller monorepo
 
 # Device firmware crates (excluded from workspace, different toolchain)
-device_crates := "oxifoc-g474 oxifoc-f405 oxifoc-bridge oxifoc-remote"
-
-# On-target test crates (run on hardware; compiled here so they don't rot)
-target_test_crates := "tests/stm32g474 tests/stm32f405"
+device_crates := "oxifoc-f103 oxifoc-bridge oxifoc-remote"
 
 # Run all checks (fmt, clippy, tests — workspace + device crates)
 check:
@@ -23,6 +20,8 @@ check-host:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     echo "tests (workspace)..."
     output=$(cargo test --workspace --quiet 2>&1) || { echo "$output"; exit 1; }
+    echo "oxifoc-core fixed-point slice..."
+    cargo test -p oxifoc-core --quiet --no-default-features --features fixed-point
     echo "oxifoc-core without detection (gate must not rot)..."
     # clippy, not check: the embassy-gated modules are compiled ONLY in this
     # slice (no workspace member enables the feature), so this is their one
@@ -39,21 +38,12 @@ check-device:
         echo "$crate: fmt + clippy + build..."
         (cd "$crate" && cargo fmt --check) || exit 1
         (cd "$crate" && cargo clippy --quiet -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
-        if [ "$crate" = "oxifoc-f405" ]; then
-            (cd "$crate" && cargo build --release --quiet --target-dir target/cf2 2>&1 | filter) || exit 1
+        if [ "$crate" = "oxifoc-f103" ]; then
+            (cd "$crate" && cargo build --release --quiet --features firmware 2>&1 | filter) || exit 1
         else
             (cd "$crate" && cargo build --release --quiet 2>&1 | filter) || exit 1
         fi
     done
-    for crate in {{ target_test_crates }}; do
-        echo "$crate: fmt + compile..."
-        (cd "$crate" && cargo fmt --check) || exit 1
-        (cd "$crate" && cargo build --tests --quiet 2>&1 | filter) || exit 1
-    done
-    # The second F405 board must not rot. Keep board artifacts in separate
-    # directories so no ELF path silently changes electrical meaning.
-    echo "oxifoc-f405 (vesc6-mk5): build..."
-    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/vesc6-mk5 --no-default-features --features transport-usb,transport-uart,board-vesc6-mk5 2>&1 | filter) || exit 1
 
 # Format all code (workspace + device crates)
 fmt:
@@ -61,42 +51,39 @@ fmt:
     set -euo pipefail
     echo "rustfmt..."
     cargo fmt --all
-    for crate in {{ device_crates }} {{ target_test_crates }}; do
+    for crate in {{ device_crates }}; do
         (cd "$crate" && cargo fmt)
     done
 
 # Run workspace tests
 test:
     cargo test --workspace
+    cargo test -p oxifoc-core --no-default-features --features fixed-point
     # HFI is behind features that are off by default; this pass runs the
     # `hfi`/`hfi-detect`-gated tests (g474/f405 config).
     cargo test -p oxifoc-core --features runtime,virtual-motor,storage,std,delivery,hfi,hfi-detect
 
-# Build STM32G474 firmware.
-build-g474:
-    cd oxifoc-g474 && cargo build --release
+# Build the STM32F103 firmware.
+build-f103:
+    cd oxifoc-f103 && command cargo build --release --features firmware
 
-# Build and flash STM32G474 firmware.
-flash-g474:
-    cd oxifoc-g474 && cargo run --release
+# Build the exact 26,200-byte image consumed by the resident CAN bootloader.
+image-f103: build-f103
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
+    llvm_objcopy="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objcopy"
+    elf=oxifoc-f103/target/thumbv7m-none-eabi/release/oxifoc-f103
+    image="$elf.flash-region.bin"
+    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x08009e58 "$elf" "$image"
+    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
+    echo "$image: 26,200 bytes"
 
-# Build Cheap FOCer 2 firmware (explicit board selection; no F405 default).
-build-f405-cf2:
-    cd oxifoc-f405 && cargo build --release --target-dir target/cf2
-
-# Build and flash Cheap FOCer 2 firmware.
-flash-f405-cf2:
-    cd oxifoc-f405 && cargo run --release --target-dir target/cf2
-
-# Build Flipsky Mini V6 MK5 firmware.
-build-f405-vesc6-mk5:
-    cd oxifoc-f405 && cargo build --release --target-dir target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
-
-# Build and flash Flipsky Mini V6 MK5 firmware.
-flash-f405-vesc6-mk5:
-    cd oxifoc-f405 && cargo run --release --target-dir target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
+# With no arguments this validates only. Pass `--yes` to transmit/install.
+flash-f103 *ARGS: image-f103
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py \
+        oxifoc-f103/target/thumbv7m-none-eabi/release/oxifoc-f103.flash-region.bin \
+        {{ ARGS }}
 
 # Build ESP32 bridge firmware.
 build-bridge:
@@ -132,26 +119,24 @@ virtual *ARGS:
 e2e:
     cargo test -p oxifoc-virtual --test e2e
 
-# Flash usage of the STM32 firmwares (see docs/flash-size.md)
+# Flash usage of the STM32F103 firmware.
 size:
     #!/usr/bin/env bash
     set -euo pipefail
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
+    llvm_size="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-size"
     measure() { # crate label limit_file target_dir extra_flags...
         local crate="$1" label="$2" memx="$3" target_dir="$4"; shift 4
         (cd "$crate" && cargo build --release --quiet --target-dir "$target_dir" "$@" 2>/dev/null) || { echo "$label: build failed"; exit 1; }
-        local elf="$crate/$target_dir/thumbv7em-none-eabihf/release/$crate"
-        local limit_k=$(grep -oP 'FLASH\s*:\s*ORIGIN[^,]*,\s*LENGTH\s*=\s*\K[0-9]+(?=K)' "$crate/$memx")
-        local limit=$((limit_k * 1024))
-        local used=$(arm-none-eabi-size "$elf" | tail -1 | awk '{print $1+$2}')
+        local elf="$crate/$target_dir/thumbv7m-none-eabi/release/$crate"
+        local limit=$(awk '/FLASH/ { for (i = 1; i <= NF; i++) if ($i == "LENGTH") { v = $(i + 2); if (v ~ /K$/) { sub(/K$/, "", v); print v * 1024 } else print v; exit } }' "$crate/$memx")
+        local used=$(command "$llvm_size" "$elf" | tail -1 | awk '{print $1+$2}')
         printf "%-24s %7d / %7d bytes (%2d%%), headroom %d\n" \
             "$label" "$used" "$limit" "$((used * 100 / limit))" "$((limit - used))"
     }
-    measure oxifoc-g474 oxifoc-g474 memory.x target
-    measure oxifoc-f405 oxifoc-f405-cf2 memory.x target/cf2
-    measure oxifoc-f405 oxifoc-f405-vesc6-mk5 memory.x target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
+    measure oxifoc-f103 oxifoc-f103 memory.x target --features firmware
 
 # Clean all build artifacts
 clean:
     cargo clean
-    for crate in {{ device_crates }} {{ target_test_crates }}; do (cd "$crate" && cargo clean); done
+    for crate in {{ device_crates }}; do (cd "$crate" && cargo clean); done

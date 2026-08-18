@@ -22,3 +22,6 @@ oxifoc-host-tauri/src-tauri/target/
 
 # Local telemetry capture artifacts
 /captures/
+
+# Disposable local experiments
+/scratch/

@@ -1,10 +1,42 @@
 # OxiFOC
 
-Field-Oriented Control (FOC) firmware for STM32 motor controllers, written in Rust with [Embassy](https://embassy.dev/). Device-host communication uses [ergot](https://github.com/jamesmunns/ergot).
+Field-Oriented Control (FOC) firmware for STM32 motor controllers, written in
+Rust. This fork's active motor target is
+[`oxifoc-f103`](oxifoc-f103/README.md): a core-backed, Hall-only STM32F103
+application with a fixed-point 16 kHz control loop and stock-bike CAN. The
+STM32G474/F405 applications remain as source references and are excluded from
+the validation build.
 
 ## Core Architecture (`oxifoc-core`)
 
-All FOC algorithms and motor control logic live in `oxifoc-core` — a `no_std` library with no hardware dependencies. Platform crates provide trait implementations for their specific hardware (ADC, PWM, sensors).
+All platform-neutral FOC algorithms and phase estimation live in
+`oxifoc-core`, a `no_std` library with no hardware dependencies. The compact
+current loop is generic over its numeric and angle backends; Clarke/Park,
+discrete PI, circular limiting, and sector SVPWM each have one implementation.
+
+| Core feature | Purpose | Linked by F103 |
+|--------------|---------|----------------|
+| `fixed-point` | Builds the shared controller with Q16.16 values and Q0.32-turn integer CORDIC | Yes |
+| `algorithms` | Adds the `f32` backend plus the original observer/HFI, detection, and optional async runtime | No |
+
+The `ControlPhaseProvider` boundary and `PhaseStrategy` identities retain Hall,
+encoder, back-EMF observer, HFI, hybrid, manual, and open-loop strategies. Only
+`HallTracker` is currently linked into the F103 ride image; the complete
+floating-point estimators remain under `foc::phase` as experiment and porting
+references.
+
+```text
+oxifoc-f103 control ISR
+├── config + control + safety
+├── hardware + sensors + transport
+└── oxifoc-core::foc
+    ├── FocKernel<Fixed, CordicTurns>
+    ├── shared transforms → discrete PI → SVPWM
+    └── phase::ControlPhaseProvider → HallTracker today
+```
+
+The following trait graph describes the original floating-point reference
+backend retained in `oxifoc-core`.
 
 ### Trait Abstraction
 
@@ -115,11 +147,14 @@ Roles are determined by topology, not firmware — disconnect two controllers an
 
 | Board | MCU | Current Sensing | Communication | Gate Driver |
 |-------|-----|-----------------|---------------|-------------|
+| Recovered S73 controller | STM32F103RE-class | Two low-side phase shunts | CAN 2.0B, 250 kbit/s | Discrete power stage |
 | Cheap FOCer 2 | STM32F405RG | DRV8301 (10 V/V) | USB + UART | DRV8301 SPI |
 | Flipsky VESC 6 MK5 | STM32F405RG | DRV8301 (20 V/V) | USB + UART | DRV8301 SPI |
 | NUCLEO-G474RE + IHM08M1 | STM32G474RE | External op-amps | USB + LPUART | L6398 |
 
-All platforms: 20 kHz center-aligned PWM, TIM1-triggered injected ADC, Hall polling via TIM6 (5 us, 7-read majority voting), persistent config in internal flash (`sequential-storage` + `postcard`).
+The F103 target uses 16 kHz center-aligned TIM1 PWM, CC4-triggered injected
+current samples, and TIM2 Hall capture. The reference platforms retain their
+original 20 kHz/Embassy architecture.
 
 ## Host Tools
 
@@ -134,26 +169,30 @@ Transports: Serial (UART VCP), RTT (probe-rs), TCP (virtual), UDP (virtual), USB
 ## Building
 
 ```bash
-just check                # fmt + clippy + tests (workspace + all device firmware)
-just build-f405-cf2       # Build Cheap FOCer 2 firmware
-just flash-f405-cf2       # Build and flash Cheap FOCer 2 via probe-rs
-just build-f405-vesc6-mk5 # Build Mini V6 MK5 firmware
-just flash-f405-vesc6-mk5 # Build and flash Mini V6 MK5 via probe-rs
+just check                # fmt + clippy + tests
+just build-f103           # Build STM32F103 firmware
+just image-f103           # Build the 26,200-byte CAN bootloader image
+just flash-f103           # Validate the image without transmitting
+just flash-f103 --yes     # Flash over gs_usb CAN channel 0 at 250 kbit/s
 just gui                  # Run Slint GUI
 just cli -- list          # Run CLI
 ```
 
-The two F405 variants use separate artifact directories:
-`oxifoc-f405/target/cf2` and `oxifoc-f405/target/vesc6-mk5`.
+The STM32F103 firmware requires Rust nightly with the `thumbv7m-none-eabi`
+target. Host crates build with stable Rust.
 
-Device firmware requires Rust nightly (`thumbv7em-none-eabihf`). Host crates build with stable Rust.
+The CAN updater preserves the resident bootloader and replaces only its
+application region. Keep the wheel stationary before requesting the reset: the
+application requires disabled motor output, 500 ms of quiet motor Halls, and a
+separately qualified quiet PB4 wheel input. Running `just flash-f103` without
+`--yes` validates the image and transmits nothing; real updates are captured in
+an ignored `scratch/can_log_bootloader_flash-*.log` file.
 
 ## Testing
 
 ```bash
 cargo test --workspace                              # Host tests
 cargo test -p oxifoc-core --features virtual-motor  # Virtual motor + detection
-cd tests/stm32f405 && cargo test                    # On-target (requires hardware)
 ```
 
 ## Development Status

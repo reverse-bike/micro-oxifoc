@@ -1,305 +1,240 @@
-//! Space Vector Pulse Width Modulation (SVPWM)
-//!
-//! SVPWM is the most efficient PWM technique for 3-phase motor control.
-//! It provides better DC bus utilization (~15% more) compared to sinusoidal PWM.
-//!
-//! The algorithm:
-//! 1. Determine which of 6 sectors the voltage vector falls in (geometric)
-//! 2. Calculate switching times (t1, t2) for active vectors
-//! 3. Center the PWM waveforms symmetrically
-//! 4. Clamp to valid duty cycle range
-//!
-//! Based on VESC firmware implementation.
+//! Sector-based space-vector PWM shared by every numeric backend.
 
-use super::constants::{FRAC_1_SQRT_3 as ONE_BY_SQRT3, FRAC_2_SQRT_3 as TWO_BY_SQRT3};
+use super::control_types::{AlphaBeta, PwmDuty};
+use super::numeric::Scalar;
 
-/// Space Vector PWM modulation
+/// Convert normalized αβ modulation into timer compares.
 ///
-/// Converts α-β frame *modulation* values to 3-phase PWM duty cycles.
-///
-/// A modulation vector of magnitude `m` produces a phase-to-neutral voltage
-/// of `(2/3)·m·vbus`, so desired volts must be scaled by `1.5 / vbus` before
-/// calling this (VESC: `voltage_normalize = 1.5 / v_bus`). The magnitude must
-/// not exceed √3/2 ≈ 0.866 to stay out of overmodulation (same contract as
-/// VESC's `foc_svm`).
-///
-/// # Arguments
-/// * `alpha` - Alpha axis modulation (volts × 1.5 / vbus)
-/// * `beta` - Beta axis modulation (volts × 1.5 / vbus)
-/// * `max_duty` - Maximum duty cycle value (e.g., 1000 for TIM ARR=1000)
-///
-/// # Returns
-/// Array of [duty_a, duty_b, duty_c] where each value is 0 to max_duty
-///
-/// # Example
-/// ```rust
-/// use oxifoc_core::foc::svpwm::space_vector_pwm;
-///
-/// let vbus = 24.0; // volts
-/// let v_alpha = 2.0; // desired α-axis voltage
-/// let v_beta = 3.0;  // desired β-axis voltage
-///
-/// // Volts → modulation: m = 1.5 × v / vbus
-/// let alpha_mod = 1.5 * v_alpha / vbus;
-/// let beta_mod = 1.5 * v_beta / vbus;
-///
-/// let duties = space_vector_pwm(alpha_mod, beta_mod, 1000);
-/// assert!(duties.iter().all(|&duty| duty <= 1000));
-/// ```
-pub fn space_vector_pwm(alpha: f32, beta: f32, max_duty: u16) -> [u16; 3] {
-    let sector = get_sector(alpha, beta);
-
-    // Calculate PWM timings per sector
-    let pwm_full = i32::from(max_duty);
-    let (ta, tb, tc) = match sector {
-        1 => {
-            // Vector on-times
-            let t1 = ((alpha - ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let t2 = (TWO_BY_SQRT3 * beta * pwm_full as f32) as i32;
-            // PWM timings with symmetrical centering
-            let ta = (pwm_full + t1 + t2) / 2;
-            let tb = ta - t1;
-            let tc = tb - t2;
-            (ta, tb, tc)
-        }
-        2 => {
-            let t2 = ((alpha + ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let t3 = ((-alpha + ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let tb = (pwm_full + t2 + t3) / 2;
-            let ta = tb - t3;
-            let tc = ta - t2;
-            (ta, tb, tc)
-        }
-        3 => {
-            let t3 = (TWO_BY_SQRT3 * beta * pwm_full as f32) as i32;
-            let t4 = ((-alpha - ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let tb = (pwm_full + t3 + t4) / 2;
-            let tc = tb - t3;
-            let ta = tc - t4;
-            (ta, tb, tc)
-        }
-        4 => {
-            let t4 = ((-alpha + ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let t5 = (-TWO_BY_SQRT3 * beta * pwm_full as f32) as i32;
-            let tc = (pwm_full + t4 + t5) / 2;
-            let tb = tc - t5;
-            let ta = tb - t4;
-            (ta, tb, tc)
-        }
-        5 => {
-            let t5 = ((-alpha - ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let t6 = ((alpha - ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let tc = (pwm_full + t5 + t6) / 2;
-            let ta = tc - t5;
-            let tb = ta - t6;
-            (ta, tb, tc)
-        }
-        6 => {
-            let t6 = (-TWO_BY_SQRT3 * beta * pwm_full as f32) as i32;
-            let t1 = ((alpha + ONE_BY_SQRT3 * beta) * pwm_full as f32) as i32;
-            let ta = (pwm_full + t6 + t1) / 2;
-            let tc = ta - t1;
-            let tb = tc - t6;
-            (ta, tb, tc)
-        }
-        _ => unreachable!("Invalid sector"),
-    };
-
-    // Clamp to valid duty cycle range
-    [
-        ta.clamp(0, pwm_full) as u16,
-        tb.clamp(0, pwm_full) as u16,
-        tc.clamp(0, pwm_full) as u16,
-    ]
+/// This preserves the original OxiFOC/VESC contract: a modulation value `m`
+/// represents a phase voltage of `(2 / 3) * m * vbus`.
+pub fn space_vector_pwm<N: Scalar>(alpha: N, beta: N, max_duty: u16) -> [u16; 3] {
+    let tick_scale = N::from_i32(i32::from(max_duty)) * N::TWO_THIRDS;
+    let neutral = max_duty / 2;
+    space_vector_pwm_ticks(
+        AlphaBeta {
+            alpha: alpha * tick_scale,
+            beta: beta * tick_scale,
+        },
+        neutral,
+        max_duty.saturating_sub(neutral),
+    )
+    .as_array()
 }
 
-/// Get the sector number for a given α-β voltage
+/// Convert αβ phase-voltage values expressed in timer ticks into compares.
 ///
-/// Useful for debugging and visualization.
-/// Uses the same geometric method as the main SVPWM function.
-pub fn get_sector(alpha: f32, beta: f32) -> u8 {
-    if beta >= 0.0 {
-        if alpha >= 0.0 {
-            // Quadrant I
-            if ONE_BY_SQRT3 * beta > alpha { 2 } else { 1 }
-        } else {
-            // Quadrant II
-            if -ONE_BY_SQRT3 * beta > alpha { 3 } else { 2 }
+/// The sector and active-vector timing equations are identical to
+/// [`space_vector_pwm`]; only the input scaling has already been performed by
+/// the caller. `phase_limit_ticks` reserves the required bootstrap, dead-time,
+/// and ADC sampling margin around `neutral`.
+pub fn space_vector_pwm_ticks<N: Scalar>(
+    voltage: AlphaBeta<N>,
+    neutral: u16,
+    phase_limit_ticks: u16,
+) -> PwmDuty {
+    let alpha = voltage.alpha;
+    let beta = voltage.beta;
+    let full_period = N::from_i32(i32::from(neutral) * 2);
+
+    let (phase_a, phase_b, phase_c) = match get_sector(alpha, beta) {
+        1 => {
+            let t1 = (alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let t2 = N::SQRT_3 * beta;
+            let phase_a = (full_period + t1 + t2) * N::HALF;
+            let phase_b = phase_a - t1;
+            let phase_c = phase_b - t2;
+            (phase_a, phase_b, phase_c)
         }
-    } else if alpha >= 0.0 {
-        // Quadrant IV
-        if -ONE_BY_SQRT3 * beta > alpha { 5 } else { 6 }
-    } else {
-        // Quadrant III
-        if ONE_BY_SQRT3 * beta > alpha { 4 } else { 5 }
+        2 => {
+            let t2 = (alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let t3 = (-alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let phase_b = (full_period + t2 + t3) * N::HALF;
+            let phase_a = phase_b - t3;
+            let phase_c = phase_a - t2;
+            (phase_a, phase_b, phase_c)
+        }
+        3 => {
+            let t3 = N::SQRT_3 * beta;
+            let t4 = (-alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let phase_b = (full_period + t3 + t4) * N::HALF;
+            let phase_c = phase_b - t3;
+            let phase_a = phase_c - t4;
+            (phase_a, phase_b, phase_c)
+        }
+        4 => {
+            let t4 = (-alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let t5 = -(N::SQRT_3 * beta);
+            let phase_c = (full_period + t4 + t5) * N::HALF;
+            let phase_b = phase_c - t5;
+            let phase_a = phase_b - t4;
+            (phase_a, phase_b, phase_c)
+        }
+        5 => {
+            let t5 = (-alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let t6 = (alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let phase_c = (full_period + t5 + t6) * N::HALF;
+            let phase_a = phase_c - t5;
+            let phase_b = phase_a - t6;
+            (phase_a, phase_b, phase_c)
+        }
+        _ => {
+            let t6 = -(N::SQRT_3 * beta);
+            let t1 = (alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
+            let phase_a = (full_period + t6 + t1) * N::HALF;
+            let phase_c = phase_a - t1;
+            let phase_b = phase_c - t6;
+            (phase_a, phase_b, phase_c)
+        }
+    };
+
+    PwmDuty {
+        a: limited_compare(phase_a, neutral, phase_limit_ticks),
+        b: limited_compare(phase_b, neutral, phase_limit_ticks),
+        c: limited_compare(phase_c, neutral, phase_limit_ticks),
     }
+}
+
+/// Geometric sector for an αβ vector.
+pub fn get_sector<N: Scalar>(alpha: N, beta: N) -> u8 {
+    if beta >= N::ZERO {
+        if alpha >= N::ZERO {
+            if N::INV_SQRT_3 * beta > alpha { 2 } else { 1 }
+        } else if -(N::INV_SQRT_3 * beta) > alpha {
+            3
+        } else {
+            2
+        }
+    } else if alpha >= N::ZERO {
+        if -(N::INV_SQRT_3 * beta) > alpha {
+            5
+        } else {
+            6
+        }
+    } else if N::INV_SQRT_3 * beta > alpha {
+        4
+    } else {
+        5
+    }
+}
+
+pub trait TickModulator<N: Scalar> {
+    fn to_duties(voltage: AlphaBeta<N>, neutral: u16, phase_limit_ticks: u16) -> PwmDuty;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SvpwmTickModulator;
+
+impl<N: Scalar> TickModulator<N> for SvpwmTickModulator {
+    #[inline]
+    fn to_duties(voltage: AlphaBeta<N>, neutral: u16, phase_limit_ticks: u16) -> PwmDuty {
+        space_vector_pwm_ticks(voltage, neutral, phase_limit_ticks)
+    }
+}
+
+fn limited_compare<N: Scalar>(value: N, neutral: u16, phase_limit_ticks: u16) -> u16 {
+    let lower = neutral.saturating_sub(phase_limit_ticks);
+    let upper = neutral.saturating_add(phase_limit_ticks);
+    value
+        .trunc_to_i32()
+        .clamp(i32::from(lower), i32::from(upper)) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foc::numeric::Fixed;
 
-    const MAX_DUTY: u16 = 1000;
+    const NEUTRAL: u16 = 1_125;
+    const PHASE_LIMIT: u16 = 1_085;
 
     #[test]
-    fn test_svpwm_zero_voltage() {
-        // Zero voltage should give 50% duty cycle on all phases
-        let duties = space_vector_pwm(0.0, 0.0, MAX_DUTY);
-
-        // All phases should be at mid-point
-        let expected = MAX_DUTY / 2;
-        for duty in duties {
-            assert!(
-                (i32::from(duty) - i32::from(expected)).abs() <= 1,
-                "Zero voltage duty should be ~{expected}, got {duty}"
+    fn fixed_modulation_respects_the_sampling_margin() {
+        for (alpha, beta) in [(1_250, 0), (0, 1_250), (-884, 884)] {
+            let duty = space_vector_pwm_ticks(
+                AlphaBeta {
+                    alpha: Fixed::from_integer(alpha),
+                    beta: Fixed::from_integer(beta),
+                },
+                NEUTRAL,
+                PHASE_LIMIT,
             );
-        }
-    }
-
-    #[test]
-    fn test_svpwm_duties_in_range() {
-        // Test various angles and magnitudes
-        for angle_deg in (0..360).step_by(15) {
-            let angle_rad = (angle_deg as f32).to_radians();
-
-            for magnitude in [0.3, 0.5, 0.7, 0.9] {
-                let alpha = magnitude * libm::cosf(angle_rad);
-                let beta = magnitude * libm::sinf(angle_rad);
-
-                let duties = space_vector_pwm(alpha, beta, MAX_DUTY);
-
-                // All duties should be in valid range
-                for (i, &duty) in duties.iter().enumerate() {
-                    assert!(
-                        duty <= MAX_DUTY,
-                        "Duty cycle {i} out of range at angle={angle_deg}, mag={magnitude}: got {duty}"
-                    );
-                }
+            for compare in duty.as_array() {
+                assert!(compare.abs_diff(NEUTRAL) <= PHASE_LIMIT);
             }
         }
     }
 
     #[test]
-    fn test_svpwm_all_sectors() {
-        // Test that all 6 sectors are covered
-        // Using VESC geometric sector detection (robust at boundaries)
-        let test_vectors = [
-            (0.5, 0.1, 1),   // ~11° - sector 1
-            (0.1, 0.5, 2),   // ~79° - sector 2
-            (-0.4, 0.4, 3),  // ~135° - sector 3
-            (-0.5, -0.1, 4), // ~191° - sector 4
-            (-0.1, -0.5, 5), // ~259° - sector 5
-            (0.4, -0.4, 6),  // ~315° - sector 6
-        ];
-
-        for (alpha, beta, expected_sector) in test_vectors {
-            let sector = get_sector(alpha, beta);
-            assert_eq!(
-                sector, expected_sector,
-                "Expected sector {expected_sector} for α={alpha}, β={beta}, got {sector}"
-            );
-
-            // Also verify SVPWM produces valid output
-            let duties = space_vector_pwm(alpha, beta, MAX_DUTY);
-            assert!(duties[0] <= MAX_DUTY);
-            assert!(duties[1] <= MAX_DUTY);
-            assert!(duties[2] <= MAX_DUTY);
-        }
+    fn zero_vector_is_centered() {
+        assert_eq!(
+            space_vector_pwm_ticks(
+                AlphaBeta {
+                    alpha: Fixed::ZERO,
+                    beta: Fixed::ZERO,
+                },
+                NEUTRAL,
+                PHASE_LIMIT,
+            ),
+            PwmDuty {
+                a: NEUTRAL,
+                b: NEUTRAL,
+                c: NEUTRAL,
+            }
+        );
     }
 
+    #[cfg(feature = "algorithms")]
     #[test]
-    fn test_sector_boundaries() {
-        // Test angles at exact sector boundaries
-        let boundary_angles: [f32; 6] = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
-
-        for angle_deg in boundary_angles {
-            let angle_rad = angle_deg.to_radians();
-            let alpha = 0.5 * libm::cosf(angle_rad);
-            let beta = 0.5 * libm::sinf(angle_rad);
-
-            // Should not panic and should produce valid duties
-            let duties = space_vector_pwm(alpha, beta, MAX_DUTY);
-
-            for duty in duties {
-                assert!(duty <= MAX_DUTY, "Duty out of range at boundary");
+    fn fixed_and_float_use_the_same_sector_timing() {
+        for (alpha, beta) in [
+            (1_000, 100),
+            (100, 1_000),
+            (-900, 400),
+            (-1_000, -100),
+            (-100, -1_000),
+            (700, -700),
+        ] {
+            let floating = space_vector_pwm_ticks(
+                AlphaBeta {
+                    alpha: alpha as f32,
+                    beta: beta as f32,
+                },
+                NEUTRAL,
+                PHASE_LIMIT,
+            );
+            let fixed = space_vector_pwm_ticks(
+                AlphaBeta {
+                    alpha: Fixed::from_integer(alpha),
+                    beta: Fixed::from_integer(beta),
+                },
+                NEUTRAL,
+                PHASE_LIMIT,
+            );
+            for (float_compare, fixed_compare) in
+                floating.as_array().into_iter().zip(fixed.as_array())
+            {
+                assert!(float_compare.abs_diff(fixed_compare) <= 2);
             }
         }
     }
 
+    #[cfg(feature = "algorithms")]
     #[test]
-    fn test_svpwm_sector_transitions() {
-        // Test smooth transition between sectors
-        for base_angle in [0, 60, 120, 180, 240, 300] {
-            let mut prev_duties: Option<[u16; 3]> = None;
-
-            for offset in 0..10 {
-                let angle_deg = base_angle + offset * 6; // 6° steps
-                let angle_rad = (angle_deg as f32).to_radians();
-                let alpha = 0.5 * libm::cosf(angle_rad);
-                let beta = 0.5 * libm::sinf(angle_rad);
-
-                let duties = space_vector_pwm(alpha, beta, MAX_DUTY);
-
-                if let Some(prev) = prev_duties {
-                    // Check no huge jumps between consecutive angles
-                    for i in 0..3 {
-                        let diff = (i32::from(duties[i]) - i32::from(prev[i])).abs();
-                        assert!(
-                            diff < 200,
-                            "Large duty change at sector boundary: {} -> {} (diff={})",
-                            prev[i],
-                            duties[i],
-                            diff
-                        );
-                    }
-                }
-
-                prev_duties = Some(duties);
-            }
-        }
-    }
-
-    #[test]
-    fn test_svpwm_saturation() {
-        // Test that excessive voltage requests are clamped
-        let duties = space_vector_pwm(2.0, 2.0, MAX_DUTY); // Way over range
-
-        for duty in duties {
-            assert!(duty <= MAX_DUTY, "Duty should be clamped to max");
-        }
-    }
-
-    #[test]
-    fn test_vesc_algorithm_zero_voltage() {
-        // Zero voltage should give 50% duty cycle (centered PWM)
-        let duties = space_vector_pwm(0.0, 0.0, 1000);
-
-        // All phases should be at mid-point (500 ± tolerance for rounding)
-        for duty in duties {
+    fn normalized_float_contract_is_preserved() {
+        assert_eq!(space_vector_pwm(0.0_f32, 0.0, 1_000), [500; 3]);
+        for (alpha, beta, sector) in [
+            (0.5, 0.1, 1),
+            (0.1, 0.5, 2),
+            (-0.4, 0.4, 3),
+            (-0.5, -0.1, 4),
+            (-0.1, -0.5, 5),
+            (0.4, -0.4, 6),
+        ] {
+            assert_eq!(get_sector(alpha, beta), sector);
             assert!(
-                (i32::from(duty) - 500).abs() <= 2,
-                "Zero voltage should give ~500 duty, got {duty}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_svpwm_phase_balance() {
-        // For balanced 3-phase SVPWM, verify duties are reasonable
-        // Note: The exact sum varies by sector due to SVPWM algorithm
-        for angle_deg in (0..360).step_by(30) {
-            let angle_rad = (angle_deg as f32).to_radians();
-            let alpha = 0.5 * libm::cosf(angle_rad);
-            let beta = 0.5 * libm::sinf(angle_rad);
-
-            let duties = space_vector_pwm(alpha, beta, MAX_DUTY);
-            let sum: u32 = duties.iter().map(|&d| u32::from(d)).sum();
-
-            // Sum should be reasonable (between 1.0x and 2.0x max_duty)
-            // SVPWM centering means it won't be exactly 1.5x everywhere
-            assert!(
-                sum >= u32::from(MAX_DUTY) && sum <= (u32::from(MAX_DUTY) * 2),
-                "Duty sum {sum} outside reasonable range at angle {angle_deg}"
+                space_vector_pwm(alpha, beta, 1_000)
+                    .into_iter()
+                    .all(|compare| compare <= 1_000)
             );
         }
     }

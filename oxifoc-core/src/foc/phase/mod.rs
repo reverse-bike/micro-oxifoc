@@ -45,18 +45,34 @@
 //! let driver = FocDriver::new(pwm, current_sensor, phase, vbus);
 //! ```
 
+mod control;
+mod hall;
+#[cfg(feature = "algorithms")]
 mod manager;
+#[cfg(feature = "algorithms")]
 mod observer;
+#[cfg(feature = "algorithms")]
 mod provider;
+#[cfg(feature = "algorithms")]
 mod source;
+#[cfg(feature = "algorithms")]
 mod startup;
+mod strategy;
 
+pub use control::{ControlPhaseEstimate, ControlPhaseInput, ControlPhaseProvider};
+pub use hall::{HallError, HallGeometry, HallTracker};
+#[cfg(feature = "algorithms")]
 pub use manager::{HallHealth, OpenLoopOverride, PhaseFault, PhaseManager};
+#[cfg(feature = "algorithms")]
 pub use observer::{
     BackEmfObserver, DEFAULT_CENTERING_GAIN, DEFAULT_LAMBDA_GAIN, Observer, ObserverInput,
 };
 #[cfg(feature = "hfi")]
 pub use observer::{HFI_DEFAULT_AMPLITUDE_RATIO, HFI_DEFAULT_FREQ_HZ, HfiObserver};
+#[cfg(feature = "algorithms")]
 pub use provider::{PhaseInput, PhaseOutput, PhaseProvider};
+#[cfg(feature = "algorithms")]
 pub use source::{PhaseSource, PhaseSourceError};
+#[cfg(feature = "algorithms")]
 pub use startup::{SensorlessStartup, StartupOutput, StartupPhase};
+pub use strategy::PhaseStrategy;

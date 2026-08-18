@@ -1,0 +1,33 @@
+[package]
+name = "oxifoc-f103"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "26,200-byte, Hall-only CAN FOC firmware for STM32F103"
+
+[lib]
+test = true
+
+[[bin]]
+name = "oxifoc-f103"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["firmware"]
+
+[features]
+default = []
+firmware = ["dep:cortex-m", "dep:cortex-m-rt", "dep:stm32f1"]
+
+[dependencies]
+oxifoc-core = { path = "../oxifoc-core", default-features = false, features = ["fixed-point"] }
+cortex-m = { version = "0.7.8", optional = true, features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7.6", optional = true }
+stm32f1 = { version = "0.15", optional = true, features = ["stm32f103", "rt"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = true
