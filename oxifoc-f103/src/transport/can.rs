@@ -95,7 +95,7 @@ pub fn service(
     vehicle_speed_tenths_kph: u16,
     distance_counter: u32,
     dc_bus_undervoltage: bool,
-    effective_current_limit: u8,
+    effective_current_limit: u16,
     derating_reasons: u8,
     ride_stage: u8,
 ) {

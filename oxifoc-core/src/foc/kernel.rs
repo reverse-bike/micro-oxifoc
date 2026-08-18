@@ -63,7 +63,7 @@ where
 
     pub fn phase_current_limit_from_dc(
         &self,
-        dc_current_limit_counts: u8,
+        dc_current_limit_counts: u16,
         maximum_phase_counts: u16,
         pwm_period_ticks: u16,
     ) -> u16 {
@@ -219,15 +219,16 @@ mod tests {
     #[test]
     fn dc_projection_is_bounded_by_the_phase_envelope() {
         let mut kernel = fixed_kernel();
-        assert_eq!(kernel.phase_current_limit_from_dc(250, 838, 2_250), 838);
+        assert_eq!(kernel.phase_current_limit_from_dc(400, 838, 2_250), 838);
         let _ = kernel.step(
             Fixed::ZERO,
             Fixed::ZERO,
             0,
-            Dq::new(Fixed::ZERO, Fixed::from_integer(-838)),
+            Dq::new(Fixed::ZERO, Fixed::from_integer(-10_000)),
             1_125,
         );
-        assert!((1..=838).contains(&kernel.phase_current_limit_from_dc(250, 838, 2_250)));
+        assert_eq!(kernel.phase_current_limit_from_dc(250, 838, 2_250), 300);
+        assert_eq!(kernel.phase_current_limit_from_dc(400, 838, 2_250), 480);
     }
 
     #[cfg(feature = "algorithms")]

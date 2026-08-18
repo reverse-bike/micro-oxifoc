@@ -30,7 +30,7 @@ pub struct EnvironmentMonitor {
     undervoltage_count: u8,
     undervoltage_active: bool,
     last_update_ms: u32,
-    latest_limit: Option<u8>,
+    latest_limit: Option<u16>,
     derating_reasons: u8,
 }
 
@@ -45,7 +45,7 @@ impl EnvironmentMonitor {
         }
     }
 
-    pub fn update(&mut self, now_ms: u32, sensors: RawLocalSensors) -> Option<u8> {
+    pub fn update(&mut self, now_ms: u32, sensors: RawLocalSensors) -> Option<u16> {
         if now_ms.wrapping_sub(self.last_update_ms) < UPDATE_PERIOD_MS {
             return self.latest_limit;
         }
@@ -161,7 +161,7 @@ fn thermistor_segment(intercept: i32, slope: i32, millivolts: i32) -> i32 {
     intercept.saturating_sub(slope.saturating_mul(millivolts) / 1_000)
 }
 
-fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u8 {
+fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u16 {
     if temperature <= start {
         return RIDE_DC_BUS_CURRENT_LIMIT_COUNTS;
     }
@@ -173,7 +173,7 @@ fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u8 {
     u32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS)
         .saturating_mul(remaining)
         .checked_div(span)
-        .unwrap_or_default() as u8
+        .unwrap_or_default() as u16
 }
 
 #[cfg(test)]
@@ -203,15 +203,15 @@ mod tests {
     fn missing_local_sensor_data_removes_drive_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
         assert_eq!(monitor.update(0, RawLocalSensors::default()), None);
-        assert_eq!(monitor.update(50, nominal()), Some(250));
+        assert_eq!(monitor.update(50, nominal()), Some(400));
     }
 
     #[test]
     fn local_temperatures_derate_to_zero() {
-        assert_eq!(thermal_limit_counts(700, 700, 800), 250);
-        assert_eq!(thermal_limit_counts(750, 700, 800), 125);
+        assert_eq!(thermal_limit_counts(700, 700, 800), 400);
+        assert_eq!(thermal_limit_counts(750, 700, 800), 200);
         assert_eq!(thermal_limit_counts(800, 700, 800), 0);
-        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 125);
+        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 200);
 
         let mut monitor = EnvironmentMonitor::new(0);
         let mut hot = nominal();
@@ -235,7 +235,7 @@ mod tests {
         for sample in 20..40 {
             assert_eq!(monitor.update(sample * 50, nominal()), Some(0));
         }
-        assert_eq!(monitor.update(40 * 50, nominal()), Some(250));
+        assert_eq!(monitor.update(40 * 50, nominal()), Some(400));
         assert_eq!(monitor.derating_reasons(), 0);
     }
 

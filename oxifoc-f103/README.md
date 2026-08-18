@@ -108,15 +108,16 @@ the directly wired inputs and local protection state.
 
 Forward torque is negative q. Demand increases by four current counts per
 millisecond and reductions apply immediately. The ride ceiling is 838 phase-
-current counts (134.08 A at the calibrated 160 mA/count), including during the
-two-second startup window. Startup requires its first Hall edge within 500 ms
-and twelve net-forward Hall transitions. The software phase-current guard
-trips above 1,344 counts (215.04 A) on A, B, or reconstructed C, preserving at
+current counts (83.8 A at the loaded-run fit of 100 mA/count), including during
+the two-second startup window. Startup requires its first Hall edge within 500
+ms and twelve net-forward Hall transitions. The software phase-current guard
+trips above 1,344 counts (134.4 A) on A, B, or reconstructed C, preserving at
 least the established 1.6-times margin over commanded phase current. The local
 39 V undervoltage debounce and controller/motor thermal envelopes can only
-reduce the 250-count (40 A) DC-side limit. DC projection dynamically reduces
-the phase-current target as applied modulation rises. The 1,250-tick voltage-
-vector ceiling, PI gains, Hall estimator, and target ramp are unchanged.
+reduce the 400-count (40 A) DC-side limit. DC projection dynamically reduces
+the phase-current target as applied modulation rises. The 1,273-tick voltage-
+vector ceiling and 1,103-tick centered PWM window reproduce the stock F103
+modulation envelope; PI gains, Hall estimator, and target ramp are unchanged.
 
 ## CAN and updater
 
@@ -136,6 +137,10 @@ Page 13 retains peak phase current, direct current, quadrature tracking error,
 and PWM span from boot so short transients remain visible at CAN telemetry
 rates. The project-page scheduler advances through all seven pages without the
 `u8` wraparound phase discontinuity.
+
+On page 9, byte 1 remains a saturated one-byte current-limit value for older
+tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
+recover the full effective DC limit (400 when it is not being derated).
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -167,4 +172,4 @@ metadata, and bootloader-image validation can establish software consistency
 and the real flash/RAM footprint. They cannot prove GPIO polarity, current
 scaling, Hall geometry, control-loop cycle time, or motor direction on this
 specific board. Those remain hardware commissioning gates. The generated
-838-count image has not been flashed as part of this change.
+400-DC-count/1,273-tick image has not been flashed as part of this change.

@@ -649,8 +649,8 @@ pub fn write_pwm_duties(duty: oxifoc_core::foc::PwmDuty) -> bool {
         return false;
     }
     // SAFETY: preload is enabled, so all three values transfer together at an
-    // update event. The explicit range check preserves the current-sample and
-    // dead-time margin even if the modulator is changed later.
+    // update event. The explicit range check preserves the stock-proven
+    // current-sample window even if the modulator is changed later.
     unsafe {
         write_volatile(TIM1_CCR1, u32::from(duty.a));
         write_volatile(TIM1_CCR2, u32::from(duty.b));

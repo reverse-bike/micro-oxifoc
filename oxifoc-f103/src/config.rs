@@ -18,9 +18,11 @@ pub const PWM_ARR: u16 = 2_250;
 pub const PWM_NEUTRAL: u16 = PWM_ARR / 2;
 pub const PWM_DEAD_TIME_TICKS: u8 = 25;
 pub const PWM_SAMPLE_CC4: u16 = 2_248;
-pub const FOC_PHASE_LIMIT_TICKS: u16 = 1_085;
-pub const FOC_HARD_PHASE_LIMIT_TICKS: u16 = 1_096;
-pub const FOC_VECTOR_LIMIT_TICKS: Fixed = Fixed::from_integer(1_250);
+// The S310 application uses a 1,273-tick voltage circle and approximately
+// 22..2,227 timer compares with this same 2,250-tick PWM period.
+pub const FOC_PHASE_LIMIT_TICKS: u16 = 1_103;
+pub const FOC_HARD_PHASE_LIMIT_TICKS: u16 = 1_103;
+pub const FOC_VECTOR_LIMIT_TICKS: Fixed = Fixed::from_integer(1_273);
 pub const CURRENT_PI_PROPORTIONAL_GAIN: Fixed = Fixed::ratio(512, 1_024);
 pub const CURRENT_PI_INTEGRAL_GAIN_PER_CYCLE: Fixed = Fixed::ratio(605, 16_384);
 pub const TARGET_RAMP_CYCLES_PER_STEP: u8 = (PWM_HZ / 1_000) as u8;
@@ -34,20 +36,21 @@ pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
     -1,
 );
 
-pub const CURRENT_MA_PER_COUNT: i32 = 160;
+// Fitted from controller dq current against BMS battery current during the
+// loaded ride; it is used for reporting and configuring the DC-side envelope.
+pub const CURRENT_MA_PER_COUNT: i32 = 100;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 838;
-pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u8 = 250;
+pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 400;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
 const _: () =
     assert!((PHASE_CURRENT_TRIP_COUNTS as u32) * 5 >= (RIDE_PHASE_CURRENT_LIMIT_COUNTS as u32) * 8);
-const _: () = assert!(FOC_PHASE_LIMIT_TICKS < FOC_HARD_PHASE_LIMIT_TICKS);
+const _: () = assert!(FOC_PHASE_LIMIT_TICKS <= FOC_HARD_PHASE_LIMIT_TICKS);
 const _: () = assert!(TARGET_RAMP_CYCLES_PER_STEP > 0);
-const _: () = assert!(
-    PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS + (PWM_DEAD_TIME_TICKS as u16) < PWM_SAMPLE_CC4
-);
+const _: () = assert!(PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
+const _: () = assert!(PWM_SAMPLE_CC4 < PWM_ARR);
 
 pub const THROTTLE_ADC_CHANNEL: u8 = 15;
 pub const THROTTLE_GPIO_PORT: u8 = b'C';
@@ -159,6 +162,12 @@ impl SafetyInterlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxifoc_core::foc::{
+        AlphaBeta,
+        angle::{AngleSinCos, CordicTurns},
+        svpwm::space_vector_pwm_ticks,
+        transforms::inverse_park,
+    };
 
     #[test]
     fn can_timing_matches_the_recovered_bus() {
@@ -203,11 +212,11 @@ mod tests {
     #[test]
     fn ride_current_envelope_matches_the_full_power_configuration() {
         assert_eq!(RIDE_PHASE_CURRENT_LIMIT_COUNTS, 838);
-        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 250);
+        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 400);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
             i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
-            134_080
+            83_800
         );
         assert_eq!(
             i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
@@ -217,5 +226,35 @@ mod tests {
             u32::from(PHASE_CURRENT_TRIP_COUNTS) * 5
                 >= u32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * 8
         );
+    }
+
+    #[test]
+    fn voltage_envelope_matches_the_stock_f103_circle() {
+        assert_eq!(FOC_VECTOR_LIMIT_TICKS.integer(), 1_273);
+        assert_eq!(FOC_PHASE_LIMIT_TICKS, 1_103);
+        assert_eq!(FOC_HARD_PHASE_LIMIT_TICKS, 1_103);
+        assert!(PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
+
+        let mut maximum_span = 0;
+        for step in 0..4_096_u32 {
+            let (sin, cos) = CordicTurns::sin_cos(step << 20);
+            let (alpha, beta) = inverse_park(FOC_VECTOR_LIMIT_TICKS, Fixed::ZERO, sin, cos);
+            let duty = space_vector_pwm_ticks(
+                AlphaBeta { alpha, beta },
+                PWM_NEUTRAL,
+                FOC_PHASE_LIMIT_TICKS,
+            );
+            let compares = duty.as_array();
+            let minimum = compares.into_iter().min().unwrap();
+            let maximum = compares.into_iter().max().unwrap();
+            maximum_span = maximum_span.max(maximum - minimum);
+            assert!(maximum < PWM_SAMPLE_CC4);
+            assert!(
+                compares
+                    .into_iter()
+                    .all(|compare| compare.abs_diff(PWM_NEUTRAL) <= FOC_HARD_PHASE_LIMIT_TICKS)
+            );
+        }
+        assert!(maximum_span >= 2_204);
     }
 }

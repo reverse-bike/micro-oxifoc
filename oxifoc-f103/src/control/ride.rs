@@ -28,7 +28,7 @@ pub struct Observation {
     pub now_ms: u32,
     pub throttle: ThrottleObservation,
     pub brake_active: bool,
-    pub environment_dc_limit_counts: Option<u8>,
+    pub environment_dc_limit_counts: Option<u16>,
     pub hall_valid: bool,
     pub current_valid: bool,
     pub fault_flags: u32,
@@ -43,7 +43,7 @@ pub struct Observation {
 pub struct Command {
     pub energize: bool,
     pub target_q_counts: i16,
-    pub dc_current_limit_counts: u8,
+    pub dc_current_limit_counts: u16,
     pub stage: Stage,
 }
 
@@ -125,7 +125,7 @@ impl RideController {
         }
     }
 
-    fn update_ready(&mut self, observation: Observation, environment_limit: u8) -> Command {
+    fn update_ready(&mut self, observation: Observation, environment_limit: u16) -> Command {
         let Some(demand) = observation.throttle.demand() else {
             if !observation.throttle.is_at_rest() {
                 self.state = State::Disarmed;
@@ -162,7 +162,7 @@ impl RideController {
         &mut self,
         mut run: Run,
         observation: Observation,
-        environment_limit: u8,
+        environment_limit: u16,
     ) -> Command {
         let demand = observation.throttle.demand();
         if matches!(run.stage, Stage::AwaitingFirstEdge | Stage::StartupTracking)
@@ -257,7 +257,7 @@ impl RideController {
     }
 }
 
-fn active_command(target_q_counts: i16, environment_limit: u8, stage: Stage) -> Command {
+fn active_command(target_q_counts: i16, environment_limit: u16, stage: Stage) -> Command {
     Command {
         energize: true,
         target_q_counts,

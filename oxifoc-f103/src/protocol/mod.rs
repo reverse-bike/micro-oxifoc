@@ -186,7 +186,7 @@ pub struct PassiveInputTelemetry {
     pub throttle_current_limit_counts: u16,
     pub live_hall_state: u8,
     pub bus_voltage_mv: u16,
-    pub effective_current_limit: u8,
+    pub effective_current_limit: u16,
     pub derating_reasons: u8,
     pub controller_temperature_deci_c: Option<i16>,
     pub motor_temperature_deci_c: Option<i16>,
@@ -260,14 +260,21 @@ pub fn passive_input_telemetry(page_index: u8, snapshot: PassiveInputTelemetry) 
         )
     } else {
         let bus_voltage = (snapshot.bus_voltage_mv / 100).to_le_bytes();
+        // Byte 1 remains a saturating legacy view. Byte 3 carries the exact
+        // overflow above 255 so widened limits remain lossless to new tools.
+        let legacy_current_limit = snapshot.effective_current_limit.min(u16::from(u8::MAX)) as u8;
+        let current_limit_overflow = snapshot
+            .effective_current_limit
+            .saturating_sub(u16::from(u8::MAX))
+            .min(u16::from(u8::MAX)) as u8;
         Frame::new(
             0x2f7,
             8,
             [
                 9,
-                snapshot.effective_current_limit,
+                legacy_current_limit,
                 snapshot.derating_reasons,
-                0,
+                current_limit_overflow,
                 bus_voltage[0],
                 bus_voltage[1],
                 encode_temperature(snapshot.controller_temperature_deci_c),
@@ -538,6 +545,18 @@ mod tests {
         assert_eq!(
             passive_input_telemetry(1, snapshot).data,
             [9, 250, 0, 0, 0x0b, 0x02, 81, 67]
+        );
+    }
+
+    #[test]
+    fn passive_input_page_preserves_wide_dc_current_limits() {
+        let snapshot = PassiveInputTelemetry {
+            effective_current_limit: 400,
+            ..PassiveInputTelemetry::default()
+        };
+        assert_eq!(
+            passive_input_telemetry(1, snapshot).data[..4],
+            [9, 255, 0, 145]
         );
     }
 

@@ -127,7 +127,7 @@ pub fn start(offsets: CurrentOffsets) {
 /// machine calls this; CAN frames never create motor authority.
 pub fn authorize_ride_target(
     target_q_counts: i16,
-    dc_current_limit_counts: u8,
+    dc_current_limit_counts: u16,
     lifetime_cycles: u32,
     safety_epoch: u32,
 ) {
@@ -397,7 +397,7 @@ fn control_cycle() {
     let phase_limit = state.kernel.phase_current_limit_from_dc(
         DC_CURRENT_LIMIT_COUNTS
             .load(Ordering::Relaxed)
-            .min(u32::from(u8::MAX)) as u8,
+            .min(u32::from(u16::MAX)) as u16,
         crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS,
         crate::config::PWM_ARR,
     );
