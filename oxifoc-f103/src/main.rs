@@ -36,6 +36,7 @@ fn main() -> ! {
     let mut dc_bus_undervoltage = false;
     let mut effective_current_limit = 0;
     let mut derating_reasons = environment::reason::LOCAL_DATA_MISSING;
+    let mut ride_stage = ride::Stage::Disarmed;
     peripherals::select_application_vector_table();
     peripherals::disable_power_stage();
     if peripherals::configure_72mhz_clock().is_ok() {
@@ -111,6 +112,7 @@ fn main() -> ! {
                 hall_interval_us: control.hall_interval_us,
                 electrical_rpm: control.electrical_rpm,
             });
+            ride_stage = command.stage;
             if command.energize {
                 foc::authorize_ride_target(
                     command.target_q_counts,
@@ -135,6 +137,7 @@ fn main() -> ! {
             dc_bus_undervoltage,
             effective_current_limit,
             derating_reasons,
+            ride_stage as u8,
         );
         if watchdog_started && now.wrapping_sub(last_watchdog_feed_ms) >= WATCHDOG_FEED_PERIOD_MS {
             let progress = foc::snapshot();

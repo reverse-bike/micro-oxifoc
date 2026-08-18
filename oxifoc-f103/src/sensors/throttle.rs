@@ -1,18 +1,17 @@
+use crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS;
+
 pub const PLAUSIBLE_LOW_ADC: u16 = 250;
 pub const REST_ADC: u16 = 726;
 pub const REST_MAX_ADC: u16 = 850;
 pub const FULL_ADC: u16 = 3_252;
 pub const PLAUSIBLE_HIGH_ADC: u16 = 3_750;
 pub const DEMAND_MAX_COUNTS: u8 = 240;
-pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 480;
-pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 768;
 
 const _: () = assert!(PLAUSIBLE_LOW_ADC <= REST_ADC);
 const _: () = assert!(REST_ADC < REST_MAX_ADC);
 const _: () = assert!(REST_MAX_ADC < FULL_ADC);
 const _: () = assert!(FULL_ADC <= PLAUSIBLE_HIGH_ADC);
 const _: () = assert!(PLAUSIBLE_HIGH_ADC <= 4_095);
-const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Observation {
@@ -178,9 +177,9 @@ mod tests {
     #[test]
     fn full_throttle_uses_confirmed_forward_sign_and_current_scale() {
         let demand = Observation::from_raw(FULL_ADC).demand().unwrap();
-        assert_eq!(demand.negative_q_target(480), -480);
+        assert_eq!(demand.negative_q_target(838), -838);
         assert_eq!(demand.negative_q_target(60), -60);
-        assert_eq!(demand.negative_q_target(600), -480);
+        assert_eq!(demand.negative_q_target(900), -838);
     }
 
     #[test]

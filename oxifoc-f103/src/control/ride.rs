@@ -1,8 +1,7 @@
 //! Local-throttle ride authority and Hall-progress lifecycle.
 
-use crate::sensors::throttle::{
-    Observation as ThrottleObservation, RIDE_PHASE_CURRENT_LIMIT_COUNTS,
-};
+use crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS;
+use crate::sensors::throttle::Observation as ThrottleObservation;
 
 pub const OUTPUT_LEASE_CYCLES: u32 = 160;
 pub const STARTUP_HALL_TIMEOUT_MS: u32 = 500;
@@ -293,7 +292,7 @@ mod tests {
             now_ms,
             throttle: ThrottleObservation::from_raw(throttle_raw),
             brake_active: false,
-            environment_dc_limit_counts: Some(240),
+            environment_dc_limit_counts: Some(crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS),
             hall_valid: true,
             current_valid: true,
             fault_flags: 0,
@@ -322,7 +321,7 @@ mod tests {
         );
         let command = controller.update(observation(2, FULL_ADC));
         assert!(command.energize);
-        assert_eq!(command.target_q_counts, -480);
+        assert_eq!(command.target_q_counts, -838);
     }
 
     #[test]

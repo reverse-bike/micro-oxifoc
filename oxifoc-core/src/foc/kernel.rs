@@ -19,6 +19,7 @@ pub struct FocKernel<
     vector_limit_ticks: N,
     phase_limit_ticks: u16,
     applied_voltage: Dq<N>,
+    voltage_limited: bool,
     backend: PhantomData<(T, M)>,
 }
 
@@ -40,6 +41,7 @@ where
             vector_limit_ticks,
             phase_limit_ticks,
             applied_voltage: Dq::new(N::ZERO, N::ZERO),
+            voltage_limited: false,
             backend: PhantomData,
         }
     }
@@ -48,10 +50,15 @@ where
         self.direct.reset();
         self.quadrature.reset();
         self.applied_voltage = Dq::new(N::ZERO, N::ZERO);
+        self.voltage_limited = false;
     }
 
     pub const fn applied_voltage(&self) -> Dq<N> {
         self.applied_voltage
+    }
+
+    pub const fn voltage_limited(&self) -> bool {
+        self.voltage_limited
     }
 
     pub fn phase_current_limit_from_dc(
@@ -115,6 +122,7 @@ where
         );
         let applied = limit_voltage_direct_priority(requested, self.vector_limit_ticks);
         self.applied_voltage = applied;
+        self.voltage_limited = applied != requested;
         self.direct
             .apply_back_calculation(direct_update, applied.d - requested.d);
         self.quadrature
@@ -168,6 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn kernel_reports_and_resets_voltage_limiting() {
+        let mut kernel = fixed_kernel();
+        let _ = kernel.step(
+            Fixed::ZERO,
+            Fixed::ZERO,
+            0,
+            Dq::new(Fixed::from_integer(10_000), Fixed::ZERO),
+            1_125,
+        );
+        assert!(kernel.voltage_limited());
+        kernel.reset();
+        assert!(!kernel.voltage_limited());
+        assert_eq!(kernel.applied_voltage(), Dq::new(Fixed::ZERO, Fixed::ZERO));
+    }
+
+    #[test]
     fn fixed_kernel_back_calculation_tracks_the_applied_vector() {
         let mut kernel = fixed_kernel();
         for _ in 0..100 {
@@ -195,15 +219,15 @@ mod tests {
     #[test]
     fn dc_projection_is_bounded_by_the_phase_envelope() {
         let mut kernel = fixed_kernel();
-        assert_eq!(kernel.phase_current_limit_from_dc(240, 480, 2_250), 480);
+        assert_eq!(kernel.phase_current_limit_from_dc(250, 838, 2_250), 838);
         let _ = kernel.step(
             Fixed::ZERO,
             Fixed::ZERO,
             0,
-            Dq::new(Fixed::ZERO, Fixed::from_integer(-480)),
+            Dq::new(Fixed::ZERO, Fixed::from_integer(-838)),
             1_125,
         );
-        assert!((1..=480).contains(&kernel.phase_current_limit_from_dc(240, 480, 2_250)));
+        assert!((1..=838).contains(&kernel.phase_current_limit_from_dc(250, 838, 2_250)));
     }
 
     #[cfg(feature = "algorithms")]

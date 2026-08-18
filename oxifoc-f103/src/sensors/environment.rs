@@ -1,9 +1,10 @@
 //! Local voltage and temperature conversion plus the ride-current envelope.
 
+use crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS;
+
 pub const UPDATE_PERIOD_MS: u32 = 50;
 pub const DC_BUS_UNDERVOLTAGE_MV: u32 = 39_000;
 pub const DC_BUS_UNDERVOLTAGE_SAMPLES: u8 = 20;
-pub const MAXIMUM_DRIVE_CURRENT_COUNTS: u8 = 240;
 const CONTROLLER_DERATE_START_DECI_C: i16 = 700;
 const CONTROLLER_STOP_DECI_C: i16 = 800;
 const MOTOR_DERATE_START_DECI_C: i16 = 1_000;
@@ -162,14 +163,14 @@ fn thermistor_segment(intercept: i32, slope: i32, millivolts: i32) -> i32 {
 
 fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u8 {
     if temperature <= start {
-        return MAXIMUM_DRIVE_CURRENT_COUNTS;
+        return RIDE_DC_BUS_CURRENT_LIMIT_COUNTS;
     }
     if temperature >= stop {
         return 0;
     }
     let remaining = u32::from(stop.saturating_sub(temperature) as u16);
     let span = u32::from(stop.saturating_sub(start) as u16);
-    u32::from(MAXIMUM_DRIVE_CURRENT_COUNTS)
+    u32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS)
         .saturating_mul(remaining)
         .checked_div(span)
         .unwrap_or_default() as u8
@@ -202,15 +203,15 @@ mod tests {
     fn missing_local_sensor_data_removes_drive_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
         assert_eq!(monitor.update(0, RawLocalSensors::default()), None);
-        assert_eq!(monitor.update(50, nominal()), Some(240));
+        assert_eq!(monitor.update(50, nominal()), Some(250));
     }
 
     #[test]
     fn local_temperatures_derate_to_zero() {
-        assert_eq!(thermal_limit_counts(700, 700, 800), 240);
-        assert_eq!(thermal_limit_counts(750, 700, 800), 120);
+        assert_eq!(thermal_limit_counts(700, 700, 800), 250);
+        assert_eq!(thermal_limit_counts(750, 700, 800), 125);
         assert_eq!(thermal_limit_counts(800, 700, 800), 0);
-        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 120);
+        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 125);
 
         let mut monitor = EnvironmentMonitor::new(0);
         let mut hot = nominal();
@@ -234,7 +235,7 @@ mod tests {
         for sample in 20..40 {
             assert_eq!(monitor.update(sample * 50, nominal()), Some(0));
         }
-        assert_eq!(monitor.update(40 * 50, nominal()), Some(240));
+        assert_eq!(monitor.update(40 * 50, nominal()), Some(250));
         assert_eq!(monitor.derating_reasons(), 0);
     }
 

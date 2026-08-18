@@ -15,6 +15,7 @@ use stm32f1::stm32f103::interrupt;
 const CONTROL_HALL_VALID: u32 = 1;
 const CONTROL_CURRENT_VALID: u32 = 1 << 1;
 const CONTROL_OUTPUT_ACTIVE: u32 = 1 << 2;
+const CONTROL_VOLTAGE_LIMITED: u32 = 1 << 3;
 const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_WARNING_CYCLES: u32 = 3_900;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
@@ -33,6 +34,14 @@ static INJECTED_SAMPLES: AtomicU32 = AtomicU32::new(0);
 static CONTROL_MAX_CYCLES: AtomicU32 = AtomicU32::new(0);
 static CONTROL_BUDGET_WARNINGS: AtomicU32 = AtomicU32::new(0);
 static CONTROL_BUDGET_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+static LIVE_TARGET_AND_LIMIT: AtomicU32 = AtomicU32::new(0);
+static LIVE_MEASURED_DQ: AtomicU32 = AtomicU32::new(0);
+static LIVE_APPLIED_DQ: AtomicU32 = AtomicU32::new(0);
+static LIVE_PWM_SPAN: AtomicU32 = AtomicU32::new(0);
+static MAXIMUM_PHASE_CURRENT_ABS: AtomicU32 = AtomicU32::new(0);
+static MAXIMUM_DIRECT_CURRENT_ABS: AtomicU32 = AtomicU32::new(0);
+static MAXIMUM_QUADRATURE_ERROR_ABS: AtomicU32 = AtomicU32::new(0);
+static MAXIMUM_PWM_SPAN: AtomicU32 = AtomicU32::new(0);
 static VALIDATED_HALL_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static VALIDATED_HALL_INTERVAL_US: AtomicU32 = AtomicU32::new(0);
 static VALIDATED_HALL_PROGRESS: AtomicI32 = AtomicI32::new(0);
@@ -49,6 +58,18 @@ pub struct Snapshot {
     pub hall_valid: bool,
     pub current_valid: bool,
     pub output_active: bool,
+    pub voltage_limited: bool,
+    pub target_q_counts: i16,
+    pub phase_current_limit_counts: u16,
+    pub measured_d_counts: i16,
+    pub measured_q_counts: i16,
+    pub applied_d_ticks: i16,
+    pub applied_q_ticks: i16,
+    pub pwm_span_ticks: u16,
+    pub maximum_phase_current_abs: u16,
+    pub maximum_direct_current_abs: u16,
+    pub maximum_quadrature_error_abs: u16,
+    pub maximum_pwm_span_ticks: u16,
     pub safety_events: u32,
     pub phase_current_trips: u32,
     pub hall_sequence: u32,
@@ -117,7 +138,10 @@ pub fn authorize_ride_target(
         ),
         Ordering::Relaxed,
     );
-    DC_CURRENT_LIMIT_COUNTS.store(u32::from(dc_current_limit_counts), Ordering::Relaxed);
+    DC_CURRENT_LIMIT_COUNTS.store(
+        u32::from(dc_current_limit_counts.min(crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS)),
+        Ordering::Relaxed,
+    );
     COMMAND_SAFETY_EPOCH.store(safety_epoch, Ordering::Relaxed);
     let now = CONTROL_CYCLE.load(Ordering::Acquire);
     COMMAND_DEADLINE.store(now.wrapping_add(lifetime_cycles), Ordering::Release);
@@ -133,10 +157,28 @@ pub fn revoke_ride_authority() {
 
 pub fn snapshot() -> Snapshot {
     let flags = CONTROL_FLAGS.load(Ordering::Acquire);
+    let (target_q_counts, phase_current_limit_counts) =
+        unpack_target_and_limit(LIVE_TARGET_AND_LIMIT.load(Ordering::Relaxed));
+    let (measured_d_counts, measured_q_counts) =
+        unpack_i16_pair(LIVE_MEASURED_DQ.load(Ordering::Relaxed));
+    let (applied_d_ticks, applied_q_ticks) =
+        unpack_i16_pair(LIVE_APPLIED_DQ.load(Ordering::Relaxed));
     Snapshot {
         hall_valid: flags & CONTROL_HALL_VALID != 0,
         current_valid: flags & CONTROL_CURRENT_VALID != 0,
         output_active: flags & CONTROL_OUTPUT_ACTIVE != 0,
+        voltage_limited: flags & CONTROL_VOLTAGE_LIMITED != 0,
+        target_q_counts,
+        phase_current_limit_counts,
+        measured_d_counts,
+        measured_q_counts,
+        applied_d_ticks,
+        applied_q_ticks,
+        pwm_span_ticks: LIVE_PWM_SPAN.load(Ordering::Relaxed) as u16,
+        maximum_phase_current_abs: MAXIMUM_PHASE_CURRENT_ABS.load(Ordering::Relaxed) as u16,
+        maximum_direct_current_abs: MAXIMUM_DIRECT_CURRENT_ABS.load(Ordering::Relaxed) as u16,
+        maximum_quadrature_error_abs: MAXIMUM_QUADRATURE_ERROR_ABS.load(Ordering::Relaxed) as u16,
+        maximum_pwm_span_ticks: MAXIMUM_PWM_SPAN.load(Ordering::Relaxed) as u16,
         safety_events: CONTROL_SAFETY_EVENTS.load(Ordering::Acquire),
         phase_current_trips: PHASE_CURRENT_TRIPS.load(Ordering::Relaxed),
         hall_sequence: VALIDATED_HALL_SEQUENCE.load(Ordering::Acquire),
@@ -179,9 +221,17 @@ const fn lease_is_active(now: u32, deadline: u32) -> bool {
 fn stop_control(state: &mut ControlState, safety_loss: bool) {
     hardware::disable_motor_outputs();
     hardware::write_pwm_neutral();
-    publish_flag(CONTROL_OUTPUT_ACTIVE, false);
+    CONTROL_FLAGS.fetch_and(
+        !(CONTROL_OUTPUT_ACTIVE | CONTROL_VOLTAGE_LIMITED),
+        Ordering::Release,
+    );
+    LIVE_TARGET_AND_LIMIT.store(0, Ordering::Relaxed);
+    LIVE_MEASURED_DQ.store(0, Ordering::Relaxed);
+    LIVE_APPLIED_DQ.store(0, Ordering::Relaxed);
+    LIVE_PWM_SPAN.store(0, Ordering::Relaxed);
     state.kernel.reset();
     state.target_ramp.reset();
+    state.command_was_enabled = false;
     if safety_loss {
         note_safety_loss();
     }
@@ -242,6 +292,18 @@ fn control_cycle() {
             return;
         }
     };
+    if lease_active || output_was_active {
+        update_max(
+            &MAXIMUM_PHASE_CURRENT_ABS,
+            u32::from(
+                current
+                    .phase_a
+                    .unsigned_abs()
+                    .max(current.phase_b.unsigned_abs())
+                    .max(current.phase_c.unsigned_abs()),
+            ),
+        );
+    }
     if current.exceeds_limit(crate::config::PHASE_CURRENT_TRIP_COUNTS)
         && (lease_active || output_was_active)
     {
@@ -354,8 +416,39 @@ fn control_cycle() {
         state.hall.injection(),
         crate::config::PWM_NEUTRAL,
     );
+    let measured_d_counts = fixed_to_i16(measured_current.d);
+    let measured_q_counts = fixed_to_i16(measured_current.q);
+    let applied_voltage = state.kernel.applied_voltage();
+    let applied_d_ticks = fixed_to_i16(applied_voltage.d);
+    let applied_q_ticks = fixed_to_i16(applied_voltage.q);
+    let pwm_span_ticks = pwm_span(duty);
+    LIVE_TARGET_AND_LIMIT.store(
+        pack_target_and_limit(target_q as i16, phase_limit),
+        Ordering::Relaxed,
+    );
+    LIVE_MEASURED_DQ.store(
+        pack_i16_pair(measured_d_counts, measured_q_counts),
+        Ordering::Relaxed,
+    );
+    LIVE_APPLIED_DQ.store(
+        pack_i16_pair(applied_d_ticks, applied_q_ticks),
+        Ordering::Relaxed,
+    );
+    LIVE_PWM_SPAN.store(u32::from(pwm_span_ticks), Ordering::Relaxed);
+    publish_flag(CONTROL_VOLTAGE_LIMITED, state.kernel.voltage_limited());
+    update_max(
+        &MAXIMUM_DIRECT_CURRENT_ABS,
+        u32::from(measured_d_counts.unsigned_abs()),
+    );
+    update_max(
+        &MAXIMUM_QUADRATURE_ERROR_ABS,
+        target_q
+            .saturating_sub(i32::from(measured_q_counts))
+            .unsigned_abs(),
+    );
+    update_max(&MAXIMUM_PWM_SPAN, u32::from(pwm_span_ticks));
     state.hall.update(&ControlPhaseInput {
-        applied_voltage: state.kernel.applied_voltage(),
+        applied_voltage,
         measured_current,
         electrical_angle: angle,
         control_period_ns: CONTROL_PERIOD_NS,
@@ -388,6 +481,46 @@ fn update_max(target: &AtomicU32, value: u32) {
             Err(updated) => current = updated,
         }
     }
+}
+
+fn fixed_to_i16(value: Fixed) -> i16 {
+    value
+        .integer()
+        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+fn pwm_span(duty: oxifoc_core::foc::PwmDuty) -> u16 {
+    let minimum = duty.a.min(duty.b).min(duty.c);
+    let maximum = duty.a.max(duty.b).max(duty.c);
+    maximum - minimum
+}
+
+fn pack_i16_pair(low: i16, high: i16) -> u32 {
+    let low = low.to_le_bytes();
+    let high = high.to_le_bytes();
+    u32::from_le_bytes([low[0], low[1], high[0], high[1]])
+}
+
+fn unpack_i16_pair(packed: u32) -> (i16, i16) {
+    let bytes = packed.to_le_bytes();
+    (
+        i16::from_le_bytes([bytes[0], bytes[1]]),
+        i16::from_le_bytes([bytes[2], bytes[3]]),
+    )
+}
+
+fn pack_target_and_limit(target: i16, limit: u16) -> u32 {
+    let target = target.to_le_bytes();
+    let limit = limit.to_le_bytes();
+    u32::from_le_bytes([target[0], target[1], limit[0], limit[1]])
+}
+
+fn unpack_target_and_limit(packed: u32) -> (i16, u16) {
+    let bytes = packed.to_le_bytes();
+    (
+        i16::from_le_bytes([bytes[0], bytes[1]]),
+        u16::from_le_bytes([bytes[2], bytes[3]]),
+    )
 }
 
 fn recover_stationary_hall(state: &mut ControlState) -> bool {

@@ -107,12 +107,16 @@ already valid local ride request; every authority decision still comes from
 the directly wired inputs and local protection state.
 
 Forward torque is negative q. Demand increases by four current counts per
-millisecond and reductions apply immediately. Startup permits at most 480
-phase-current counts for two seconds, requires its first Hall edge within 500
-ms, and requires twelve net-forward Hall transitions. The software
-phase-current guard trips above 768 counts on A, B, or reconstructed C. The
-local 39 V undervoltage debounce and controller/motor thermal envelopes can
-only reduce the 240-count DC-side limit.
+millisecond and reductions apply immediately. The ride ceiling is 838 phase-
+current counts (134.08 A at the calibrated 160 mA/count), including during the
+two-second startup window. Startup requires its first Hall edge within 500 ms
+and twelve net-forward Hall transitions. The software phase-current guard
+trips above 1,344 counts (215.04 A) on A, B, or reconstructed C, preserving at
+least the established 1.6-times margin over commanded phase current. The local
+39 V undervoltage debounce and controller/motor thermal envelopes can only
+reduce the 250-count (40 A) DC-side limit. DC projection dynamically reduces
+the phase-current target as applied modulation rises. The 1,250-tick voltage-
+vector ceiling, PI gains, Hall estimator, and target ramp are unchanged.
 
 ## CAN and updater
 
@@ -123,7 +127,15 @@ on PA13. The application provides:
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
   including local brake, wheel speed/distance, temperatures, and fault pages;
 - updater reset on `0x67F#AA552A002A...`;
-- passive bring-up pages 6, 8, and 9 on `0x2F7`.
+- commissioning pages 6 and 8--13 on `0x2F7`.
+
+Pages 10 and 11 report live target/measured dq current, ride stage, output and
+voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
+span. Page 12 carries the full internal fault mask and safety-event count.
+Page 13 retains peak phase current, direct current, quadrature tracking error,
+and PWM span from boot so short transients remain visible at CAN telemetry
+rates. The project-page scheduler advances through all seven pages without the
+`u8` wraparound phase discontinuity.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -154,5 +166,5 @@ Host behavior tests, target Clippy, linking, section inspection, stack-size
 metadata, and bootloader-image validation can establish software consistency
 and the real flash/RAM footprint. They cannot prove GPIO polarity, current
 scaling, Hall geometry, control-loop cycle time, or motor direction on this
-specific board. Those remain hardware commissioning gates; this repository has
-not flashed the generated image.
+specific board. Those remain hardware commissioning gates. The generated
+838-count image has not been flashed as part of this change.

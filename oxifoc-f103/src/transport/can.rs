@@ -43,7 +43,7 @@ static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TRANSMIT_LOCKED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_SLOT: AtomicU8 = AtomicU8::new(0);
 static STOCK_FAULT_PAGE: AtomicU8 = AtomicU8::new(0);
-static PASSIVE_INPUT_PAGE: AtomicU8 = AtomicU8::new(0);
+static PROJECT_TELEMETRY_PAGE: AtomicU8 = AtomicU8::new(0);
 static NEXT_TELEMETRY_MS: AtomicU32 = AtomicU32::new(0);
 
 pub fn initialize() -> bool {
@@ -97,13 +97,15 @@ pub fn service(
     dc_bus_undervoltage: bool,
     effective_current_limit: u8,
     derating_reasons: u8,
+    ride_stage: u8,
 ) {
     let next = NEXT_TELEMETRY_MS.load(Ordering::Relaxed);
     if next != now_ms && next.wrapping_sub(now_ms) < 0x8000_0000 {
         return;
     }
     NEXT_TELEMETRY_MS.store(now_ms.wrapping_add(50), Ordering::Relaxed);
-    let slot = TELEMETRY_SLOT.fetch_add(1, Ordering::Relaxed) % 60;
+    let slot = TELEMETRY_SLOT.load(Ordering::Relaxed);
+    TELEMETRY_SLOT.store(protocol::next_telemetry_slot(slot), Ordering::Relaxed);
     let inputs = sensors::latest();
     let control = foc::snapshot();
     let fault_page = STOCK_FAULT_PAGE.load(Ordering::Relaxed);
@@ -133,9 +135,9 @@ pub fn service(
         STOCK_FAULT_PAGE.store(fault_page.wrapping_add(1) & 3, Ordering::Relaxed);
     }
     if mailboxes_used < 3 {
-        let page = PASSIVE_INPUT_PAGE.load(Ordering::Relaxed);
-        let frame = if page < 2 {
-            protocol::passive_input_telemetry(
+        let page = PROJECT_TELEMETRY_PAGE.load(Ordering::Relaxed);
+        let frame = match page {
+            0 | 1 => protocol::passive_input_telemetry(
                 page,
                 protocol::PassiveInputTelemetry {
                     analog_valid: inputs.analog_valid,
@@ -157,16 +159,44 @@ pub fn service(
                     controller_temperature_deci_c: controller_temperature,
                     motor_temperature_deci_c: motor_temperature,
                 },
-            )
-        } else {
-            protocol::control_timing_telemetry(protocol::ControlTimingTelemetry {
+            ),
+            2 => protocol::control_timing_telemetry(protocol::ControlTimingTelemetry {
                 current_trips: control.phase_current_trips,
                 maximum_cycles: control.control_max_cycles,
                 warning_count: control.control_budget_warnings,
-            })
+            }),
+            3 => protocol::control_live_telemetry(protocol::ControlLiveTelemetry {
+                hall_valid: control.hall_valid,
+                current_valid: control.current_valid,
+                output_active: control.output_active,
+                voltage_limited: control.voltage_limited,
+                ride_stage,
+                target_q_counts: control.target_q_counts,
+                measured_d_counts: control.measured_d_counts,
+                measured_q_counts: control.measured_q_counts,
+            }),
+            4 => protocol::control_output_telemetry(protocol::ControlOutputTelemetry {
+                phase_limit_counts: control.phase_current_limit_counts,
+                applied_d_ticks: control.applied_d_ticks,
+                applied_q_ticks: control.applied_q_ticks,
+                pwm_span_ticks: control.pwm_span_ticks,
+            }),
+            5 => protocol::control_fault_telemetry(protocol::ControlFaultTelemetry {
+                fault_flags: control.fault_flags,
+                safety_events: control.safety_events.min(u32::from(u16::MAX)) as u16,
+            }),
+            _ => protocol::control_peak_telemetry(protocol::ControlPeakTelemetry {
+                maximum_phase_current_abs: control.maximum_phase_current_abs,
+                maximum_direct_current_abs: control.maximum_direct_current_abs,
+                maximum_quadrature_error_abs: control.maximum_quadrature_error_abs,
+                maximum_pwm_span_ticks: control.maximum_pwm_span_ticks,
+            }),
         };
         if transmit(frame) {
-            PASSIVE_INPUT_PAGE.store(if page == 2 { 0 } else { page + 1 }, Ordering::Relaxed);
+            PROJECT_TELEMETRY_PAGE.store(
+                protocol::next_project_telemetry_page(page),
+                Ordering::Relaxed,
+            );
         }
     }
 }

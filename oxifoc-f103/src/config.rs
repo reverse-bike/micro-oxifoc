@@ -35,12 +35,14 @@ pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
 );
 
 pub const CURRENT_MA_PER_COUNT: i32 = 160;
-pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 768;
-pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 480;
-pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u8 = 240;
+pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
+pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 838;
+pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u8 = 250;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
+const _: () =
+    assert!((PHASE_CURRENT_TRIP_COUNTS as u32) * 5 >= (RIDE_PHASE_CURRENT_LIMIT_COUNTS as u32) * 8);
 const _: () = assert!(FOC_PHASE_LIMIT_TICKS < FOC_HARD_PHASE_LIMIT_TICKS);
 const _: () = assert!(TARGET_RAMP_CYCLES_PER_STEP > 0);
 const _: () = assert!(
@@ -196,5 +198,24 @@ mod tests {
         assert_eq!(REGULAR_ADC_CHANNELS, [13, 15, 8, 5, 16]);
         assert_eq!(regular_adc_sequence_register_1(), 0x0040_0000);
         assert_eq!(regular_adc_sequence_register_3(), 0x0102_a1ed);
+    }
+
+    #[test]
+    fn ride_current_envelope_matches_the_full_power_configuration() {
+        assert_eq!(RIDE_PHASE_CURRENT_LIMIT_COUNTS, 838);
+        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 250);
+        assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
+        assert_eq!(
+            i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
+            134_080
+        );
+        assert_eq!(
+            i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
+            40_000
+        );
+        assert!(
+            u32::from(PHASE_CURRENT_TRIP_COUNTS) * 5
+                >= u32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * 8
+        );
     }
 }

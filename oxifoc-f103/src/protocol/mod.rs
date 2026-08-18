@@ -109,6 +109,14 @@ pub fn telemetry_slot(slot: u8, snapshot: StockTelemetry) -> [Option<Frame>; 3] 
     }
 }
 
+pub const fn next_telemetry_slot(slot: u8) -> u8 {
+    if slot >= 59 { 0 } else { slot + 1 }
+}
+
+pub const fn next_project_telemetry_page(page: u8) -> u8 {
+    if page >= 6 { 0 } else { page + 1 }
+}
+
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
     Frame::new(0x200, 8, [0, 0, 0, 0, 0, 0, faults[0], faults[1]])
@@ -191,6 +199,40 @@ pub struct ControlTimingTelemetry {
     pub warning_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlLiveTelemetry {
+    pub hall_valid: bool,
+    pub current_valid: bool,
+    pub output_active: bool,
+    pub voltage_limited: bool,
+    pub ride_stage: u8,
+    pub target_q_counts: i16,
+    pub measured_d_counts: i16,
+    pub measured_q_counts: i16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlOutputTelemetry {
+    pub phase_limit_counts: u16,
+    pub applied_d_ticks: i16,
+    pub applied_q_ticks: i16,
+    pub pwm_span_ticks: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlFaultTelemetry {
+    pub fault_flags: u32,
+    pub safety_events: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPeakTelemetry {
+    pub maximum_phase_current_abs: u16,
+    pub maximum_direct_current_abs: u16,
+    pub maximum_quadrature_error_abs: u16,
+    pub maximum_pwm_span_ticks: u16,
+}
+
 /// The two passive commissioning pages retain the established `0x2F7` page-8
 /// and page-9 field locations without claiming the complete ride telemetry
 /// schema. They never grant motor authority.
@@ -266,6 +308,99 @@ pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
     )
 }
 
+/// Page 10: instantaneous current-loop demand and response. The ride stage is
+/// packed into the upper flag nibble and therefore remains limited to 0--7.
+pub fn control_live_telemetry(snapshot: ControlLiveTelemetry) -> Frame {
+    let flags = u8::from(snapshot.hall_valid)
+        | (u8::from(snapshot.current_valid) << 1)
+        | (u8::from(snapshot.output_active) << 2)
+        | (u8::from(snapshot.voltage_limited) << 3)
+        | ((snapshot.ride_stage & 7) << 4);
+    let target = snapshot.target_q_counts.to_le_bytes();
+    let direct = snapshot.measured_d_counts.to_le_bytes();
+    let quadrature = snapshot.measured_q_counts.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            10,
+            flags,
+            target[0],
+            target[1],
+            direct[0],
+            direct[1],
+            quadrature[0],
+            quadrature[1],
+        ],
+    )
+}
+
+/// Page 11: instantaneous dynamic current limit and applied modulation. PWM
+/// span is encoded in 16-tick units so the complete timer range fits in one
+/// byte.
+pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
+    let phase_limit = snapshot.phase_limit_counts.to_le_bytes();
+    let direct = snapshot.applied_d_ticks.to_le_bytes();
+    let quadrature = snapshot.applied_q_ticks.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            11,
+            phase_limit[0],
+            phase_limit[1],
+            direct[0],
+            direct[1],
+            quadrature[0],
+            quadrature[1],
+            (snapshot.pwm_span_ticks / 16).min(u16::from(u8::MAX)) as u8,
+        ],
+    )
+}
+
+/// Page 12: the complete internal hardware/software fault mask and saturated
+/// safety-loss count.
+pub fn control_fault_telemetry(snapshot: ControlFaultTelemetry) -> Frame {
+    let faults = snapshot.fault_flags.to_le_bytes();
+    let safety_events = snapshot.safety_events.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            12,
+            faults[0],
+            faults[1],
+            faults[2],
+            faults[3],
+            safety_events[0],
+            safety_events[1],
+            0,
+        ],
+    )
+}
+
+/// Page 13: boot-retained control peaks. PWM span uses the same 16-tick scale
+/// as page 11.
+pub fn control_peak_telemetry(snapshot: ControlPeakTelemetry) -> Frame {
+    let phase = snapshot.maximum_phase_current_abs.to_le_bytes();
+    let direct = snapshot.maximum_direct_current_abs.to_le_bytes();
+    let quadrature = snapshot.maximum_quadrature_error_abs.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            13,
+            phase[0],
+            phase[1],
+            direct[0],
+            direct[1],
+            quadrature[0],
+            quadrature[1],
+            (snapshot.maximum_pwm_span_ticks / 16).min(u16::from(u8::MAX)) as u8,
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +445,30 @@ mod tests {
             }
         }
         assert!(found.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn telemetry_schedule_keeps_its_sixty_slot_phase_across_u8_wrap() {
+        let mut slot = 0;
+        let mut visits = [0_u16; 60];
+        for _ in 0..600 {
+            visits[usize::from(slot)] += 1;
+            slot = next_telemetry_slot(slot);
+        }
+        assert_eq!(slot, 0);
+        assert!(visits.into_iter().all(|count| count == 10));
+    }
+
+    #[test]
+    fn project_telemetry_rotates_through_all_seven_pages() {
+        let mut page = 0;
+        let mut visits = [0_u8; 7];
+        for _ in 0..70 {
+            visits[usize::from(page)] += 1;
+            page = next_project_telemetry_page(page);
+        }
+        assert_eq!(page, 0);
+        assert!(visits.into_iter().all(|count| count == 10));
     }
 
     #[test]
@@ -364,21 +523,21 @@ mod tests {
             throttle_at_rest: true,
             throttle_raw: 726,
             throttle_demand: 0,
-            throttle_current_limit_counts: 480,
+            throttle_current_limit_counts: 838,
             live_hall_state: 5,
             bus_voltage_mv: 52_300,
-            effective_current_limit: 240,
+            effective_current_limit: 250,
             derating_reasons: 0,
             controller_temperature_deci_c: Some(410),
             motor_temperature_deci_c: Some(270),
         };
         assert_eq!(
             passive_input_telemetry(0, snapshot).data,
-            [8, 0, 0xd6, 0x02, 0, 240, 0x15, 5]
+            [8, 0, 0xd6, 0x02, 0, 0xa3, 0x15, 0x0d]
         );
         assert_eq!(
             passive_input_telemetry(1, snapshot).data,
-            [9, 240, 0, 0, 0x0b, 0x02, 81, 67]
+            [9, 250, 0, 0, 0x0b, 0x02, 81, 67]
         );
     }
 
@@ -392,6 +551,55 @@ mod tests {
             })
             .data,
             [6, 0, 1, 0, 0x74, 0x05, 2, 0]
+        );
+    }
+
+    #[test]
+    fn control_commissioning_pages_are_compact_and_lossless() {
+        let live = ControlLiveTelemetry {
+            hall_valid: true,
+            current_valid: true,
+            output_active: true,
+            voltage_limited: true,
+            ride_stage: 4,
+            target_q_counts: -838,
+            measured_d_counts: -17,
+            measured_q_counts: -801,
+        };
+        assert_eq!(
+            control_live_telemetry(live).data,
+            [10, 0x4f, 0xba, 0xfc, 0xef, 0xff, 0xdf, 0xfc]
+        );
+
+        let output = ControlOutputTelemetry {
+            phase_limit_counts: 838,
+            applied_d_ticks: -123,
+            applied_q_ticks: -1_240,
+            pwm_span_ticks: 2_168,
+        };
+        assert_eq!(
+            control_output_telemetry(output).data,
+            [11, 0x46, 0x03, 0x85, 0xff, 0x28, 0xfb, 135]
+        );
+
+        let faults = ControlFaultTelemetry {
+            fault_flags: 0x1234_5678,
+            safety_events: 0xabcd,
+        };
+        assert_eq!(
+            control_fault_telemetry(faults).data,
+            [12, 0x78, 0x56, 0x34, 0x12, 0xcd, 0xab, 0]
+        );
+
+        let peaks = ControlPeakTelemetry {
+            maximum_phase_current_abs: 1_337,
+            maximum_direct_current_abs: 55,
+            maximum_quadrature_error_abs: 222,
+            maximum_pwm_span_ticks: 2_168,
+        };
+        assert_eq!(
+            control_peak_telemetry(peaks).data,
+            [13, 0x39, 0x05, 55, 0, 222, 0, 135]
         );
     }
 }
