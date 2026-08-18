@@ -5,9 +5,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FocKernel, Pi,
+    Dq, Fixed, FocController, PIController,
+    hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
-    phase::{ControlPhaseInput, ControlPhaseProvider, HallTracker},
+    phase::{PhaseInput, PhaseManager, PhaseProvider},
     ramp::QuadratureTargetRamp,
 };
 use stm32f1::stm32f103::interrupt;
@@ -49,9 +50,49 @@ static ELECTRICAL_RPM: AtomicI32 = AtomicI32::new(0);
 
 struct IsrCell<T>(UnsafeCell<T>);
 
-// SAFETY: the contained state is accessed only by TIM1_UP after initialization
-// completes with that interrupt masked.
+// SAFETY: each instance below documents how interrupt/foreground exclusion is
+// maintained for its contained value.
 unsafe impl<T> Sync for IsrCell<T> {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectCurrentPeakEvent {
+    pub generation: u8,
+    pub measured_d_counts: i16,
+    pub measured_q_counts: i16,
+    pub target_q_counts: i16,
+    pub hall_raw: u8,
+    pub hall_angle_direction: i8,
+    pub edge_age_us: u16,
+    pub hall_interval_us: u16,
+    pub measurement_angle_q16: u16,
+    pub unlimited_angle_q16: u16,
+    pub phase_a_counts: i16,
+    pub phase_b_counts: i16,
+    pub applied_d_ticks: i16,
+    pub applied_q_ticks: i16,
+    pub voltage_limited: bool,
+    pub angle_rate_limited: bool,
+}
+
+static PEAK_DIRECT_EVENT: IsrCell<DirectCurrentPeakEvent> =
+    IsrCell(UnsafeCell::new(DirectCurrentPeakEvent {
+        generation: 0,
+        measured_d_counts: 0,
+        measured_q_counts: 0,
+        target_q_counts: 0,
+        hall_raw: 0,
+        hall_angle_direction: 0,
+        edge_age_us: 0,
+        hall_interval_us: 0,
+        measurement_angle_q16: 0,
+        unlimited_angle_q16: 0,
+        phase_a_counts: 0,
+        phase_b_counts: 0,
+        applied_d_ticks: 0,
+        applied_q_ticks: 0,
+        voltage_limited: false,
+        angle_rate_limited: false,
+    }));
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
@@ -70,6 +111,7 @@ pub struct Snapshot {
     pub maximum_direct_current_abs: u16,
     pub maximum_quadrature_error_abs: u16,
     pub maximum_pwm_span_ticks: u16,
+    pub maximum_direct_event: DirectCurrentPeakEvent,
     pub safety_events: u32,
     pub phase_current_trips: u32,
     pub hall_sequence: u32,
@@ -85,9 +127,9 @@ pub struct Snapshot {
 }
 
 struct ControlState {
-    kernel: FocKernel,
+    controller: FocController,
     target_ramp: QuadratureTargetRamp,
-    hall: HallTracker,
+    phase: PhaseManager<HallSensor>,
     offsets: CurrentOffsets,
     offset_tracker: CurrentOffsetTracker,
     hardware_hall_sequence: u32,
@@ -99,19 +141,19 @@ struct ControlState {
 static CONTROL: IsrCell<Option<ControlState>> = IsrCell(UnsafeCell::new(None));
 
 pub fn start(offsets: CurrentOffsets) {
-    let mut hall = HallTracker::new(&crate::config::HALL_GEOMETRY);
+    let mut hall = HallSensor::new(&crate::config::HALL_GEOMETRY);
     let hall_valid = hall.seed(hardware::live_hall_state()).is_ok();
     let initial_flags = if hall_valid { CONTROL_HALL_VALID } else { 0 };
     CONTROL_FLAGS.store(initial_flags, Ordering::Release);
     // SAFETY: TIM1_UP remains masked until start_tim1_control_loop returns.
     unsafe {
         CONTROL.0.get().write(Some(ControlState {
-            kernel: ride_foc_kernel(),
+            controller: ride_foc_controller(),
             target_ramp: QuadratureTargetRamp::new(
                 crate::config::TARGET_RAMP_CYCLES_PER_STEP,
                 crate::config::TARGET_RAMP_COUNTS_PER_STEP,
             ),
-            hall,
+            phase: PhaseManager::with_hall(hall),
             offsets,
             offset_tracker: CurrentOffsetTracker::new(offsets.phase_a, offsets.phase_b),
             hardware_hall_sequence: 0,
@@ -163,6 +205,9 @@ pub fn snapshot() -> Snapshot {
         unpack_i16_pair(LIVE_MEASURED_DQ.load(Ordering::Relaxed));
     let (applied_d_ticks, applied_q_ticks) =
         unpack_i16_pair(LIVE_APPLIED_DQ.load(Ordering::Relaxed));
+    // SAFETY: TIM1_UP is the only writer, and global interrupt masking keeps
+    // this multiword copy coherent with the exact cycle that set the peak.
+    let maximum_direct_event = cortex_m::interrupt::free(|_| unsafe { *PEAK_DIRECT_EVENT.0.get() });
     Snapshot {
         hall_valid: flags & CONTROL_HALL_VALID != 0,
         current_valid: flags & CONTROL_CURRENT_VALID != 0,
@@ -179,6 +224,7 @@ pub fn snapshot() -> Snapshot {
         maximum_direct_current_abs: MAXIMUM_DIRECT_CURRENT_ABS.load(Ordering::Relaxed) as u16,
         maximum_quadrature_error_abs: MAXIMUM_QUADRATURE_ERROR_ABS.load(Ordering::Relaxed) as u16,
         maximum_pwm_span_ticks: MAXIMUM_PWM_SPAN.load(Ordering::Relaxed) as u16,
+        maximum_direct_event,
         safety_events: CONTROL_SAFETY_EVENTS.load(Ordering::Acquire),
         phase_current_trips: PHASE_CURRENT_TRIPS.load(Ordering::Relaxed),
         hall_sequence: VALIDATED_HALL_SEQUENCE.load(Ordering::Acquire),
@@ -229,7 +275,7 @@ fn stop_control(state: &mut ControlState, safety_loss: bool) {
     LIVE_MEASURED_DQ.store(0, Ordering::Relaxed);
     LIVE_APPLIED_DQ.store(0, Ordering::Relaxed);
     LIVE_PWM_SPAN.store(0, Ordering::Relaxed);
-    state.kernel.reset();
+    state.controller.reset();
     state.target_ramp.reset();
     state.command_was_enabled = false;
     if safety_loss {
@@ -247,7 +293,7 @@ fn TIM1_UP() {
     }
     control_cycle();
     let elapsed = hardware::cycle_count().wrapping_sub(started);
-    update_max(&CONTROL_MAX_CYCLES, elapsed);
+    let _ = update_max(&CONTROL_MAX_CYCLES, elapsed);
     if elapsed > CONTROL_BUDGET_WARNING_CYCLES {
         CONTROL_BUDGET_WARNINGS.fetch_add(1, Ordering::Relaxed);
     }
@@ -293,7 +339,7 @@ fn control_cycle() {
         }
     };
     if lease_active || output_was_active {
-        update_max(
+        let _ = update_max(
             &MAXIMUM_PHASE_CURRENT_ABS,
             u32::from(
                 current
@@ -330,23 +376,29 @@ fn control_cycle() {
             return;
         }
         state.hardware_hall_sequence = sequence;
-        if state.hall.update_edge(raw, interval_us).is_err() {
+        if state
+            .phase
+            .hall_mut()
+            .update_edge(raw, interval_us)
+            .is_err()
+        {
             publish_flag(CONTROL_HALL_VALID, false);
             stop_control(state, true);
             return;
         }
         state.hall_recovery_cycles = 0;
         VALIDATED_HALL_SEQUENCE.store(sequence, Ordering::Release);
-        VALIDATED_HALL_INTERVAL_US.store(state.hall.sector_interval_us(), Ordering::Relaxed);
+        VALIDATED_HALL_INTERVAL_US
+            .store(state.phase.hall().sector_interval_us(), Ordering::Relaxed);
         VALIDATED_HALL_PROGRESS.fetch_add(
-            i32::from(state.hall.physical_direction()),
+            i32::from(state.phase.hall().physical_direction()),
             Ordering::Relaxed,
         );
-        ELECTRICAL_RPM.store(state.hall.electrical_rpm(), Ordering::Relaxed);
+        ELECTRICAL_RPM.store(state.phase.hall().electrical_rpm(), Ordering::Relaxed);
     }
-    if command_enabled && !state.command_was_enabled && state.hall.is_stationary() {
+    if command_enabled && !state.command_was_enabled && state.phase.hall().is_stationary() {
         let live_before = hardware::live_hall_state();
-        if live_before != state.hall.raw() {
+        if live_before != state.phase.hall().raw_state() {
             publish_flag(CONTROL_HALL_VALID, false);
             stop_control(state, true);
             return;
@@ -357,11 +409,14 @@ fn control_cycle() {
             stop_control(state, true);
             return;
         }
-        state.hall.discard_next_interval();
+        state.phase.hall_mut().discard_next_interval();
     }
     state.command_was_enabled = command_enabled;
     let edge_age_us = hardware::hall_edge_age_us().saturating_add(3);
-    let angle = match state.hall.estimate(edge_age_us) {
+    let angle = match state
+        .phase
+        .estimate_for_control(edge_age_us, CONTROL_PERIOD_NS)
+    {
         Some(estimate) => {
             state.hall_recovery_cycles = 0;
             estimate.angle
@@ -371,8 +426,8 @@ fn control_cycle() {
             && recover_stationary_hall(state) =>
         {
             state
-                .hall
-                .estimate(0)
+                .phase
+                .estimate_for_control(0, CONTROL_PERIOD_NS)
                 .map(|estimate| estimate.angle)
                 .unwrap_or_default()
         }
@@ -394,7 +449,7 @@ fn control_cycle() {
         return;
     }
 
-    let phase_limit = state.kernel.phase_current_limit_from_dc(
+    let phase_limit = state.controller.phase_current_limit_from_dc(
         DC_CURRENT_LIMIT_COUNTS
             .load(Ordering::Relaxed)
             .min(u32::from(u16::MAX)) as u16,
@@ -405,7 +460,10 @@ fn control_cycle() {
         .load(Ordering::Relaxed)
         .max(-i32::from(phase_limit));
     let target_q = state.target_ramp.next(requested);
-    let (measured_current, duty) = state.kernel.step_with_injection(
+    state
+        .controller
+        .set_actuation_advance(state.phase.hall().actuation_advance());
+    let (measured_current, duty) = state.controller.step_with_injection(
         Fixed::from_integer(i32::from(current.phase_a)),
         Fixed::from_integer(i32::from(current.phase_b)),
         angle,
@@ -413,12 +471,12 @@ fn control_cycle() {
             d: Fixed::ZERO,
             q: Fixed::from_integer(target_q),
         },
-        state.hall.injection(),
+        state.phase.injection(),
         crate::config::PWM_NEUTRAL,
     );
     let measured_d_counts = fixed_to_i16(measured_current.d);
     let measured_q_counts = fixed_to_i16(measured_current.q);
-    let applied_voltage = state.kernel.applied_voltage();
+    let applied_voltage = state.controller.applied_voltage();
     let applied_d_ticks = fixed_to_i16(applied_voltage.d);
     let applied_q_ticks = fixed_to_i16(applied_voltage.q);
     let pwm_span_ticks = pwm_span(duty);
@@ -435,19 +493,38 @@ fn control_cycle() {
         Ordering::Relaxed,
     );
     LIVE_PWM_SPAN.store(u32::from(pwm_span_ticks), Ordering::Relaxed);
-    publish_flag(CONTROL_VOLTAGE_LIMITED, state.kernel.voltage_limited());
-    update_max(
+    publish_flag(CONTROL_VOLTAGE_LIMITED, state.controller.voltage_limited());
+    if update_max(
         &MAXIMUM_DIRECT_CURRENT_ABS,
         u32::from(measured_d_counts.unsigned_abs()),
-    );
-    update_max(
+    ) {
+        capture_direct_current_peak(DirectCurrentPeakEvent {
+            measured_d_counts,
+            measured_q_counts,
+            target_q_counts: target_q as i16,
+            hall_raw: state.phase.hall().raw_state(),
+            hall_angle_direction: state.phase.hall().angle_direction(),
+            edge_age_us: saturating_u32_to_u16(edge_age_us),
+            hall_interval_us: saturating_u32_to_u16(state.phase.hall().sector_interval_us()),
+            measurement_angle_q16: (angle >> 16) as u16,
+            unlimited_angle_q16: (state.phase.hall().unlimited_angle() >> 16) as u16,
+            phase_a_counts: current.phase_a,
+            phase_b_counts: current.phase_b,
+            applied_d_ticks,
+            applied_q_ticks,
+            voltage_limited: state.controller.voltage_limited(),
+            angle_rate_limited: angle != state.phase.hall().unlimited_angle(),
+            ..DirectCurrentPeakEvent::default()
+        });
+    }
+    let _ = update_max(
         &MAXIMUM_QUADRATURE_ERROR_ABS,
         target_q
             .saturating_sub(i32::from(measured_q_counts))
             .unsigned_abs(),
     );
-    update_max(&MAXIMUM_PWM_SPAN, u32::from(pwm_span_ticks));
-    state.hall.update(&ControlPhaseInput {
+    let _ = update_max(&MAXIMUM_PWM_SPAN, u32::from(pwm_span_ticks));
+    state.phase.update(&PhaseInput {
         applied_voltage,
         measured_current,
         electrical_angle: angle,
@@ -460,12 +537,12 @@ fn control_cycle() {
     publish_flag(CONTROL_OUTPUT_ACTIVE, true);
 }
 
-const fn ride_foc_kernel() -> FocKernel {
-    let pi = Pi::new(
+const fn ride_foc_controller() -> FocController {
+    let pi = PIController::new(
         crate::config::CURRENT_PI_PROPORTIONAL_GAIN,
         crate::config::CURRENT_PI_INTEGRAL_GAIN_PER_CYCLE,
     );
-    FocKernel::new(
+    FocController::new(
         pi,
         pi,
         crate::config::FOC_VECTOR_LIMIT_TICKS,
@@ -473,13 +550,32 @@ const fn ride_foc_kernel() -> FocKernel {
     )
 }
 
-fn update_max(target: &AtomicU32, value: u32) {
+fn update_max(target: &AtomicU32, value: u32) -> bool {
     let mut current = target.load(Ordering::Relaxed);
     while value > current {
         match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
+            Ok(_) => return true,
             Err(updated) => current = updated,
         }
+    }
+    false
+}
+
+fn capture_direct_current_peak(mut event: DirectCurrentPeakEvent) {
+    // SAFETY: called only by TIM1_UP. Foreground copies this cell with global
+    // interrupts masked in snapshot().
+    unsafe {
+        let previous = *PEAK_DIRECT_EVENT.0.get();
+        event.generation = previous.generation.wrapping_add(1).max(1);
+        *PEAK_DIRECT_EVENT.0.get() = event;
+    }
+}
+
+const fn saturating_u32_to_u16(value: u32) -> u16 {
+    if value > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        value as u16
     }
 }
 
@@ -539,7 +635,7 @@ fn recover_stationary_hall(state: &mut ControlState) -> bool {
     if state.hall_recovery_cycles < HALL_RECOVERY_STABLE_CYCLES {
         return false;
     }
-    if state.hall.seed(raw).is_err() {
+    if state.phase.hall_mut().seed(raw).is_err() {
         return false;
     }
     state.hall_recovery_cycles = 0;

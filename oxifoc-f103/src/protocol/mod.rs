@@ -114,8 +114,10 @@ pub const fn next_telemetry_slot(slot: u8) -> u8 {
 }
 
 pub const fn next_project_telemetry_page(page: u8) -> u8 {
-    if page >= 6 { 0 } else { page + 1 }
+    if page >= 11 { 0 } else { page + 1 }
 }
+
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 2;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -231,6 +233,26 @@ pub struct ControlPeakTelemetry {
     pub maximum_direct_current_abs: u16,
     pub maximum_quadrature_error_abs: u16,
     pub maximum_pwm_span_ticks: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPeakEventTelemetry {
+    pub generation: u8,
+    pub measured_d_counts: i16,
+    pub measured_q_counts: i16,
+    pub target_q_counts: i16,
+    pub hall_raw: u8,
+    pub hall_angle_direction: i8,
+    pub edge_age_us: u16,
+    pub hall_interval_us: u16,
+    pub measurement_angle_q16: u16,
+    pub unlimited_angle_q16: u16,
+    pub phase_a_counts: i16,
+    pub phase_b_counts: i16,
+    pub applied_d_ticks: i16,
+    pub applied_q_ticks: i16,
+    pub voltage_limited: bool,
+    pub angle_rate_limited: bool,
 }
 
 /// The two passive commissioning pages retain the established `0x2F7` page-8
@@ -408,6 +430,114 @@ pub fn control_peak_telemetry(snapshot: ControlPeakTelemetry) -> Frame {
     )
 }
 
+/// Pages 14--17: fields captured from the exact 16 kHz cycle that established
+/// the boot-retained maximum |d|. Every page repeats the event generation so
+/// readers never combine fields from two different peaks.
+pub fn control_peak_event_telemetry(page_index: u8, snapshot: ControlPeakEventTelemetry) -> Frame {
+    match page_index {
+        0 => {
+            let direct = snapshot.measured_d_counts.to_le_bytes();
+            let quadrature = snapshot.measured_q_counts.to_le_bytes();
+            let target = snapshot.target_q_counts.to_le_bytes();
+            Frame::new(
+                0x2f7,
+                8,
+                [
+                    14,
+                    snapshot.generation,
+                    direct[0],
+                    direct[1],
+                    quadrature[0],
+                    quadrature[1],
+                    target[0],
+                    target[1],
+                ],
+            )
+        }
+        1 => {
+            let edge_age = snapshot.edge_age_us.to_le_bytes();
+            let interval = snapshot.hall_interval_us.to_le_bytes();
+            let hall_flags = (snapshot.hall_raw & 7)
+                | (u8::from(snapshot.hall_angle_direction < 0) << 3)
+                | (u8::from(snapshot.hall_angle_direction > 0) << 4)
+                | (u8::from(snapshot.voltage_limited) << 5)
+                | (u8::from(snapshot.angle_rate_limited) << 6);
+            let angle_error_q8 = (snapshot
+                .unlimited_angle_q16
+                .wrapping_sub(snapshot.measurement_angle_q16)
+                as i16
+                >> 8) as u8;
+            Frame::new(
+                0x2f7,
+                8,
+                [
+                    15,
+                    snapshot.generation,
+                    hall_flags,
+                    edge_age[0],
+                    edge_age[1],
+                    interval[0],
+                    interval[1],
+                    angle_error_q8,
+                ],
+            )
+        }
+        2 => {
+            let phase_a = snapshot.phase_a_counts.to_le_bytes();
+            let phase_b = snapshot.phase_b_counts.to_le_bytes();
+            let direct = snapshot.applied_d_ticks.to_le_bytes();
+            Frame::new(
+                0x2f7,
+                8,
+                [
+                    16,
+                    snapshot.generation,
+                    phase_a[0],
+                    phase_a[1],
+                    phase_b[0],
+                    phase_b[1],
+                    direct[0],
+                    direct[1],
+                ],
+            )
+        }
+        _ => {
+            let quadrature = snapshot.applied_q_ticks.to_le_bytes();
+            let measurement_angle = snapshot.measurement_angle_q16.to_le_bytes();
+            let unlimited_angle = snapshot.unlimited_angle_q16.to_le_bytes();
+            Frame::new(
+                0x2f7,
+                8,
+                [
+                    17,
+                    snapshot.generation,
+                    quadrature[0],
+                    quadrature[1],
+                    measurement_angle[0],
+                    measurement_angle[1],
+                    unlimited_angle[0],
+                    unlimited_angle[1],
+                ],
+            )
+        }
+    }
+}
+
+/// Page 18 identifies the exact crate version and project telemetry schema in
+/// ride logs without changing the stock identity responses.
+pub fn firmware_version_telemetry() -> Frame {
+    let version = env!("CARGO_PKG_VERSION").as_bytes();
+    let mut data = [0_u8; 8];
+    data[0] = 18;
+    data[1] = PROJECT_TELEMETRY_SCHEMA;
+    let mut index = 0;
+    while index < 6 && index < version.len() {
+        data[index + 2] = version[index];
+        index += 1;
+    }
+    Frame::new(0x2f7, 8, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,10 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn project_telemetry_rotates_through_all_seven_pages() {
+    fn project_telemetry_rotates_through_all_twelve_pages() {
         let mut page = 0;
-        let mut visits = [0_u8; 7];
-        for _ in 0..70 {
+        let mut visits = [0_u8; 12];
+        for _ in 0..120 {
             visits[usize::from(page)] += 1;
             page = next_project_telemetry_page(page);
         }
@@ -551,12 +681,12 @@ mod tests {
     #[test]
     fn passive_input_page_preserves_wide_dc_current_limits() {
         let snapshot = PassiveInputTelemetry {
-            effective_current_limit: 400,
+            effective_current_limit: 480,
             ..PassiveInputTelemetry::default()
         };
         assert_eq!(
             passive_input_telemetry(1, snapshot).data[..4],
-            [9, 255, 0, 145]
+            [9, 255, 0, 225]
         );
     }
 
@@ -619,6 +749,45 @@ mod tests {
         assert_eq!(
             control_peak_telemetry(peaks).data,
             [13, 0x39, 0x05, 55, 0, 222, 0, 135]
+        );
+
+        let event = ControlPeakEventTelemetry {
+            generation: 7,
+            measured_d_counts: -782,
+            measured_q_counts: -358,
+            target_q_counts: -732,
+            hall_raw: 5,
+            hall_angle_direction: -1,
+            edge_age_us: 321,
+            hall_interval_us: 1_234,
+            measurement_angle_q16: 0x1234,
+            unlimited_angle_q16: 0x2345,
+            phase_a_counts: 900,
+            phase_b_counts: -420,
+            applied_d_ticks: -123,
+            applied_q_ticks: -1_273,
+            voltage_limited: true,
+            angle_rate_limited: true,
+        };
+        assert_eq!(
+            control_peak_event_telemetry(0, event).data,
+            [14, 7, 0xf2, 0xfc, 0x9a, 0xfe, 0x24, 0xfd]
+        );
+        assert_eq!(
+            control_peak_event_telemetry(1, event).data,
+            [15, 7, 0x6d, 0x41, 0x01, 0xd2, 0x04, 0x11]
+        );
+        assert_eq!(
+            control_peak_event_telemetry(2, event).data,
+            [16, 7, 0x84, 0x03, 0x5c, 0xfe, 0x85, 0xff]
+        );
+        assert_eq!(
+            control_peak_event_telemetry(3, event).data,
+            [17, 7, 0x07, 0xfb, 0x34, 0x12, 0x45, 0x23]
+        );
+        assert_eq!(
+            firmware_version_telemetry().data,
+            [18, 2, b'0', b'.', b'1', b'.', b'1', 0]
         );
     }
 }

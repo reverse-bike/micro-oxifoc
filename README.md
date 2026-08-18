@@ -10,63 +10,53 @@ the validation build.
 ## Core Architecture (`oxifoc-core`)
 
 All platform-neutral FOC algorithms and phase estimation live in
-`oxifoc-core`, a `no_std` library with no hardware dependencies. The compact
-current loop is generic over its numeric and angle backends; Clarke/Park,
-discrete PI, circular limiting, and sector SVPWM each have one implementation.
+`oxifoc-core`, a `no_std` library with no hardware dependencies. The active
+fork keeps OxiFOC's original module boundaries—controller, PI controller,
+Hall sensor, phase provider/manager, transforms, trigonometry, and SVPWM—but
+uses fixed-point values throughout the synchronous F103 path.
 
 | Core feature | Purpose | Linked by F103 |
 |--------------|---------|----------------|
 | `fixed-point` | Builds the shared controller with Q16.16 values and Q0.32-turn integer CORDIC | Yes |
-| `algorithms` | Adds the `f32` backend plus the original observer/HFI, detection, and optional async runtime | No |
+| `algorithms` | Legacy observer/HFI, detection, and runtime source retained as a porting reference | No |
 
-The `ControlPhaseProvider` boundary and `PhaseStrategy` identities retain Hall,
-encoder, back-EMF observer, HFI, hybrid, manual, and open-loop strategies. Only
-`HallTracker` is currently linked into the F103 ride image; the complete
-floating-point estimators remain under `foc::phase` as experiment and porting
-references.
+`PhaseProvider`, `PhaseManager`, and `PhaseSource` retain Hall, encoder,
+back-EMF observer, HFI, hybrid, manual, and open-loop roles. Only `HallSensor`
+is installed in the manager today. Selecting an unported source is rejected;
+the legacy observer/HFI files remain source references for fixed-point ports.
 
 ```text
 oxifoc-f103 control ISR
 ├── config + control + safety
 ├── hardware + sensors + transport
 └── oxifoc-core::foc
-    ├── FocKernel<Fixed, CordicTurns>
-    ├── shared transforms → discrete PI → SVPWM
-    └── phase::ControlPhaseProvider → HallTracker today
+    ├── FocController<Fixed, CordicSinCos>
+    │   └── transforms → PIController → SVPWM
+    └── PhaseManager → PhaseProvider → HallSensor
 ```
-
-The following trait graph describes the original floating-point reference
-backend retained in `oxifoc-core`.
 
 ### Trait Abstraction
 
 ```mermaid
 graph TD
-    FocDriver["<b>FocDriver&lt;P, C, Ph, S&gt;</b><br/>Integrates everything<br/>Mode management · Current limiting"]
-
-    FocDriver --> PhasePwm["<b>PhasePwm</b><br/>set_duties · disable · enable<br/>set_phase_states (six-step)"]
-    FocDriver --> CurrentSensor["<b>CurrentSensor</b><br/>read_currents · calibrate<br/>update_duties (reconstruction)"]
-    FocDriver --> PhaseProvider["<b>PhaseProvider</b><br/>get() → angle, velocity<br/>injection() → HFI carrier<br/>update(vαβ, iαβ, dt)"]
-    FocDriver --> SinCos["<b>SinCos</b><br/>sin_cos(θ) → (sin, cos)<br/>LibmSinCos · FastSinCos · CordicSinCos"]
-
-    FocDriver --> FocController["<b>FocController&lt;M, S&gt;</b><br/>Clarke · Park · PI · Inv. Park<br/>Dead time comp · Voltage clamping"]
-    FocController --> Modulator["<b>Modulator</b><br/>to_duties(vα, vβ) → [u16; 3]<br/>SvpwmModulator"]
-
-    PhaseProvider --> PhaseManager["<b>PhaseManager&lt;H, E&gt;</b><br/>Source selection · Health tracking<br/>Observer fallback · Open-loop override"]
-    PhaseManager --> AngleSensor["<b>AngleSensor</b><br/>HallSensor · Encoder · NoSensor"]
-    PhaseManager --> Observer["<b>Observer slot</b><br/>BackEmfObserver"]
-    PhaseManager --> Hfi["<b>HFI slot</b><br/>HfiObserver<br/>carrier + polarity probe"]
+    ISR["<b>F103 control ISR</b><br/>sampling · safety · hardware"] --> PhaseManager
+    ISR --> FocController
+    PhaseManager["<b>PhaseManager&lt;H&gt;</b><br/>source ownership · selection"] --> PhaseProvider
+    PhaseProvider["<b>PhaseProvider</b><br/>estimate · injection · update"] --> HallSensor
+    FocController["<b>FocController&lt;N,T,M&gt;</b><br/>Clarke · Park · PI · inverse Park"] --> PIController
+    FocController --> SinCos["<b>SinCos</b><br/>Q0.32 turns → Q16.16 sin/cos"]
+    FocController --> SVPWM
 ```
 
-Platform crates implement `PhasePwm` (TIM1 complementary PWM), `CurrentSensor` (shunt ADC reading), and `SinCos` (CORDIC hardware or software libm). Everything else is shared.
+The device crate owns raw TIM1/ADC access and safety timing. Estimation and
+control math stay in the core; neither boundary depends on an executor.
 
 ### Phase Source Selection
 
-`PhaseManager` supports multiple angle estimation strategies with runtime
-switching (host command `cmd/phase_source`; the active source is reported
-back via slow telemetry). Both software estimators run concurrently in
-dedicated slots and are armed automatically from stored motor parameters
-at boot:
+`PhaseSource` preserves the strategy and fixed-point crossover configuration.
+The current manager installs Hall only; observer, encoder, HFI, hybrid,
+manual, and open-loop selections return a typed unavailable error until their
+fixed-point providers are added:
 
 | Source | Use Case |
 |--------|----------|

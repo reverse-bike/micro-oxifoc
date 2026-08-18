@@ -17,10 +17,10 @@ The application uses `oxifoc-core` with default features disabled and only the
 the device crate without pulling the floating-point or async stack into the
 image:
 
-- `oxifoc-core::foc` owns current-offset tracking, generic Clarke/Park,
-  discrete PI and anti-windup, voltage limiting, CORDIC, SVPWM, target slew,
-  and the phase-provider interface. `FocKernel<Fixed, CordicTurns>` uses the
-  same algorithm source that its `f32` reference tests exercise.
+- `oxifoc-core::foc` owns current-offset tracking, Clarke/Park,
+  `PIController`, `FocController`, voltage limiting, CORDIC, SVPWM, target
+  slew, `HallSensor`, and the phase provider/manager interfaces. These live in
+  OxiFOC's canonical modules rather than a parallel F103 algorithm tree.
 - `oxifoc-f103` owns the recovered pin map, direct register access, interrupt
   scheduling, board-specific gains and limits, ride safety, local inputs, and
   stock-bike CAN.
@@ -50,12 +50,17 @@ src/
 └── main.rs                synchronous initialization and foreground loop
 ```
 
-Hall is the active phase provider. The `PhaseStrategy` API deliberately
+Every image prepared for a real CAN flash receives one patch-version bump and
+a brief change/reason entry in [CHANGELOG.md](CHANGELOG.md). Validation-only
+builds do not bump the version. Page 18 of project telemetry reports the crate
+version embedded in the running image so ride logs remain attributable.
+
+Hall is the installed phase provider. The `PhaseSource` API deliberately
 retains encoder, back-EMF observer, HFI, hybrid, manual, and open-loop strategy
-identities so experiments can add providers without changing the current
-controller or board boundary. The original floating-point observer/HFI
-implementations remain in `oxifoc-core::foc::phase` as porting references, but
-are not linked into this image.
+identities and fixed-point crossover settings. `PhaseManager` rejects those
+sources until their providers are ported, so experiments can add them without
+changing the controller or board boundary. The legacy observer/HFI sources
+remain porting references and are not linked into this image.
 
 ## Runtime
 
@@ -68,7 +73,9 @@ are not linked into this image.
 - TIM2 captures both polarities of the remapped XOR Hall input at 1 MHz. Ride
   control uses the hardware-validated stock boundary table
   `[5699, 16526, 26499, 37754, 49151, 59124]`. The later occupancy-derived
-  candidate was rejected by hardware testing and is not used.
+  candidate was rejected by hardware testing and is not used. Above 500 eRPM,
+  boundary corrections are rate-limited to 1.5 times the measured per-cycle
+  angle travel rather than being applied as a single transform-frame jump.
 - TIM3 captures the PB4 wheel input. Its qualified speed and volatile distance
   feed stock CAN telemetry; its independent quiet state is required for an
   updater reset.
@@ -114,10 +121,15 @@ ms and twelve net-forward Hall transitions. The software phase-current guard
 trips above 1,344 counts (134.4 A) on A, B, or reconstructed C, preserving at
 least the established 1.6-times margin over commanded phase current. The local
 39 V undervoltage debounce and controller/motor thermal envelopes can only
-reduce the 400-count (40 A) DC-side limit. DC projection dynamically reduces
+reduce the 480-count projected DC-side limit. This is nominally 48 A at the
+loaded-run current fit, and is expected to produce approximately 40 A at the
+BMS based on the preceding 400-count ride. DC projection dynamically reduces
 the phase-current target as applied modulation rises. The 1,273-tick voltage-
 vector ceiling and 1,103-tick centered PWM window reproduce the stock F103
-modulation envelope; PI gains, Hall estimator, and target ramp are unchanged.
+modulation envelope. PI gains and target ramp are unchanged. The voltage vector
+alone is advanced by one measured electrical control-period step to compensate
+the ADC-to-PWM pipeline; current Park transformation remains at the sampled
+Hall angle.
 
 ## CAN and updater
 
@@ -128,19 +140,24 @@ on PA13. The application provides:
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
   including local brake, wheel speed/distance, temperatures, and fault pages;
 - updater reset on `0x67F#AA552A002A...`;
-- commissioning pages 6 and 8--13 on `0x2F7`.
+- commissioning pages 6 and 8--18 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
 span. Page 12 carries the full internal fault mask and safety-event count.
 Page 13 retains peak phase current, direct current, quadrature tracking error,
 and PWM span from boot so short transients remain visible at CAN telemetry
-rates. The project-page scheduler advances through all seven pages without the
-`u8` wraparound phase discontinuity.
+rates. Pages 14--17 retain signed dq current and target, Hall state/direction,
+edge age and interval, measurement and unlimited Hall angles, phase A/B
+current, applied dq voltage, and limiting flags from the exact cycle that set
+the maximum |d|. A repeated event generation prevents readers from combining
+different peaks. Page 18 carries telemetry schema 2 and the crate version. The
+project-page scheduler advances through all twelve pages without a wraparound
+phase discontinuity.
 
 On page 9, byte 1 remains a saturated one-byte current-limit value for older
 tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
-recover the full effective DC limit (400 when it is not being derated).
+recover the full effective DC limit (480 when it is not being derated).
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -172,4 +189,5 @@ metadata, and bootloader-image validation can establish software consistency
 and the real flash/RAM footprint. They cannot prove GPIO polarity, current
 scaling, Hall geometry, control-loop cycle time, or motor direction on this
 specific board. Those remain hardware commissioning gates. The generated
-400-DC-count/1,273-tick image has not been flashed as part of this change.
+version 0.1.1, 480-DC-count/1,273-tick image has not been flashed as part of
+this change.

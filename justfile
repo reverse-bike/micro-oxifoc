@@ -1,67 +1,38 @@
 # oxifoc — FOC motor controller monorepo
 
-# Device firmware crates (excluded from workspace, different toolchain)
-device_crates := "oxifoc-f103 oxifoc-bridge oxifoc-remote"
-
-# Run all checks (fmt, clippy, tests — workspace + device crates)
+# Validate the active fixed-point core and STM32F103 firmware only. The host,
+# G474, F405, bridge, and remote crates remain source references in this fork.
 check:
-    @just check-host
-    @just check-device
+    @just check-core
+    @just check-f103
 
-# Host workspace: fmt + clippy + tests
-check-host:
+# Shared fixed-point controller: formatting, linting, and behavior tests.
+check-core:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "git-rev sync across lock files..."
-    python3 scripts/check-git-rev-sync.py
-    echo "rustfmt (workspace)..."
-    cargo fmt --check --all
-    echo "clippy (workspace)..."
-    cargo clippy --workspace --all-targets --quiet -- -D warnings
-    echo "tests (workspace)..."
-    output=$(cargo test --workspace --quiet 2>&1) || { echo "$output"; exit 1; }
-    echo "oxifoc-core fixed-point slice..."
-    cargo test -p oxifoc-core --quiet --no-default-features --features fixed-point
-    echo "oxifoc-core without detection (gate must not rot)..."
-    # clippy, not check: the embassy-gated modules are compiled ONLY in this
-    # slice (no workspace member enables the feature), so this is their one
-    # lint gate.
-    cargo clippy -p oxifoc-core --quiet --no-default-features \
-        --features algorithms,runtime,storage,delivery,defmt,embassy,virtual-motor,std -- -D warnings
+    command cargo fmt --check -p oxifoc-core
+    command cargo clippy -p oxifoc-core --all-targets -- -D warnings
+    command cargo test -p oxifoc-core
 
-# Device firmware: fmt + clippy + build (all targets)
-check-device:
+# STM32F103 application: host tests plus the optimized Thumb image.
+check-f103:
     #!/usr/bin/env bash
     set -euo pipefail
-    filter() { grep -v 'unstable feature.*vfp2\|not stably supported\|unknown and unstable feature.*fp64\|still passed through to the codegen\|consider filing a feature request\|^  |\|^$' || true; }
-    for crate in {{ device_crates }}; do
-        echo "$crate: fmt + clippy + build..."
-        (cd "$crate" && cargo fmt --check) || exit 1
-        (cd "$crate" && cargo clippy --quiet -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
-        if [ "$crate" = "oxifoc-f103" ]; then
-            (cd "$crate" && cargo build --release --quiet --features firmware 2>&1 | filter) || exit 1
-        else
-            (cd "$crate" && cargo build --release --quiet 2>&1 | filter) || exit 1
-        fi
-    done
+    cd oxifoc-f103
+    command cargo fmt --check
+    command cargo test --target aarch64-apple-darwin
+    command cargo clippy --release --features firmware -- -D warnings
+    command cargo build --release --features firmware
 
-# Format all code (workspace + device crates)
+# Format the active core and F103 application.
 fmt:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "rustfmt..."
-    cargo fmt --all
-    for crate in {{ device_crates }}; do
-        (cd "$crate" && cargo fmt)
-    done
+    command cargo fmt -p oxifoc-core
+    cd oxifoc-f103 && command cargo fmt
 
-# Run workspace tests
+# Run the active fixed-point behavior tests.
 test:
-    cargo test --workspace
-    cargo test -p oxifoc-core --no-default-features --features fixed-point
-    # HFI is behind features that are off by default; this pass runs the
-    # `hfi`/`hfi-detect`-gated tests (g474/f405 config).
-    cargo test -p oxifoc-core --features runtime,virtual-motor,storage,std,delivery,hfi,hfi-detect
+    command cargo test -p oxifoc-core
+    cd oxifoc-f103 && command cargo test --target aarch64-apple-darwin
 
 # Build the STM32F103 firmware.
 build-f103:
@@ -136,7 +107,7 @@ size:
     }
     measure oxifoc-f103 oxifoc-f103 memory.x target --features firmware
 
-# Clean all build artifacts
+# Clean active core and F103 build artifacts.
 clean:
-    cargo clean
-    for crate in {{ device_crates }}; do (cd "$crate" && cargo clean); done
+    command cargo clean -p oxifoc-core
+    cd oxifoc-f103 && command cargo clean

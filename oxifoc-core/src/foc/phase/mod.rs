@@ -1,78 +1,27 @@
-//! Phase management for FOC control
+//! Electrical-phase source management for FOC control.
 //!
-//! Provides a unified interface for electrical phase angle estimation,
-//! supporting multiple sources (Hall, Encoder, Observer) with runtime switching.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                      PhaseManager<H, E>                      │
-//! │  • Manages Hall sensor (H)                                   │
-//! │  • Manages Encoder (E)                                       │
-//! │  • Manages Observer (sensorless)                             │
-//! │  • Handles source selection & blending                       │
-//! │                                                              │
-//! │  implements PhaseProvider                                    │
-//! └──────────────────────────┬──────────────────────────────────┘
-//!                            │
-//!                            ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                     PhaseProvider trait                      │
-//! │  • get() → PhaseOutput (angle, velocity)                    │
-//! │  • update(PhaseInput, now_ticks)                            │
-//! └─────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use oxifoc_core::foc::phase::{PhaseManager, PhaseSource, Observer, BackEmfObserver};
-//!
-//! // Create phase manager with Hall sensor
-//! let mut phase = PhaseManager::with_hall(hall_sensor);
-//!
-//! // Add sensorless observer for high-speed operation
-//! phase.set_observer(Observer::BackEmf(BackEmfObserver::new(r, l, lambda)));
-//!
-//! // Configure hybrid mode
-//! phase.set_source(PhaseSource::HallToObserver {
-//!     blend_low: 300.0,   // Start blending at 300 rad/s
-//!     blend_high: 600.0,  // Full observer at 600 rad/s
-//! })?;
-//!
-//! // Use with FocDriver
-//! let driver = FocDriver::new(pwm, current_sensor, phase, vbus);
-//! ```
+//! Sensors and estimators implement [`PhaseProvider`]. [`PhaseManager`] owns
+//! those providers, validates source selection, and presents one phase stream
+//! to the synchronous current loop. The F103 build installs only its Hall
+//! sensor today while retaining the source identities needed for later
+//! encoder, observer, HFI, hybrid, manual, and open-loop experiments.
 
-mod control;
-mod hall;
-#[cfg(feature = "algorithms")]
 mod manager;
 #[cfg(feature = "algorithms")]
 mod observer;
-#[cfg(feature = "algorithms")]
 mod provider;
-#[cfg(feature = "algorithms")]
 mod source;
 #[cfg(feature = "algorithms")]
 mod startup;
-mod strategy;
 
-pub use control::{ControlPhaseEstimate, ControlPhaseInput, ControlPhaseProvider};
-pub use hall::{HallError, HallGeometry, HallTracker};
-#[cfg(feature = "algorithms")]
-pub use manager::{HallHealth, OpenLoopOverride, PhaseFault, PhaseManager};
+pub use manager::PhaseManager;
 #[cfg(feature = "algorithms")]
 pub use observer::{
     BackEmfObserver, DEFAULT_CENTERING_GAIN, DEFAULT_LAMBDA_GAIN, Observer, ObserverInput,
 };
 #[cfg(feature = "hfi")]
 pub use observer::{HFI_DEFAULT_AMPLITUDE_RATIO, HFI_DEFAULT_FREQ_HZ, HfiObserver};
-#[cfg(feature = "algorithms")]
-pub use provider::{PhaseInput, PhaseOutput, PhaseProvider};
-#[cfg(feature = "algorithms")]
+pub use provider::{PhaseEstimate, PhaseInput, PhaseProvider};
 pub use source::{PhaseSource, PhaseSourceError};
 #[cfg(feature = "algorithms")]
 pub use startup::{SensorlessStartup, StartupOutput, StartupPhase};
-pub use strategy::PhaseStrategy;

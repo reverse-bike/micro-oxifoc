@@ -185,12 +185,37 @@ pub fn service(
                 fault_flags: control.fault_flags,
                 safety_events: control.safety_events.min(u32::from(u16::MAX)) as u16,
             }),
-            _ => protocol::control_peak_telemetry(protocol::ControlPeakTelemetry {
+            6 => protocol::control_peak_telemetry(protocol::ControlPeakTelemetry {
                 maximum_phase_current_abs: control.maximum_phase_current_abs,
                 maximum_direct_current_abs: control.maximum_direct_current_abs,
                 maximum_quadrature_error_abs: control.maximum_quadrature_error_abs,
                 maximum_pwm_span_ticks: control.maximum_pwm_span_ticks,
             }),
+            7..=10 => {
+                let event = control.maximum_direct_event;
+                protocol::control_peak_event_telemetry(
+                    page - 7,
+                    protocol::ControlPeakEventTelemetry {
+                        generation: event.generation,
+                        measured_d_counts: event.measured_d_counts,
+                        measured_q_counts: event.measured_q_counts,
+                        target_q_counts: event.target_q_counts,
+                        hall_raw: event.hall_raw,
+                        hall_angle_direction: event.hall_angle_direction,
+                        edge_age_us: event.edge_age_us,
+                        hall_interval_us: event.hall_interval_us,
+                        measurement_angle_q16: event.measurement_angle_q16,
+                        unlimited_angle_q16: event.unlimited_angle_q16,
+                        phase_a_counts: event.phase_a_counts,
+                        phase_b_counts: event.phase_b_counts,
+                        applied_d_ticks: event.applied_d_ticks,
+                        applied_q_ticks: event.applied_q_ticks,
+                        voltage_limited: event.voltage_limited,
+                        angle_rate_limited: event.angle_rate_limited,
+                    },
+                )
+            }
+            _ => protocol::firmware_version_telemetry(),
         };
         if transmit(frame) {
             PROJECT_TELEMETRY_PAGE.store(

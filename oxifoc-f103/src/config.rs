@@ -5,7 +5,7 @@
 //! per-boot measurement; the Hall boundaries and current limits below are
 //! explicit, reviewed application constants.
 
-use oxifoc_core::foc::{Fixed, phase::HallGeometry};
+use oxifoc_core::foc::{Fixed, hall_sensor::HallGeometry};
 
 pub const SYSCLK_HZ: u32 = 72_000_000;
 pub const APPLICATION_FLASH_ORIGIN: u32 = 0x0800_3800;
@@ -41,7 +41,7 @@ pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
 pub const CURRENT_MA_PER_COUNT: i32 = 100;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 838;
-pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 400;
+pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 480;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
@@ -164,9 +164,9 @@ mod tests {
     use super::*;
     use oxifoc_core::foc::{
         AlphaBeta,
-        angle::{AngleSinCos, CordicTurns},
         svpwm::space_vector_pwm_ticks,
         transforms::inverse_park,
+        trig::{CordicSinCos, SinCos},
     };
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn ride_current_envelope_matches_the_full_power_configuration() {
         assert_eq!(RIDE_PHASE_CURRENT_LIMIT_COUNTS, 838);
-        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 400);
+        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 480);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
             i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
@@ -220,7 +220,7 @@ mod tests {
         );
         assert_eq!(
             i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
-            40_000
+            48_000
         );
         assert!(
             u32::from(PHASE_CURRENT_TRIP_COUNTS) * 5
@@ -237,7 +237,7 @@ mod tests {
 
         let mut maximum_span = 0;
         for step in 0..4_096_u32 {
-            let (sin, cos) = CordicTurns::sin_cos(step << 20);
+            let (sin, cos) = CordicSinCos::sin_cos(step << 20);
             let (alpha, beta) = inverse_park(FOC_VECTOR_LIMIT_TICKS, Fixed::ZERO, sin, cos);
             let duty = space_vector_pwm_ticks(
                 AlphaBeta { alpha, beta },

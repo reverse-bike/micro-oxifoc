@@ -2,17 +2,17 @@
 //!
 //! Platform-agnostic Field-Oriented Control (FOC) algorithms and motor control logic.
 //!
-//! This crate provides the mathematical foundation for FOC motor control:
+//! This crate provides the synchronous mathematical foundation for FOC motor control:
 //! - Coordinate transformations (Clarke, Park)
 //! - Space Vector PWM (SVPWM) modulation
 //! - PI controllers with anti-windup
 //! - FOC control loops
-//! - Motor parameter detection (R, L, λ)
+//! - Hall phase estimation and source management
 //!
 //! ## Feature Flags
 //!
-//! - **`algorithms`** (default): floating-point FOC, drivers, and phase estimators
-//! - **`fixed-point`**: synchronous shared FOC instantiated with Q16.16 values
+//! - **`fixed-point`** (default): synchronous Q16.16 FOC and phase management
+//! - **`algorithms`**: legacy floating-point experiment and detection modules
 //! - **`icd`**: Interface Control Document with ergot endpoints
 //! - **`runtime`**: Async runtime with servers
 //! - **`virtual-motor`**: Motor simulation for testing
@@ -29,58 +29,30 @@
 //!
 //! ### Embedded firmware
 //! ```toml
-//! oxifoc-core = { version = "0.1", features = ["runtime", "defmt"] }
-//! ```
-//!
-//! ### Flash-constrained synchronous firmware
-//! ```toml
 //! oxifoc-core = { version = "0.1", default-features = false, features = ["fixed-point"] }
 //! ```
 //!
-//! ### Testing with virtual motor
-//! ```toml
-//! oxifoc-core = { version = "0.1", features = ["virtual-motor"] }
-//! ```
-//!
-//! ## Floating-point FOC Algorithm Example
+//! ## Fixed-point FOC example
 //!
 //! ```rust
-//! # #[cfg(feature = "algorithms")]
-//! # {
-//! use oxifoc_core::foc::{transforms, svpwm, pi_controller::PIController};
+//! use oxifoc_core::foc::{Dq, Fixed, FocController, PIController};
 //!
-//! // Example: Current control loop
-//! let mut id_controller = PIController::new(0.5, 10.0);
-//! let mut iq_controller = PIController::new(0.5, 10.0);
-//!
-//! // Sample feedback and setpoints
-//! let ia = 1.2;
-//! let ib = -0.6;
-//! let theta = 0.5_f32;
-//! let (sin_theta, cos_theta) = (theta.sin(), theta.cos());
-//! let id_target = 0.0;
-//! let iq_target = 5.0;
-//! let dt = 0.0001;
-//! let max_duty = 1000;
-//!
-//! // Measure currents and transform to dq frame
-//! let (i_alpha, i_beta) = transforms::clarke(ia, ib);
-//! let (id, iq) = transforms::park(i_alpha, i_beta, sin_theta, cos_theta);
-//!
-//! // Run PI controllers
-//! let vd = id_controller.update(id_target, id, dt);
-//! let vq = iq_controller.update(iq_target, iq, dt);
-//!
-//! // Transform back and generate PWM
-//! let (v_alpha, v_beta) = transforms::inverse_park(vd, vq, sin_theta, cos_theta);
-//! let duties = svpwm::space_vector_pwm(v_alpha, v_beta, max_duty);
-//! assert_eq!(duties.len(), 3);
-//! # }
+//! let pi = PIController::new(Fixed::ratio(1, 2), Fixed::ratio(605, 16_384));
+//! let mut controller: FocController =
+//!     FocController::new(pi, pi, Fixed::from_integer(1_273), 1_103);
+//! let (_current, duty) = controller.step(
+//!     Fixed::ZERO,
+//!     Fixed::ZERO,
+//!     0,
+//!     Dq::new(Fixed::ZERO, Fixed::ZERO),
+//!     1_125,
+//! );
+//! assert_eq!(duty.as_array(), [1_125; 3]);
 //! ```
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-// The 20 kHz ISR hot path is GENERIC (FocDriver/PhaseManager/FocController
-// over platform types), so it monomorphizes into the DEVICE crate and
+// The ISR hot path is generic (PhaseManager/FocController over numeric and
+// provider types), so it monomorphizes into the device crate and
 // inherits its size-optimized profile — the per-package opt-level override
 // for oxifoc-core cannot reach it. At opt-level "z" the machine outliner
 // chops the ISR into cross-calls and struct returns become memcpys (SWD PC
@@ -277,7 +249,7 @@ pub mod foc {
         diff
     }
 
-    /// Scalar and angle backends for shared FOC algorithms.
+    /// Scalar backends for shared FOC algorithms.
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod numeric;
 
@@ -285,17 +257,9 @@ pub mod foc {
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod control_types;
 
-    /// Electrical-angle trigonometry backends.
+    /// Per-control-period PI controller with external anti-windup.
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub mod angle;
-
-    /// Per-control-period PI law used by the compact controller.
-    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub mod discrete_pi;
-
-    /// Shared compact current-loop controller.
-    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub mod kernel;
+    pub mod pi_controller;
 
     /// Undriven current-offset drift tracker.
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
@@ -308,11 +272,11 @@ pub mod foc {
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub use control_types::{AlphaBeta, Dq, PwmDuty};
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub use discrete_pi::Pi;
-    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub use kernel::FocKernel;
+    pub use controller::FocController;
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub use numeric::{Fixed, Scalar};
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub use pi_controller::PIController;
 
     /// Board configuration and ADC utilities
     #[cfg(feature = "algorithms")]
@@ -322,8 +286,8 @@ pub mod foc {
     #[cfg(feature = "algorithms")]
     pub mod constants;
 
-    /// High-level FOC control loop
-    #[cfg(feature = "algorithms")]
+    /// Synchronous high-level FOC current controller
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod controller;
 
     /// Fault registry shared across targets
@@ -351,12 +315,8 @@ pub mod foc {
     pub mod hall_calibration;
 
     /// Hall sensor angle estimation
-    #[cfg(feature = "algorithms")]
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod hall_sensor;
-
-    /// PI controller with anti-windup
-    #[cfg(feature = "algorithms")]
-    pub mod pi_controller;
 
     /// Phase PWM trait for platform drivers
     #[cfg(feature = "algorithms")]
@@ -382,8 +342,8 @@ pub mod foc {
     #[cfg(feature = "algorithms")]
     pub mod fast_math;
 
-    /// Trigonometric abstractions (SinCos trait, q1.31 helpers for CORDIC)
-    #[cfg(feature = "algorithms")]
+    /// Electrical-angle and trigonometry backends
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod trig;
 
     /// Velocity control loop building block (slew-limited reference + PI)

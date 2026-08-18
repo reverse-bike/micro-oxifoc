@@ -60,11 +60,10 @@ name = "oxifoc_core"
 path = "src/lib.rs"
 
 [features]
-default = ["algorithms", "detection", "offset-diagnostics"]
+default = ["fixed-point"]
 
-# Allocation-free Q16.16 instantiation of the shared generic FOC path. Device
-# crates select this without the async runtime, protocol, storage, or motor
-# detection features.
+# Allocation-free Q16.16 synchronous FOC path. Device crates select this
+# without the async runtime, protocol, storage, or motor detection features.
 fixed-point = []
 
 # Runtime current-offset comparison (undriven / per-phase / all-phases).
