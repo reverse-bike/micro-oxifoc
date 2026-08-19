@@ -21,6 +21,7 @@ static MILLIS: AtomicU32 = AtomicU32::new(0);
 fn main() -> ! {
     const WATCHDOG_FEED_PERIOD_MS: u32 = 10;
 
+    safety::capture_boot_diagnostics();
     let mut inputs = None;
     let mut environment = None;
     let mut ride = None;
@@ -85,6 +86,11 @@ fn main() -> ! {
             && let (Some(environment), Some(ride)) = (environment.as_mut(), ride.as_mut())
         {
             let local = sensors::latest();
+            foc::set_bus_voltage_mv(if local.analog_valid {
+                sensors::bus_voltage_mv(local.bus_voltage_adc)
+            } else {
+                0
+            });
             let environment_limit = environment.update(
                 now,
                 environment::RawLocalSensors {

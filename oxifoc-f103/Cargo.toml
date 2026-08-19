@@ -1,9 +1,9 @@
 [package]
 name = "oxifoc-f103"
-version = "0.1.4"
+version = "0.1.8"
 edition = "2024"
 publish = false
-description = "26,200-byte, Hall-only CAN FOC firmware for STM32F103"
+description = "26,200-byte Hall/back-EMF CAN FOC firmware for STM32F103"
 
 [lib]
 test = true
@@ -28,6 +28,6 @@ stm32f1 = { version = "0.15", optional = true, features = ["stm32f103", "rt"] }
 [profile.release]
 codegen-units = 1
 lto = "fat"
-opt-level = "z"
+opt-level = "s"
 panic = "abort"
 strip = true

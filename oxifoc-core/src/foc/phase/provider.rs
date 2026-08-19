@@ -1,6 +1,6 @@
 //! Numeric contract between a phase source and the synchronous FOC loop.
 
-use crate::foc::control_types::Dq;
+use crate::foc::control_types::{AlphaBeta, Dq};
 use crate::foc::numeric::{Fixed, Scalar};
 use crate::foc::phase::PhaseSource;
 use crate::foc::trig::Turns;
@@ -14,10 +14,28 @@ pub struct PhaseEstimate<A = Turns> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PhaseInput<N: Scalar = Fixed, A = Turns> {
-    pub applied_voltage: Dq<N>,
-    pub measured_current: Dq<N>,
-    pub electrical_angle: A,
+    /// Stationary-frame voltage that was physically applied while the current
+    /// sample was developing.
+    pub applied_voltage: AlphaBeta<N>,
+    /// Simultaneously sampled stationary-frame phase current.
+    pub measured_current: AlphaBeta<N>,
     pub control_period_ns: u32,
+    angle: core::marker::PhantomData<A>,
+}
+
+impl<N: Scalar, A> PhaseInput<N, A> {
+    pub const fn new(
+        applied_voltage: AlphaBeta<N>,
+        measured_current: AlphaBeta<N>,
+        control_period_ns: u32,
+    ) -> Self {
+        Self {
+            applied_voltage,
+            measured_current,
+            control_period_ns,
+            angle: core::marker::PhantomData,
+        }
+    }
 }
 
 pub trait PhaseProvider<N: Scalar = Fixed> {

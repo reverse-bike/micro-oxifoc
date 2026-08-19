@@ -5,9 +5,9 @@ controller. It is linked at `0x08003800` for the resident CAN bootloader and is
 hard-limited to a 26,200-byte application image and 4 KiB of linked RAM.
 
 The firmware has no async executor, allocator, floating-point operations,
-formatting stack, USB/UART/RTT transport, persistent storage, sensorless
-observer, HFI, or motor-detection path. The 16 kHz loop uses ADC-count and PWM-
-tick units, Q16.16 control values, Q0.32 electrical angle, and integer CORDIC
+formatting stack, USB/UART/RTT transport, persistent storage, HFI, or
+motor-detection path. The 16 kHz loop uses ADC-count and PWM-tick units,
+Q16.16 control values, Q0.32 electrical angle, and integer CORDIC
 trigonometry.
 
 ## Architecture
@@ -19,9 +19,9 @@ image:
 
 - `oxifoc-core::foc` owns current-offset tracking, Clarke/Park,
   `PIController`, `FocController`, layered current limiting, voltage limiting,
-  CORDIC, SVPWM, target slew, `HallSensor`, and the phase provider/manager
-  interfaces. These live in OxiFOC's canonical modules rather than a parallel
-  F103 algorithm tree.
+  CORDIC, SVPWM, target slew, `HallSensor`, `BackEmfObserver`, and the phase
+  provider/manager interfaces. These live in OxiFOC's canonical modules rather
+  than a parallel F103 algorithm tree.
 - `oxifoc-f103` owns the recovered pin map, direct register access, interrupt
   scheduling, board-specific gains and limits, ride safety, local inputs, and
   stock-bike CAN.
@@ -61,12 +61,15 @@ pin assignments, peripheral timing, sensor conversions, Hall geometry, and
 the reviewed electrical envelope. Current regulation, limiting, estimation,
 and modulation follow OxiFOC's control architecture.
 
-Hall is the installed phase provider. The `PhaseSource` API deliberately
-retains encoder, back-EMF observer, HFI, hybrid, manual, and open-loop strategy
-identities and fixed-point crossover settings. `PhaseManager` rejects those
-sources until their providers are ported, so experiments can add them without
-changing the controller or board boundary. The legacy observer/HFI sources
-remain porting references and are not linked into this image.
+`PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
+observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
+confidence, PLL-lock, minimum-speed, and physical back-EMF validity gates pass
+(or a trusted Hall seed grants initial validity), the manager blends to
+observer angle through 6,000 eRPM. A
+greater-than-90-degree disagreement while Hall still has authority reseeds the
+observer instead of blending through a half-turn ambiguity. Encoder, HFI,
+manual, and open-loop source identities remain available for later experiments
+but are rejected until their providers are installed.
 
 ## Runtime
 
@@ -86,7 +89,10 @@ remain porting references and are not linked into this image.
   feed stock CAN telemetry; its independent quiet state is required for an
   updater reset.
 - DWT measures every 16 kHz control pass. Page 6 of `0x2F7` reports the maximum
-  and warning count; a pass over 4,500 cycles latches output off.
+  and warning count; a pass over 4,500 cycles latches output off. Page 21
+  retains separate maxima for TIM1 entry through phase selection and the FOC
+  driver step. Subtracting both from page 6's whole-handler maximum bounds the
+  remaining output-publication cost.
 - WWDG requires TIM1 interrupt progress, while IWDG is refreshed only when the
   foreground observes both control-cycle and injected-ADC progress.
 
@@ -148,7 +154,7 @@ on PA13. The application provides:
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
   including local brake, wheel speed/distance, temperatures, and fault pages;
 - updater reset on `0x67F#AA552A002A...`;
-- commissioning pages 6 and 8--18 on `0x2F7`.
+- commissioning pages 6 and 8--23 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
@@ -159,9 +165,20 @@ rates. Pages 14--17 retain signed dq current and target, Hall state/direction,
 edge age and interval, measurement and unlimited Hall angles, phase A/B
 current, applied dq voltage, and limiting flags from the exact cycle that set
 the maximum |d|. A repeated event generation prevents readers from combining
-different peaks. Page 18 carries telemetry schema 2 and the crate version. The
-project-page scheduler advances through all twelve pages without a wraparound
-phase discontinuity.
+different peaks. Page 12 also retains the specific cause of the latest safety
+loss. Pages 19 and 20 report observer configuration/readiness/activity, blend,
+confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
+back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
+schema 6 and the crate version. Page 21 reports retained pre-driver phase-path
+and driver-step timing maxima. Pages 22 and 23 report the RCC reset cause and,
+after a watchdog reset, the retained fatal class, last control checkpoint,
+whole-handler timing, cycle number, exception detail, and low address words of
+the stacked PC/LR. The complete PC is recoverable because this application is
+confined to `0x08003800..0x08009E57`. The project-page scheduler advances
+through all seventeen pages without a wraparound phase discontinuity.
+The 40-byte retained record is linked at `0x20004F00`: above the recovered
+bootloader's `0x200000DC..0x20000CF7` zero-fill/stack range and outside the
+application's conservative 4 KiB runtime RAM region.
 
 On page 9, byte 1 remains a saturated one-byte current-limit value for older
 tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
@@ -196,6 +213,20 @@ Host behavior tests, target Clippy, linking, section inspection, stack-size
 metadata, and bootloader-image validation can establish software consistency
 and the real flash/RAM footprint. They cannot prove GPIO polarity, current
 scaling, Hall geometry, control-loop cycle time, or motor direction on this
-specific board. Those remain hardware commissioning gates. The generated
-version 0.1.1, 480-DC-count/1,273-tick image has not been flashed as part of
-this change.
+specific board. Those remain hardware commissioning gates. Version 0.1.5 was
+flashed over CAN on 2026-08-18 and answered the stock identity query after the
+bootloader reset. A stationary post-flash capture reported telemetry schema 3,
+no faults or safety losses, and a 1,091-cycle maximum against the 4,500-cycle
+control budget. Its loaded capture subsequently exposed Hall-correlated timing
+overruns and six resets. Version 0.1.6 replaced the wide Hall interval
+divisions, but its loaded capture still reached 4,561 cycles, accumulated 122
+warnings within 0.75 seconds, and restarted six times. Its schema-4 breakdown
+reported 964 Hall-edge cycles and 2,445 driver cycles. Version 0.1.7 replaces
+the remaining geometry scans with direct raw-state metadata and moves the
+schema-5 timing boundary around the complete pre-driver phase path. Its loaded
+capture held the observer through 56.3 km/h and felt good, but reached 4,334
+cycles, accumulated 2,509 warning passes, and restarted once without a power
+cycle. Version 0.1.8 retains reset/crash context across watchdog resets and
+removes read-modify-write diagnostic atomics from the control interrupt. A
+loaded 0.1.8 capture confirming both the reset cause and recovered timing
+margin is the next commissioning gate.

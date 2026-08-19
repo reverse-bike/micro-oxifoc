@@ -19,6 +19,8 @@ pub struct FocController<
     vector_limit_ticks: N,
     phase_limit_ticks: u16,
     applied_voltage: Dq<N>,
+    applied_stationary: AlphaBeta<N>,
+    measured_stationary: AlphaBeta<N>,
     voltage_limited: bool,
     actuation_advance: N,
     backend: PhantomData<(T, M)>,
@@ -42,6 +44,14 @@ where
             vector_limit_ticks,
             phase_limit_ticks,
             applied_voltage: Dq::new(N::ZERO, N::ZERO),
+            applied_stationary: AlphaBeta {
+                alpha: N::ZERO,
+                beta: N::ZERO,
+            },
+            measured_stationary: AlphaBeta {
+                alpha: N::ZERO,
+                beta: N::ZERO,
+            },
             voltage_limited: false,
             actuation_advance: N::ZERO,
             backend: PhantomData,
@@ -52,11 +62,27 @@ where
         self.direct.reset();
         self.quadrature.reset();
         self.applied_voltage = Dq::new(N::ZERO, N::ZERO);
+        self.applied_stationary = AlphaBeta {
+            alpha: N::ZERO,
+            beta: N::ZERO,
+        };
+        self.measured_stationary = AlphaBeta {
+            alpha: N::ZERO,
+            beta: N::ZERO,
+        };
         self.voltage_limited = false;
     }
 
     pub const fn applied_voltage(&self) -> Dq<N> {
         self.applied_voltage
+    }
+
+    pub const fn applied_stationary(&self) -> AlphaBeta<N> {
+        self.applied_stationary
+    }
+
+    pub const fn measured_stationary(&self) -> AlphaBeta<N> {
+        self.measured_stationary
     }
 
     pub const fn voltage_limited(&self) -> bool {
@@ -104,6 +130,7 @@ where
     ) -> (Dq<N>, PwmDuty) {
         let (sin, cos) = T::sin_cos(electrical_angle);
         let (alpha, beta) = clarke(phase_a, phase_b);
+        self.measured_stationary = AlphaBeta { alpha, beta };
         let (measured_d, measured_q) = park(alpha, beta, sin, cos);
         let measured = Dq::new(measured_d, measured_q);
         let direct_update = self.direct.prepare_update(target.d, measured.d);
@@ -128,6 +155,10 @@ where
         let (voltage_alpha, voltage_beta) = inverse_park(applied.d, applied.q, sin, cos);
         let (voltage_alpha, voltage_beta) =
             self.apply_actuation_advance(voltage_alpha, voltage_beta);
+        self.applied_stationary = AlphaBeta {
+            alpha: voltage_alpha,
+            beta: voltage_beta,
+        };
         let duties = M::to_duties(
             AlphaBeta {
                 alpha: voltage_alpha,

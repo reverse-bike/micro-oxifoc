@@ -4,7 +4,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::protocol::{self, Frame};
-use crate::{config, control::foc, hardware::peripherals, sensors};
+use crate::{config, control::foc, hardware::peripherals, safety, sensors};
 use stm32f1::stm32f103::interrupt;
 
 const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
@@ -184,6 +184,7 @@ pub fn service(
             5 => protocol::control_fault_telemetry(protocol::ControlFaultTelemetry {
                 fault_flags: control.fault_flags,
                 safety_events: control.safety_events.min(u32::from(u16::MAX)) as u16,
+                last_safety_loss_reason: control.last_safety_loss_reason,
             }),
             6 => protocol::control_peak_telemetry(protocol::ControlPeakTelemetry {
                 maximum_phase_current_abs: control.maximum_phase_current_abs,
@@ -214,6 +215,48 @@ pub fn service(
                         angle_rate_limited: event.angle_rate_limited,
                     },
                 )
+            }
+            11 => protocol::observer_status_telemetry(protocol::ObserverStatusTelemetry {
+                configured: control.observer_configured,
+                ready: control.observer_ready,
+                active: control.observer_active,
+                blend: control.observer_blend,
+                confidence: control.observer_confidence,
+                electrical_rpm: control.observer_electrical_rpm,
+                hall_error_q16: control.observer_hall_error_q16,
+            }),
+            12 => protocol::observer_model_telemetry(protocol::ObserverModelTelemetry {
+                flux_centi_mwb: control.observer_flux_centi_mwb,
+                bemf_q_mv: control.observer_bemf_q_mv,
+                phase_error_q16: control.observer_phase_error_q16,
+                validity_progress: control.observer_validity_progress,
+            }),
+            13 => protocol::control_timing_breakdown_telemetry(
+                protocol::ControlTimingBreakdownTelemetry {
+                    maximum_pre_driver_cycles: control.maximum_pre_driver_cycles,
+                    maximum_driver_step_cycles: control.maximum_driver_step_cycles,
+                },
+            ),
+            14 => {
+                let reset = safety::boot_diagnostics_snapshot();
+                protocol::reset_summary_telemetry(protocol::ResetSummaryTelemetry {
+                    reset_flags: reset.reset_flags,
+                    retained_context_valid: reset.retained_context_valid,
+                    fatal_reason: reset.fatal_reason,
+                    checkpoint: reset.checkpoint,
+                    last_control_cycles: reset.last_control_cycles.min(u32::from(u16::MAX)) as u16,
+                    maximum_control_cycles: reset.maximum_control_cycles.min(u32::from(u16::MAX))
+                        as u16,
+                })
+            }
+            15 => {
+                let reset = safety::boot_diagnostics_snapshot();
+                protocol::crash_context_telemetry(protocol::CrashContextTelemetry {
+                    detail: reset.detail,
+                    control_cycle: reset.control_cycle,
+                    program_counter: reset.program_counter,
+                    link_register: reset.link_register,
+                })
             }
             _ => protocol::firmware_version_telemetry(),
         };

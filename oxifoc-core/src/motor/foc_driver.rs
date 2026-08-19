@@ -7,7 +7,7 @@
 
 use crate::foc::phase::{PhaseEstimate, PhaseInput, PhaseProvider};
 use crate::foc::trig::Turns;
-use crate::foc::{Dq, Fixed, FocController, PwmDuty, Scalar};
+use crate::foc::{AlphaBeta, Dq, Fixed, FocController, PwmDuty, Scalar};
 
 /// Current-command, supply-current, and measured-overcurrent limits.
 ///
@@ -93,6 +93,9 @@ pub struct FocDriver<Phase> {
     bus_mod_q_filt_ticks: Fixed,
     pwm_period_ticks: u16,
     modulation_filter_shift: u8,
+    volts_per_pwm_tick: Fixed,
+    amps_per_current_count: Fixed,
+    previous_applied_voltage: AlphaBeta,
 }
 
 impl<Phase> FocDriver<Phase> {
@@ -110,7 +113,30 @@ impl<Phase> FocDriver<Phase> {
             bus_mod_q_filt_ticks: Fixed::ZERO,
             pwm_period_ticks,
             modulation_filter_shift,
+            volts_per_pwm_tick: Fixed::ONE,
+            amps_per_current_count: Fixed::ONE,
+            previous_applied_voltage: AlphaBeta {
+                alpha: Fixed::ZERO,
+                beta: Fixed::ZERO,
+            },
         }
+    }
+
+    /// Configure the physical scales supplied to phase observers.
+    pub const fn with_observer_scales(
+        mut self,
+        volts_per_pwm_tick: Fixed,
+        amps_per_current_count: Fixed,
+    ) -> Self {
+        self.volts_per_pwm_tick = volts_per_pwm_tick;
+        self.amps_per_current_count = amps_per_current_count;
+        self
+    }
+
+    /// Refresh the bus-dependent voltage scale without disturbing the
+    /// previous-cycle voltage/current pairing.
+    pub fn set_volts_per_pwm_tick(&mut self, volts_per_pwm_tick: Fixed) {
+        self.volts_per_pwm_tick = volts_per_pwm_tick;
     }
 
     pub const fn phase(&self) -> &Phase {
@@ -141,6 +167,7 @@ impl<Phase> FocDriver<Phase> {
     pub fn reset(&mut self) {
         self.controller.reset();
         self.bus_mod_q_filt_ticks = Fixed::ZERO;
+        self.previous_applied_voltage = AlphaBeta::default();
     }
 
     pub fn filtered_q_modulation(&self) -> Fixed {
@@ -251,12 +278,22 @@ where
         let applied_voltage = self.controller.applied_voltage();
         self.note_applied_voltage(applied_voltage);
         let voltage_limited = self.controller.voltage_limited();
-        self.phase.update(&PhaseInput {
-            applied_voltage,
-            measured_current,
-            electrical_angle,
+        let measured_stationary = self.controller.measured_stationary();
+        let measured_stationary = AlphaBeta {
+            alpha: scale_observer_input(measured_stationary.alpha, self.amps_per_current_count),
+            beta: scale_observer_input(measured_stationary.beta, self.amps_per_current_count),
+        };
+        let applied_stationary = self.controller.applied_stationary();
+        let applied_stationary = AlphaBeta {
+            alpha: scale_observer_input(applied_stationary.alpha, self.volts_per_pwm_tick),
+            beta: scale_observer_input(applied_stationary.beta, self.volts_per_pwm_tick),
+        };
+        self.phase.update(&PhaseInput::new(
+            self.previous_applied_voltage,
+            measured_stationary,
             control_period_ns,
-        });
+        ));
+        self.previous_applied_voltage = applied_stationary;
         Ok(FocOutput {
             target,
             quadrature_limit,
@@ -266,6 +303,15 @@ where
             voltage_limited,
         })
     }
+}
+
+#[inline(always)]
+fn scale_observer_input(value: Fixed, scale: Fixed) -> Fixed {
+    // Controller current and voltage are already bounded by the ADC and PWM
+    // envelopes. Their physical scales cannot approach Q16.16 overflow, so
+    // the observer bridge needs only the fixed-point product, not another
+    // saturation tree around each of its four axes.
+    Fixed::from_bits(((i64::from(value.to_bits()) * i64::from(scale.to_bits())) >> 16) as i32)
 }
 
 fn phase_current_limit(bus_limit: Fixed, q_voltage_ticks: u32, pwm_period_ticks: u16) -> Fixed {
@@ -304,6 +350,31 @@ mod tests {
                 electrical_rpm: 0,
                 trustworthy: true,
             })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CapturingPhase {
+        input: PhaseInput,
+    }
+
+    impl PhaseProvider for CapturingPhase {
+        type Angle = Turns;
+
+        fn source(&self) -> PhaseSource {
+            PhaseSource::Observer
+        }
+
+        fn estimate(&self, _elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
+            Some(PhaseEstimate {
+                angle: 0,
+                electrical_rpm: 0,
+                trustworthy: true,
+            })
+        }
+
+        fn update(&mut self, input: &PhaseInput) {
+            self.input = *input;
         }
     }
 
@@ -417,5 +488,56 @@ mod tests {
         let modulation = driver.filtered_q_modulation();
         assert!(modulation < Fixed::ratio(-47, 100));
         assert!(modulation > Fixed::ratio(-49, 100));
+    }
+
+    #[test]
+    fn observer_receives_previous_voltage_with_the_current_sample() {
+        let proportional = PIController::new(Fixed::ONE, Fixed::ZERO);
+        let mut driver = FocDriver::new(
+            FocController::new(proportional, proportional, Fixed::from_integer(100), 100),
+            CapturingPhase::default(),
+            CurrentLimits::new(
+                Fixed::from_integer(100),
+                Fixed::from_integer(200),
+                None,
+                None,
+            ),
+            200,
+            0,
+        )
+        .with_observer_scales(Fixed::from_integer(2), Fixed::from_integer(3));
+
+        driver
+            .step_current_control(
+                Fixed::ZERO,
+                Fixed::ZERO,
+                0,
+                Dq::new(Fixed::from_integer(10), Fixed::ZERO),
+                100,
+                62_500,
+            )
+            .unwrap();
+        assert_eq!(driver.phase().input.applied_voltage, AlphaBeta::default());
+
+        driver
+            .step_current_control(
+                Fixed::from_integer(2),
+                Fixed::from_integer(-1),
+                0,
+                Dq::default(),
+                100,
+                62_500,
+            )
+            .unwrap();
+        let applied = driver.phase().input.applied_voltage;
+        assert!((applied.alpha.to_bits() - Fixed::from_integer(20).to_bits()).unsigned_abs() <= 32);
+        assert!(applied.beta.to_bits().unsigned_abs() <= 32);
+        assert_eq!(
+            driver.phase().input.measured_current,
+            AlphaBeta {
+                alpha: Fixed::from_integer(6),
+                beta: Fixed::ZERO,
+            }
+        );
     }
 }

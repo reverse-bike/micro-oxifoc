@@ -1,35 +1,55 @@
-//! Phase-source ownership and selection for the synchronous controller.
+//! Phase-source ownership, validation, and crossover for synchronous FOC.
 //!
-//! The manager remains the boundary between a concrete angle sensor and the
-//! FOC loop. The F103 image currently installs only a Hall provider; the
-//! source enum and validation errors keep the observer, encoder, HFI, manual,
-//! and open-loop extension points explicit without linking unused estimators.
+//! The manager is the boundary OxiFOC uses between physical angle sensors,
+//! software observers, and the motor driver. The F103 configuration installs a
+//! Hall provider plus [`BackEmfObserver`], selecting the established
+//! Hall-to-observer blend strategy without putting estimator policy in the
+//! interrupt or Hall implementation.
 
-use core::marker::PhantomData;
+use crate::foc::numeric::Fixed;
 
-use crate::foc::numeric::{Fixed, Scalar};
+use super::observer::signed_angle_difference;
+use super::{
+    BackEmfObserver, PhaseEstimate, PhaseInput, PhaseProvider, PhaseSource, PhaseSourceError,
+};
+use crate::foc::trig::Turns;
 
-use super::{PhaseEstimate, PhaseInput, PhaseProvider, PhaseSource, PhaseSourceError};
-
-/// Owns the configured phase providers and exposes the selected source to the
-/// current loop.
-///
-/// Only the Hall slot is populated in the present F103 firmware. Additional
-/// fixed-point providers belong here when they are ported; they should not be
-/// embedded in the Hall sensor or the device interrupt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhaseManager<H, N: Scalar = Fixed> {
-    hall: H,
-    source: PhaseSource,
-    numeric: PhantomData<N>,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObserverDiagnostics {
+    pub configured: bool,
+    pub ready: bool,
+    pub active: bool,
+    pub blend: Fixed,
+    pub electrical_rpm: i32,
+    /// Observer minus Hall as a signed Q0.32 turn difference.
+    pub hall_error_q32: i32,
+    pub confidence: Fixed,
+    pub flux_magnitude_mwb: Fixed,
+    pub bemf_q_v: Fixed,
+    pub phase_error_filtered_q32: u32,
+    pub validity_progress: u8,
 }
 
-impl<H, N: Scalar> PhaseManager<H, N> {
+/// Owns the installed Hall sensor and optional back-EMF estimator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseManager<H> {
+    hall: H,
+    observer: Option<BackEmfObserver>,
+    source: PhaseSource,
+    observer_seed_requested: bool,
+    last_observer_blend: Fixed,
+    last_observer_hall_error_q32: i32,
+}
+
+impl<H> PhaseManager<H> {
     pub const fn with_hall(hall: H) -> Self {
         Self {
             hall,
+            observer: None,
             source: PhaseSource::Hall,
-            numeric: PhantomData,
+            observer_seed_requested: false,
+            last_observer_blend: Fixed::ZERO,
+            last_observer_hall_error_q32: 0,
         }
     }
 
@@ -45,19 +65,62 @@ impl<H, N: Scalar> PhaseManager<H, N> {
         &mut self.hall
     }
 
-    /// Select an available phase source.
-    ///
-    /// Hall is the only installed provider today. Rejections distinguish the
-    /// missing provider class so future observer experiments can add their
-    /// state to this manager without changing the FOC/device boundary.
+    pub const fn observer(&self) -> Option<&BackEmfObserver> {
+        self.observer.as_ref()
+    }
+
+    pub fn observer_mut(&mut self) -> Option<&mut BackEmfObserver> {
+        self.observer.as_mut()
+    }
+
+    pub fn set_observer(&mut self, observer: BackEmfObserver) {
+        self.observer = Some(observer);
+    }
+
+    pub fn reset_observer(&mut self) {
+        if let Some(observer) = &mut self.observer {
+            observer.reset();
+        }
+        self.last_observer_blend = Fixed::ZERO;
+        self.last_observer_hall_error_q32 = 0;
+    }
+
+    /// Seed the estimator from the next Hall estimate before source blending.
+    pub fn request_observer_seed(&mut self) {
+        self.observer_seed_requested = true;
+    }
+
+    pub fn observer_diagnostics(&self) -> ObserverDiagnostics {
+        let Some(observer) = self.observer.as_ref() else {
+            return ObserverDiagnostics::default();
+        };
+        ObserverDiagnostics {
+            configured: true,
+            ready: observer.is_ready(),
+            active: self.last_observer_blend > Fixed::ZERO,
+            blend: self.last_observer_blend,
+            electrical_rpm: observer.electrical_rpm(),
+            hall_error_q32: self.last_observer_hall_error_q32,
+            confidence: observer.confidence(),
+            flux_magnitude_mwb: observer.flux_magnitude_mwb(),
+            bemf_q_v: observer.bemf_q_filtered_v(),
+            phase_error_filtered_q32: observer.phase_error_filtered_q32(),
+            validity_progress: observer.validity_progress(),
+        }
+    }
+
     pub fn set_source(&mut self, source: PhaseSource) -> Result<(), PhaseSourceError> {
         let result = match source {
             PhaseSource::Hall => Ok(()),
+            PhaseSource::Observer | PhaseSource::HallToObserver { .. } => {
+                if self.observer.is_some() {
+                    Ok(())
+                } else {
+                    Err(PhaseSourceError::ObserverNotConfigured)
+                }
+            }
             PhaseSource::Encoder | PhaseSource::EncoderToObserver { .. } => {
                 Err(PhaseSourceError::EncoderNotAvailable)
-            }
-            PhaseSource::Observer | PhaseSource::HallToObserver { .. } => {
-                Err(PhaseSourceError::ObserverNotConfigured)
             }
             PhaseSource::Hfi
             | PhaseSource::HfiToObserver { .. }
@@ -70,40 +133,155 @@ impl<H, N: Scalar> PhaseManager<H, N> {
         };
         if result.is_ok() {
             self.source = source;
+            self.last_observer_blend = Fixed::ZERO;
+            self.last_observer_hall_error_q32 = 0;
         }
         result
     }
+
+    fn observer_estimate(&self) -> Option<PhaseEstimate<Turns>> {
+        let observer = self.observer.as_ref()?;
+        Some(PhaseEstimate {
+            angle: observer.phase(),
+            electrical_rpm: observer.electrical_rpm(),
+            trustworthy: observer.is_ready(),
+        })
+    }
+
+    fn select_estimate(
+        &mut self,
+        hall: Option<PhaseEstimate<Turns>>,
+    ) -> Option<PhaseEstimate<Turns>> {
+        if self.observer_seed_requested {
+            if let (Some(sensor), Some(observer)) = (hall, &mut self.observer) {
+                observer.seed(sensor.angle, sensor.electrical_rpm);
+            }
+            self.observer_seed_requested = false;
+        }
+
+        let observer = self.observer_estimate();
+        let mut blend = Fixed::ZERO;
+        let mut hall_error_q32 = match (hall, observer) {
+            (Some(sensor), Some(estimate)) => signed_angle_difference(estimate.angle, sensor.angle),
+            _ => 0,
+        };
+        let output = match self.source {
+            PhaseSource::Hall => hall,
+            PhaseSource::Observer => match observer {
+                Some(estimate) if estimate.trustworthy => {
+                    blend = Fixed::ONE;
+                    Some(estimate)
+                }
+                _ => None,
+            },
+            PhaseSource::HallToObserver {
+                blend_low_erpm,
+                blend_high_erpm,
+            } => match (hall, observer) {
+                (Some(sensor), Some(estimate)) if estimate.trustworthy => {
+                    blend = crossover_blend(
+                        sensor
+                            .electrical_rpm
+                            .unsigned_abs()
+                            .max(estimate.electrical_rpm.unsigned_abs()),
+                        blend_low_erpm,
+                        blend_high_erpm,
+                    );
+                    let error = signed_angle_difference(estimate.angle, sensor.angle);
+                    // OxiFOC's half-turn ambiguity guard: while Hall retains
+                    // any authority, a >90-degree disagreement is a reseed,
+                    // never a command to blend through zero torque.
+                    if blend < Fixed::ONE && error.unsigned_abs() > 0x4000_0000 {
+                        if let Some(observer) = &mut self.observer {
+                            observer.seed(sensor.angle, sensor.electrical_rpm);
+                        }
+                        blend = Fixed::ZERO;
+                        hall_error_q32 = 0;
+                        Some(sensor)
+                    } else if blend == Fixed::ONE {
+                        Some(estimate)
+                    } else {
+                        Some(blend_estimates(sensor, estimate, blend))
+                    }
+                }
+                (Some(sensor), _) => Some(sensor),
+                (None, Some(estimate)) if estimate.trustworthy => {
+                    blend = Fixed::ONE;
+                    Some(estimate)
+                }
+                _ => None,
+            },
+            _ => hall,
+        };
+        self.last_observer_blend = blend;
+        self.last_observer_hall_error_q32 = hall_error_q32;
+        output
+    }
 }
 
-impl<H, N> PhaseProvider<N> for PhaseManager<H, N>
+impl<H> PhaseProvider for PhaseManager<H>
 where
-    H: PhaseProvider<N>,
-    N: Scalar,
+    H: PhaseProvider<Fixed, Angle = Turns>,
 {
-    type Angle = H::Angle;
+    type Angle = Turns;
 
     fn source(&self) -> PhaseSource {
         self.source
     }
 
-    fn estimate(&self, elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Self::Angle>> {
-        self.hall.estimate(elapsed_since_observation_us)
+    fn estimate(&self, elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
+        let hall = self.hall.estimate(elapsed_since_observation_us);
+        match self.source {
+            PhaseSource::Hall => hall,
+            PhaseSource::Observer => self
+                .observer_estimate()
+                .filter(|estimate| estimate.trustworthy),
+            PhaseSource::HallToObserver {
+                blend_low_erpm,
+                blend_high_erpm,
+            } => match (hall, self.observer_estimate()) {
+                (Some(sensor), Some(observer)) if observer.trustworthy => {
+                    let blend = crossover_blend(
+                        sensor
+                            .electrical_rpm
+                            .unsigned_abs()
+                            .max(observer.electrical_rpm.unsigned_abs()),
+                        blend_low_erpm,
+                        blend_high_erpm,
+                    );
+                    if blend == Fixed::ONE {
+                        Some(observer)
+                    } else {
+                        Some(blend_estimates(sensor, observer, blend))
+                    }
+                }
+                (Some(sensor), _) => Some(sensor),
+                (None, Some(observer)) if observer.trustworthy => Some(observer),
+                _ => None,
+            },
+            _ => hall,
+        }
     }
 
     fn estimate_for_control(
         &mut self,
         elapsed_since_observation_us: u32,
         control_period_ns: u32,
-    ) -> Option<PhaseEstimate<Self::Angle>> {
-        self.hall
-            .estimate_for_control(elapsed_since_observation_us, control_period_ns)
+    ) -> Option<PhaseEstimate<Turns>> {
+        let hall = self
+            .hall
+            .estimate_for_control(elapsed_since_observation_us, control_period_ns);
+        self.select_estimate(hall)
     }
 
-    fn update(&mut self, input: &PhaseInput<N, Self::Angle>) {
+    fn update(&mut self, input: &PhaseInput) {
         self.hall.update(input);
+        if let Some(observer) = &mut self.observer {
+            observer.update(input);
+        }
     }
 
-    fn injection(&self) -> crate::foc::Dq<N> {
+    fn injection(&self) -> crate::foc::Dq {
         self.hall.injection()
     }
 
@@ -112,13 +290,54 @@ where
     }
 }
 
+fn crossover_blend(speed_erpm: u32, low_erpm: i32, high_erpm: i32) -> Fixed {
+    let low = low_erpm.max(0) as u32;
+    let high = high_erpm.max(low_erpm.max(0) + 1) as u32;
+    if speed_erpm <= low {
+        Fixed::ZERO
+    } else if speed_erpm >= high {
+        Fixed::ONE
+    } else {
+        Fixed::ratio((speed_erpm - low) as i32, (high - low) as i32)
+    }
+}
+
+fn blend_estimates(
+    sensor: PhaseEstimate<Turns>,
+    observer: PhaseEstimate<Turns>,
+    blend: Fixed,
+) -> PhaseEstimate<Turns> {
+    let angle_error = signed_angle_difference(observer.angle, sensor.angle);
+    let blended_angle = sensor
+        .angle
+        .wrapping_add(scale_i32(angle_error, blend) as u32);
+    let velocity_error = observer
+        .electrical_rpm
+        .saturating_sub(sensor.electrical_rpm);
+    PhaseEstimate {
+        angle: blended_angle,
+        electrical_rpm: sensor
+            .electrical_rpm
+            .saturating_add(scale_i32(velocity_error, blend)),
+        trustworthy: sensor.trustworthy || observer.trustworthy,
+    }
+}
+
+fn scale_i32(value: i32, scale: Fixed) -> i32 {
+    ((i64::from(value) * i64::from(scale.to_bits())) >> 16)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foc::trig::Turns;
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-    struct TestHall;
+    struct TestHall {
+        angle: Turns,
+        electrical_rpm: i32,
+        valid: bool,
+    }
 
     impl PhaseProvider for TestHall {
         type Angle = Turns;
@@ -128,28 +347,124 @@ mod tests {
         }
 
         fn estimate(&self, _elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
-            Some(PhaseEstimate {
-                angle: 0x1234_0000,
-                electrical_rpm: -900,
+            self.valid.then_some(PhaseEstimate {
+                angle: self.angle,
+                electrical_rpm: self.electrical_rpm,
                 trustworthy: true,
             })
         }
     }
 
-    #[test]
-    fn hall_provider_remains_behind_the_phase_manager() {
-        let manager = PhaseManager::<TestHall>::with_hall(TestHall);
-        assert_eq!(manager.source(), PhaseSource::Hall);
-        assert_eq!(manager.estimate(10).unwrap().angle, 0x1234_0000);
+    fn observer() -> BackEmfObserver {
+        BackEmfObserver::new(
+            Fixed::ratio(884, 10_000),
+            Fixed::ratio(39, 1_000),
+            Fixed::ratio(122, 10),
+            16_000,
+        )
     }
 
     #[test]
-    fn unavailable_sources_are_rejected_without_changing_the_active_source() {
-        let mut manager = PhaseManager::<TestHall>::with_hall(TestHall);
+    fn unavailable_sources_are_rejected_without_changing_source() {
+        let hall = TestHall {
+            valid: true,
+            ..TestHall::default()
+        };
+        let mut manager = PhaseManager::with_hall(hall);
         assert_eq!(
             manager.set_source(PhaseSource::Observer),
             Err(PhaseSourceError::ObserverNotConfigured)
         );
         assert_eq!(manager.source(), PhaseSource::Hall);
+    }
+
+    #[test]
+    fn hall_to_observer_blends_across_the_configured_erpm_band() {
+        let hall = TestHall {
+            angle: 0x1000_0000,
+            electrical_rpm: 4_500,
+            valid: true,
+        };
+        let mut observer = observer();
+        observer.seed(0x2000_0000, 4_500);
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(observer);
+        manager
+            .set_source(PhaseSource::HallToObserver {
+                blend_low_erpm: 3_000,
+                blend_high_erpm: 6_000,
+            })
+            .unwrap();
+
+        let estimate = manager.estimate_for_control(0, 62_500).unwrap();
+        assert!((estimate.angle.wrapping_sub(0x1800_0000) as i32).unsigned_abs() < 0x1_0000);
+        assert_eq!(manager.observer_diagnostics().blend, Fixed::ratio(1, 2));
+    }
+
+    #[test]
+    fn full_speed_crossover_uses_the_observer() {
+        let hall = TestHall {
+            angle: 0x1000_0000,
+            electrical_rpm: 7_000,
+            valid: true,
+        };
+        let mut observer = observer();
+        observer.seed(0x2000_0000, 7_000);
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(observer);
+        manager
+            .set_source(PhaseSource::HallToObserver {
+                blend_low_erpm: 3_000,
+                blend_high_erpm: 6_000,
+            })
+            .unwrap();
+
+        assert_eq!(
+            manager.estimate_for_control(0, 62_500).unwrap().angle,
+            0x2000_0000
+        );
+        assert_eq!(manager.observer_diagnostics().blend, Fixed::ONE);
+        assert!(manager.observer_diagnostics().active);
+    }
+
+    #[test]
+    fn half_turn_disagreement_reseeds_instead_of_blending() {
+        let hall = TestHall {
+            angle: 0x1000_0000,
+            electrical_rpm: 4_500,
+            valid: true,
+        };
+        let mut observer = observer();
+        observer.seed(0x9000_0000, 4_500);
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(observer);
+        manager
+            .set_source(PhaseSource::HallToObserver {
+                blend_low_erpm: 3_000,
+                blend_high_erpm: 6_000,
+            })
+            .unwrap();
+
+        assert_eq!(
+            manager.estimate_for_control(0, 62_500).unwrap().angle,
+            hall.angle
+        );
+        assert_eq!(manager.observer().unwrap().phase(), hall.angle);
+        assert_eq!(manager.observer_diagnostics().blend, Fixed::ZERO);
+    }
+
+    #[test]
+    fn requested_seed_uses_the_next_rate_limited_hall_estimate() {
+        let hall = TestHall {
+            angle: 0x3000_0000,
+            electrical_rpm: -5_000,
+            valid: true,
+        };
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(observer());
+        manager.request_observer_seed();
+        let _ = manager.estimate_for_control(0, 62_500);
+        assert_eq!(manager.observer().unwrap().phase(), hall.angle);
+        assert!((manager.observer().unwrap().electrical_rpm() + 5_000).unsigned_abs() < 2);
     }
 }

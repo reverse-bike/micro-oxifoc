@@ -114,10 +114,10 @@ pub const fn next_telemetry_slot(slot: u8) -> u8 {
 }
 
 pub const fn next_project_telemetry_page(page: u8) -> u8 {
-    if page >= 11 { 0 } else { page + 1 }
+    if page >= 16 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 2;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 6;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -225,6 +225,7 @@ pub struct ControlOutputTelemetry {
 pub struct ControlFaultTelemetry {
     pub fault_flags: u32,
     pub safety_events: u16,
+    pub last_safety_loss_reason: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -253,6 +254,49 @@ pub struct ControlPeakEventTelemetry {
     pub applied_q_ticks: i16,
     pub voltage_limited: bool,
     pub angle_rate_limited: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObserverStatusTelemetry {
+    pub configured: bool,
+    pub ready: bool,
+    pub active: bool,
+    pub blend: u8,
+    pub confidence: u8,
+    pub electrical_rpm: i16,
+    pub hall_error_q16: i16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObserverModelTelemetry {
+    pub flux_centi_mwb: u16,
+    pub bemf_q_mv: i16,
+    pub phase_error_q16: u16,
+    pub validity_progress: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlTimingBreakdownTelemetry {
+    pub maximum_pre_driver_cycles: u16,
+    pub maximum_driver_step_cycles: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResetSummaryTelemetry {
+    pub reset_flags: u8,
+    pub retained_context_valid: bool,
+    pub fatal_reason: u8,
+    pub checkpoint: u8,
+    pub last_control_cycles: u16,
+    pub maximum_control_cycles: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrashContextTelemetry {
+    pub detail: i16,
+    pub control_cycle: u32,
+    pub program_counter: u32,
+    pub link_register: u32,
 }
 
 /// The two passive commissioning pages retain the established `0x2F7` page-8
@@ -387,8 +431,8 @@ pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
     )
 }
 
-/// Page 12: the complete internal hardware/software fault mask and saturated
-/// safety-loss count.
+/// Page 12: the complete internal hardware/software fault mask, saturated
+/// safety-loss count, and most recent loss reason.
 pub fn control_fault_telemetry(snapshot: ControlFaultTelemetry) -> Frame {
     let faults = snapshot.fault_flags.to_le_bytes();
     let safety_events = snapshot.safety_events.to_le_bytes();
@@ -403,7 +447,7 @@ pub fn control_fault_telemetry(snapshot: ControlFaultTelemetry) -> Frame {
             faults[3],
             safety_events[0],
             safety_events[1],
-            0,
+            snapshot.last_safety_loss_reason,
         ],
     )
 }
@@ -523,6 +567,122 @@ pub fn control_peak_event_telemetry(page_index: u8, snapshot: ControlPeakEventTe
     }
 }
 
+/// Page 19: active Hall-to-observer handoff state and angle disagreement.
+pub fn observer_status_telemetry(snapshot: ObserverStatusTelemetry) -> Frame {
+    let flags = u8::from(snapshot.configured)
+        | (u8::from(snapshot.ready) << 1)
+        | (u8::from(snapshot.active) << 2);
+    let rpm = snapshot.electrical_rpm.to_le_bytes();
+    let hall_error = snapshot.hall_error_q16.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            19,
+            flags,
+            snapshot.blend,
+            snapshot.confidence,
+            rpm[0],
+            rpm[1],
+            hall_error[0],
+            hall_error[1],
+        ],
+    )
+}
+
+/// Page 20: observer model magnitude, back-EMF corroboration, PLL lock error,
+/// and progress toward the two-revolution external-validity threshold.
+pub fn observer_model_telemetry(snapshot: ObserverModelTelemetry) -> Frame {
+    let flux = snapshot.flux_centi_mwb.to_le_bytes();
+    let bemf = snapshot.bemf_q_mv.to_le_bytes();
+    let phase_error = snapshot.phase_error_q16.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            20,
+            flux[0],
+            flux[1],
+            bemf[0],
+            bemf[1],
+            phase_error[0],
+            phase_error[1],
+            snapshot.validity_progress,
+        ],
+    )
+}
+
+/// Page 21 separates TIM1 entry through phase selection from the FOC driver
+/// step. Together with page 6's whole-handler maximum, these fields expose the
+/// residual post-driver cost without instrumenting another hot-path boundary.
+pub fn control_timing_breakdown_telemetry(snapshot: ControlTimingBreakdownTelemetry) -> Frame {
+    let pre_driver = snapshot.maximum_pre_driver_cycles.to_le_bytes();
+    let driver = snapshot.maximum_driver_step_cycles.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            21,
+            pre_driver[0],
+            pre_driver[1],
+            driver[0],
+            driver[1],
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Page 22 identifies why the MCU reset and, for watchdog resets, where the
+/// preceding control interrupt last made progress. Bit 7 marks retained
+/// context as valid; the low six bits retain the decoded RCC reset causes.
+pub fn reset_summary_telemetry(snapshot: ResetSummaryTelemetry) -> Frame {
+    let flags = (snapshot.reset_flags & 0x3f) | (u8::from(snapshot.retained_context_valid) << 7);
+    let last = snapshot.last_control_cycles.to_le_bytes();
+    let maximum = snapshot.maximum_control_cycles.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            22,
+            flags,
+            snapshot.fatal_reason,
+            snapshot.checkpoint,
+            last[0],
+            last[1],
+            maximum[0],
+            maximum[1],
+        ],
+    )
+}
+
+/// Page 23 carries compact exception context from the preceding watchdog
+/// reset. Application addresses fit below 0x0801_0000, so their low 16 bits
+/// identify the exact instruction in this 26,200-byte image. The low 16 bits
+/// also distinguish normal link addresses from Cortex-M EXC_RETURN values.
+pub fn crash_context_telemetry(snapshot: CrashContextTelemetry) -> Frame {
+    let cycle = snapshot.control_cycle.to_le_bytes();
+    let pc = snapshot.program_counter.to_le_bytes();
+    let lr = snapshot.link_register.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            23,
+            snapshot
+                .detail
+                .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8 as u8,
+            cycle[0],
+            cycle[1],
+            pc[0],
+            pc[1],
+            lr[0],
+            lr[1],
+        ],
+    )
+}
+
 /// Page 18 identifies the exact crate version and project telemetry schema in
 /// ride logs without changing the stock identity responses.
 pub fn firmware_version_telemetry() -> Frame {
@@ -597,10 +757,10 @@ mod tests {
     }
 
     #[test]
-    fn project_telemetry_rotates_through_all_twelve_pages() {
+    fn project_telemetry_rotates_through_all_seventeen_pages() {
         let mut page = 0;
-        let mut visits = [0_u8; 12];
-        for _ in 0..120 {
+        let mut visits = [0_u8; 17];
+        for _ in 0..170 {
             visits[usize::from(page)] += 1;
             page = next_project_telemetry_page(page);
         }
@@ -734,10 +894,11 @@ mod tests {
         let faults = ControlFaultTelemetry {
             fault_flags: 0x1234_5678,
             safety_events: 0xabcd,
+            last_safety_loss_reason: 7,
         };
         assert_eq!(
             control_fault_telemetry(faults).data,
-            [12, 0x78, 0x56, 0x34, 0x12, 0xcd, 0xab, 0]
+            [12, 0x78, 0x56, 0x34, 0x12, 0xcd, 0xab, 7]
         );
 
         let peaks = ControlPeakTelemetry {
@@ -786,8 +947,65 @@ mod tests {
             [17, 7, 0x07, 0xfb, 0x34, 0x12, 0x45, 0x23]
         );
         assert_eq!(
+            observer_status_telemetry(ObserverStatusTelemetry {
+                configured: true,
+                ready: true,
+                active: true,
+                blend: 192,
+                confidence: 247,
+                electrical_rpm: -7_500,
+                hall_error_q16: -1_024,
+            })
+            .data,
+            [19, 7, 192, 247, 0xb4, 0xe2, 0x00, 0xfc]
+        );
+        assert_eq!(
+            observer_model_telemetry(ObserverModelTelemetry {
+                flux_centi_mwb: 1_220,
+                bemf_q_mv: -9_876,
+                phase_error_q16: 456,
+                validity_progress: 255,
+            })
+            .data,
+            [20, 0xc4, 0x04, 0x6c, 0xd9, 0xc8, 0x01, 255]
+        );
+        assert_eq!(
+            control_timing_breakdown_telemetry(ControlTimingBreakdownTelemetry {
+                maximum_pre_driver_cycles: 321,
+                maximum_driver_step_cycles: 2_345,
+            })
+            .data,
+            [21, 0x41, 0x01, 0x29, 0x09, 0, 0, 0]
+        );
+        assert_eq!(
             firmware_version_telemetry().data,
-            [18, 2, b'0', b'.', b'1', b'.', b'4', 0]
+            [18, 6, b'0', b'.', b'1', b'.', b'8', 0]
+        );
+    }
+
+    #[test]
+    fn reset_forensics_pages_preserve_the_previous_boot_context() {
+        assert_eq!(
+            reset_summary_telemetry(ResetSummaryTelemetry {
+                reset_flags: 0x18,
+                retained_context_valid: true,
+                fatal_reason: 2,
+                checkpoint: 4,
+                last_control_cycles: 4_321,
+                maximum_control_cycles: 4_498,
+            })
+            .data,
+            [22, 0x98, 2, 4, 0xe1, 0x10, 0x92, 0x11]
+        );
+        assert_eq!(
+            crash_context_telemetry(CrashContextTelemetry {
+                detail: -3,
+                control_cycle: 0x1234_5678,
+                program_counter: 0x0800_9abc,
+                link_register: 0xffff_fff9,
+            })
+            .data,
+            [23, 0xfd, 0x78, 0x56, 0xbc, 0x9a, 0xf9, 0xff]
         );
     }
 }

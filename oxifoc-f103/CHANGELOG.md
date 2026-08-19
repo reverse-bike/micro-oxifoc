@@ -5,6 +5,101 @@ every real `flash-f103 --yes` invocation, bump the crate version and add an
 entry here. Validation builds and rebuilding an unchanged image do not create a
 new version.
 
+## 0.1.8 - 2026-08-18
+
+Changes:
+
+- Added early RCC reset-cause capture and a signature-validated retained
+  context in a dedicated NOLOAD region above the resident bootloader's SRAM
+  clear/stack
+  range and the application's runtime stack. Watchdog resets now preserve the
+  last control checkpoint, control-cycle number, whole-handler timing, fatal
+  exception class, exception detail, stacked PC, and stacked LR.
+- Added reset-summary and crash-context telemetry on pages 22 and 23 and
+  advanced the project telemetry schema to 6. Power and pin resets deliberately
+  ignore retained SRAM context so stale data cannot be mistaken for a crash.
+- Moved ISR-produced flags, live measurements, counters, maxima, observer
+  diagnostics, and the coherent maximum-|d| event into the existing
+  interrupt-owned `ControlState`. Foreground snapshots copy that state in one
+  short critical section; only command mailboxes remain atomic across the
+  foreground/interrupt boundary.
+
+Reason: the loaded 0.1.7 run felt good and held the observer through 56.3 km/h,
+but reached 4,334 of 4,500 cycles, accumulated 2,509 timing warnings, and
+restarted once without a user power cycle. Post-reset telemetry could not
+distinguish an IWDG/WWDG reset from a fatal exception or identify the last
+completed control stage. The retained record makes the next occurrence
+actionable, while removing diagnostic read-modify-write atomics recovers
+control-loop margin without changing OxiFOC's control algorithm.
+
+## 0.1.7 - 2026-08-18
+
+Changes:
+
+- Replaced repeated six-state Hall geometry scans with a const-built table
+  indexed directly by the raw three-bit Hall value. Each entry caches its
+  calibrated boundary, sector width, and adjacent raw states, matching the
+  lookup-table structure of OxiFOC's original Hall implementation.
+- Changed telemetry page 21 to retain the complete TIM1-entry-through-phase-
+  selection maximum alongside the FOC/observer driver maximum, and advanced
+  the project telemetry schema to 5. Page 6 remains the whole-handler timing.
+
+Reason: the loaded 0.1.6 capture still restarted six times and reached 4,561
+cycles against the 4,500-cycle period. Its retained maxima showed 964 cycles
+in Hall-transition handling and 2,445 in the driver, with 122 warning passes in
+one 0.75-second interval. The two blocks plus the fixed interrupt work only
+crossed the deadline when combined. Direct Hall metadata removes the avoidable
+edge-cycle scan cost while the revised timing boundary accounts for all work
+before the driver on the next capture.
+
+## 0.1.6 - 2026-08-18
+
+Changes:
+
+- Replaced the Hall transition's two 64-bit interval-ratio divisions with an
+  exact saturating quotient/remainder calculation using the Cortex-M3's native
+  32-bit divider.
+- Added an exact full-observer endpoint fast path to `PhaseManager`, avoiding
+  unnecessary interpolation arithmetic without changing the crossover result.
+- Added retained Hall-edge and driver-step maximum timings on telemetry page
+  21 and advanced the project telemetry schema to 4.
+- Made a timing overrun publish the already-disabled output state immediately,
+  preserving `ControlTiming` as the single root safety-loss cause instead of
+  letting the next interrupt replace it with a generic hardware-fault event.
+
+Reason: the loaded 0.1.5 capture reached 4,503 cycles against the exact 4,500-
+cycle period and restarted six times. During its sustained observer interval,
+the warning rate was 865 per second while measured speed predicted 847 Hall
+edges per second, identifying the combined Hall-transition/observer cycle as
+the over-budget path. This revision keeps the observer active while removing
+the avoidable M3 arithmetic and makes the next hardware capture report the
+remaining cost by subsystem.
+
+## 0.1.5 - 2026-08-18
+
+Changes:
+
+- Ported OxiFOC's MXLEMMING active-flux integrator, PLL, confidence, and
+  back-EMF validity gates to the canonical fixed-point `phase/observer.rs`.
+- Configured `PhaseManager` for an active Hall-to-observer blend from 3,000 to
+  6,000 electrical RPM, including the established readiness gate, Hall seed,
+  half-turn ambiguity guard, and Hall fallback while the observer is not ready.
+- Fed the observer causally paired previous-cycle stationary voltage and live
+  current, using the measured 88.4 mOhm, 39 uH, and 12.2 mWb motor model, the
+  160 mA/ADC-count analog conversion, and live bus-voltage scaling.
+- Separated physical vehicle direction from calibrated angle-coordinate speed
+  so a Hall seed gives the observer the correct PLL sign.
+- Added the most recent safety-loss cause to page 12 and observer crossover,
+  flux, PLL, and back-EMF diagnostics on pages 19 and 20 (telemetry schema 3).
+- Changed the F103 release optimization from `z` to `s` and placed the
+  interrupt-owned control state in zero-initialized RAM, leaving 984 bytes in
+  the 26,200-byte application region.
+
+Reason: exercise OxiFOC's proven sensor-to-observer architecture directly at
+high speed, rather than maintaining a parallel or shadow estimator path, while
+keeping the complete observer inside the F103 flash budget and designing its
+hot path for the 16 kHz control-loop timing envelope.
+
 ## 0.1.4 - 2026-08-18
 
 Changes:

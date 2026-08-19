@@ -39,6 +39,14 @@ pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
 // Fitted from controller dq current against BMS battery current during the
 // loaded ride; it is used for reporting and configuring the DC-side envelope.
 pub const CURRENT_MA_PER_COUNT: i32 = 100;
+// The observer model uses the calibrated analog-front-end conversion rather
+// than the battery-current fit used by ride policy and telemetry above.
+pub const PHASE_CURRENT_AMPS_PER_ADC_COUNT: Fixed = Fixed::ratio(4, 25);
+pub const MOTOR_PHASE_RESISTANCE_OHMS: Fixed = Fixed::ratio(884, 10_000);
+pub const MOTOR_PHASE_INDUCTANCE_MILLIHENRIES: Fixed = Fixed::ratio(39, 1_000);
+pub const MOTOR_FLUX_LINKAGE_MILLIWEBERS: Fixed = Fixed::ratio(122, 10);
+pub const OBSERVER_BLEND_LOW_ERPM: i32 = 3_000;
+pub const OBSERVER_BLEND_HIGH_ERPM: i32 = 6_000;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 838;
 pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 480;
@@ -49,6 +57,8 @@ const _: () =
     assert!((PHASE_CURRENT_TRIP_COUNTS as u32) * 5 >= (RIDE_PHASE_CURRENT_LIMIT_COUNTS as u32) * 8);
 const _: () = assert!(FOC_PHASE_LIMIT_TICKS <= FOC_HARD_PHASE_LIMIT_TICKS);
 const _: () = assert!(TARGET_RAMP_CYCLES_PER_STEP > 0);
+const _: () = assert!(OBSERVER_BLEND_LOW_ERPM > 0);
+const _: () = assert!(OBSERVER_BLEND_HIGH_ERPM > OBSERVER_BLEND_LOW_ERPM);
 const _: () = assert!(PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
 const _: () = assert!(PWM_SAMPLE_CC4 < PWM_ARR);
 
@@ -87,6 +97,18 @@ pub const CAN_SJW_TQ: u8 = 1;
 /// injected sample is consumed only at underflow, where DIR reads clear.
 pub const fn sample_injected_on_timer_update(timer_counting_down: bool) -> bool {
     !timer_counting_down
+}
+
+/// Q16.16 phase volts represented by one commanded PWM timer tick.
+pub const fn observer_volts_per_pwm_tick_bits(bus_voltage_mv: u32) -> i32 {
+    // Reduce 65536/1000 by eight before multiplying. The board ADC cannot
+    // report above 75.9 V, so this exact u32 form cannot overflow.
+    let bounded_mv = if bus_voltage_mv > 75_900 {
+        75_900
+    } else {
+        bus_voltage_mv
+    };
+    (bounded_mv * 8_192 / (PWM_ARR as u32 * 125)) as i32
 }
 
 pub const CAN_RIDE_TUNING_ID: u16 = 0x2f1;
@@ -191,6 +213,13 @@ mod tests {
     fn injected_sample_is_consumed_only_at_underflow() {
         assert!(sample_injected_on_timer_update(false));
         assert!(!sample_injected_on_timer_update(true));
+    }
+
+    #[test]
+    fn observer_voltage_scale_uses_the_live_bus_and_pwm_period() {
+        assert_eq!(observer_volts_per_pwm_tick_bits(0), 0);
+        assert_eq!(observer_volts_per_pwm_tick_bits(52_300), 1_523);
+        assert_eq!(observer_volts_per_pwm_tick_bits(100_000), 2_210);
     }
 
     #[test]

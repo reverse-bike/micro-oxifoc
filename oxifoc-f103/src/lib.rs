@@ -9,11 +9,10 @@
 pub mod config;
 pub mod control;
 pub mod protocol;
+pub mod safety;
 pub mod sensors;
 
 #[cfg(feature = "firmware")]
 pub mod hardware;
-#[cfg(feature = "firmware")]
-pub mod safety;
 #[cfg(feature = "firmware")]
 pub mod transport;

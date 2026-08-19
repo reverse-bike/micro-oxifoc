@@ -23,6 +23,12 @@ check-f103:
     command cargo test --target aarch64-apple-darwin
     command cargo clippy --release --features firmware -- -D warnings
     command cargo build --release --features firmware
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
+    llvm_objdump="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objdump"
+    read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h target/thumbv7m-none-eabi/release/oxifoc-f103 | command awk '$2 == ".retained" { print $3, $4, $5 }')"
+    test "$retained_address" = 20004f00
+    test "$retained_type" = BSS
+    test "$((16#$retained_size))" -le 256
 
 # Format the active core and F103 application.
 fmt:
