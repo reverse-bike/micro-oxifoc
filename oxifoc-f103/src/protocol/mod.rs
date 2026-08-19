@@ -787,7 +787,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 2, b'0', b'.', b'1', b'.', b'3', 0]
+            [18, 2, b'0', b'.', b'1', b'.', b'4', 0]
         );
     }
 }

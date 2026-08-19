@@ -29,9 +29,9 @@ the legacy observer/HFI files remain source references for fixed-point ports.
 oxifoc-f103 control ISR
 ├── config + control + safety
 ├── hardware + sensors + transport
-└── oxifoc-core::foc
-    ├── CurrentLimiter<Fixed>
-    │   └── current circle → modulation-based bus clamp → dq trip
+└── oxifoc-core::motor::foc_driver::FocDriver<PhaseManager<HallSensor>>
+    ├── CurrentLimits + filtered q modulation
+    │   └── current circle → DC-bus clamp → measured dq trip
     ├── FocController<Fixed, CordicSinCos>
     │   └── transforms → PIController → voltage circle → SVPWM
     └── PhaseManager → PhaseProvider → HallSensor
@@ -41,12 +41,13 @@ oxifoc-f103 control ISR
 
 ```mermaid
 graph TD
-    ISR["<b>F103 control ISR</b><br/>sampling · safety · hardware"] --> PhaseManager
-    ISR --> CurrentLimiter
-    ISR --> FocController
+    ISR["<b>F103 control ISR</b><br/>sampling · safety · hardware"] --> FocDriver
+    FocDriver["<b>FocDriver</b><br/>control sequencing · current limits · bus projection"] --> PhaseManager
+    FocDriver --> CurrentLimits
+    FocDriver --> FocController
     PhaseManager["<b>PhaseManager&lt;H&gt;</b><br/>source ownership · selection"] --> PhaseProvider
     PhaseProvider["<b>PhaseProvider</b><br/>estimate · injection · update"] --> HallSensor
-    CurrentLimiter["<b>CurrentLimiter</b><br/>dq target circle · DC-bus projection · trip"] --> FocController
+    CurrentLimits["<b>CurrentLimits</b><br/>dq target circle · supply limits · trip threshold"]
     FocController["<b>FocController&lt;N,T,M&gt;</b><br/>Clarke · Park · PI · inverse Park"] --> PIController
     FocController --> SinCos["<b>SinCos</b><br/>Q0.32 turns → Q16.16 sin/cos"]
     FocController --> SVPWM

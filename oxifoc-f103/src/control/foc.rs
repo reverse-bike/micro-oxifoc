@@ -5,13 +5,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FocController, PIController, Scalar,
-    current_limits::{CurrentLimiter, CurrentLimits},
-    hall_sensor::HallSensor,
-    offset_tracker::CurrentOffsetTracker,
-    phase::{PhaseInput, PhaseManager, PhaseProvider},
-    ramp::QuadratureTargetRamp,
+    Dq, Fixed, FocController, PIController, Scalar, hall_sensor::HallSensor,
+    offset_tracker::CurrentOffsetTracker, phase::PhaseManager, ramp::QuadratureTargetRamp,
 };
+use oxifoc_core::motor::foc_driver::{CurrentLimits, FocDriver, StepError};
 use stm32f1::stm32f103::interrupt;
 
 const CONTROL_HALL_VALID: u32 = 1;
@@ -130,10 +127,8 @@ pub struct Snapshot {
 }
 
 struct ControlState {
-    controller: FocController,
-    current_limiter: CurrentLimiter,
+    driver: FocDriver<PhaseManager<HallSensor>>,
     target_ramp: QuadratureTargetRamp,
-    phase: PhaseManager<HallSensor>,
     offsets: CurrentOffsets,
     offset_tracker: CurrentOffsetTracker,
     hardware_hall_sequence: u32,
@@ -152,13 +147,11 @@ pub fn start(offsets: CurrentOffsets) {
     // SAFETY: TIM1_UP remains masked until start_tim1_control_loop returns.
     unsafe {
         CONTROL.0.get().write(Some(ControlState {
-            controller: ride_foc_controller(),
-            current_limiter: ride_current_limiter(),
+            driver: ride_foc_driver(PhaseManager::with_hall(hall)),
             target_ramp: QuadratureTargetRamp::new(
                 crate::config::TARGET_RAMP_CYCLES_PER_STEP,
                 crate::config::TARGET_RAMP_COUNTS_PER_STEP,
             ),
-            phase: PhaseManager::with_hall(hall),
             offsets,
             offset_tracker: CurrentOffsetTracker::new(offsets.phase_a, offsets.phase_b),
             hardware_hall_sequence: 0,
@@ -280,8 +273,7 @@ fn stop_control(state: &mut ControlState, safety_loss: bool) {
     LIVE_MEASURED_DQ.store(0, Ordering::Relaxed);
     LIVE_APPLIED_DQ.store(0, Ordering::Relaxed);
     LIVE_PWM_SPAN.store(0, Ordering::Relaxed);
-    state.controller.reset();
-    state.current_limiter.reset();
+    state.driver.reset();
     state.target_ramp.reset();
     state.command_was_enabled = false;
     if safety_loss {
@@ -383,7 +375,8 @@ fn control_cycle() {
         }
         state.hardware_hall_sequence = sequence;
         if state
-            .phase
+            .driver
+            .phase_mut()
             .hall_mut()
             .update_edge(raw, interval_us)
             .is_err()
@@ -394,17 +387,23 @@ fn control_cycle() {
         }
         state.hall_recovery_cycles = 0;
         VALIDATED_HALL_SEQUENCE.store(sequence, Ordering::Release);
-        VALIDATED_HALL_INTERVAL_US
-            .store(state.phase.hall().sector_interval_us(), Ordering::Relaxed);
-        VALIDATED_HALL_PROGRESS.fetch_add(
-            i32::from(state.phase.hall().physical_direction()),
+        VALIDATED_HALL_INTERVAL_US.store(
+            state.driver.phase().hall().sector_interval_us(),
             Ordering::Relaxed,
         );
-        ELECTRICAL_RPM.store(state.phase.hall().electrical_rpm(), Ordering::Relaxed);
+        VALIDATED_HALL_PROGRESS.fetch_add(
+            i32::from(state.driver.phase().hall().physical_direction()),
+            Ordering::Relaxed,
+        );
+        ELECTRICAL_RPM.store(
+            state.driver.phase().hall().electrical_rpm(),
+            Ordering::Relaxed,
+        );
     }
-    if command_enabled && !state.command_was_enabled && state.phase.hall().is_stationary() {
+    if command_enabled && !state.command_was_enabled && state.driver.phase().hall().is_stationary()
+    {
         let live_before = hardware::live_hall_state();
-        if live_before != state.phase.hall().raw_state() {
+        if live_before != state.driver.phase().hall().raw_state() {
             publish_flag(CONTROL_HALL_VALID, false);
             stop_control(state, true);
             return;
@@ -415,12 +414,12 @@ fn control_cycle() {
             stop_control(state, true);
             return;
         }
-        state.phase.hall_mut().discard_next_interval();
+        state.driver.phase_mut().hall_mut().discard_next_interval();
     }
     state.command_was_enabled = command_enabled;
     let edge_age_us = hardware::hall_edge_age_us().saturating_add(3);
     let angle = match state
-        .phase
+        .driver
         .estimate_for_control(edge_age_us, CONTROL_PERIOD_NS)
     {
         Some(estimate) => {
@@ -432,7 +431,7 @@ fn control_cycle() {
             && recover_stationary_hall(state) =>
         {
             state
-                .phase
+                .driver
                 .estimate_for_control(0, CONTROL_PERIOD_NS)
                 .map(|estimate| estimate.angle)
                 .unwrap_or_default()
@@ -458,42 +457,40 @@ fn control_cycle() {
     let dc_current_limit = DC_CURRENT_LIMIT_COUNTS
         .load(Ordering::Relaxed)
         .min(u32::from(u16::MAX)) as u16;
-    state.current_limiter.set_bus_limits(
+    state.driver.set_bus_limits(
         Some(Fixed::from_integer(i32::from(dc_current_limit))),
         Some(Fixed::ZERO),
     );
-    let limited_target = state.current_limiter.clamp_targets_with_limit(Dq::new(
-        Fixed::ZERO,
-        Fixed::from_integer(TARGET_Q_COUNTS.load(Ordering::Relaxed)),
-    ));
-    let phase_limit = limited_target
-        .quadrature_limit
-        .abs_ceil_u32()
-        .min(u32::from(u16::MAX)) as u16;
-    let target_q = state.target_ramp.next(limited_target.target.q.integer());
-    state
-        .controller
-        .set_actuation_advance(state.phase.hall().actuation_advance());
-    let (measured_current, duty) = state.controller.step_with_injection(
+    let requested_q = state
+        .target_ramp
+        .next(TARGET_Q_COUNTS.load(Ordering::Relaxed));
+    let actuation_advance = state.driver.phase().hall().actuation_advance();
+    state.driver.set_actuation_advance(actuation_advance);
+    let output = match state.driver.step_current_control(
         Fixed::from_integer(i32::from(current.phase_a)),
         Fixed::from_integer(i32::from(current.phase_b)),
         angle,
-        Dq {
-            d: Fixed::ZERO,
-            q: Fixed::from_integer(target_q),
-        },
-        state.phase.injection(),
+        Dq::new(Fixed::ZERO, Fixed::from_integer(requested_q)),
         crate::config::PWM_NEUTRAL,
-    );
-    if state.current_limiter.is_overcurrent(measured_current) {
-        PHASE_CURRENT_TRIPS.fetch_add(1, Ordering::Relaxed);
-        stop_control(state, true);
-        return;
-    }
+        CONTROL_PERIOD_NS,
+    ) {
+        Ok(output) => output,
+        Err(StepError::Overcurrent) => {
+            PHASE_CURRENT_TRIPS.fetch_add(1, Ordering::Relaxed);
+            stop_control(state, true);
+            return;
+        }
+    };
+    let phase_limit = output
+        .quadrature_limit
+        .abs_ceil_u32()
+        .min(u32::from(u16::MAX)) as u16;
+    let target_q = output.target.q.integer();
+    let measured_current = output.measured_current;
+    let duty = output.duties;
     let measured_d_counts = fixed_to_i16(measured_current.d);
     let measured_q_counts = fixed_to_i16(measured_current.q);
-    let applied_voltage = state.controller.applied_voltage();
-    state.current_limiter.note_applied_voltage(applied_voltage);
+    let applied_voltage = output.applied_voltage;
     let applied_d_ticks = fixed_to_i16(applied_voltage.d);
     let applied_q_ticks = fixed_to_i16(applied_voltage.q);
     let pwm_span_ticks = pwm_span(duty);
@@ -510,7 +507,7 @@ fn control_cycle() {
         Ordering::Relaxed,
     );
     LIVE_PWM_SPAN.store(u32::from(pwm_span_ticks), Ordering::Relaxed);
-    publish_flag(CONTROL_VOLTAGE_LIMITED, state.controller.voltage_limited());
+    publish_flag(CONTROL_VOLTAGE_LIMITED, output.voltage_limited);
     if update_max(
         &MAXIMUM_DIRECT_CURRENT_ABS,
         u32::from(measured_d_counts.unsigned_abs()),
@@ -519,18 +516,20 @@ fn control_cycle() {
             measured_d_counts,
             measured_q_counts,
             target_q_counts: target_q as i16,
-            hall_raw: state.phase.hall().raw_state(),
-            hall_angle_direction: state.phase.hall().angle_direction(),
+            hall_raw: state.driver.phase().hall().raw_state(),
+            hall_angle_direction: state.driver.phase().hall().angle_direction(),
             edge_age_us: saturating_u32_to_u16(edge_age_us),
-            hall_interval_us: saturating_u32_to_u16(state.phase.hall().sector_interval_us()),
+            hall_interval_us: saturating_u32_to_u16(
+                state.driver.phase().hall().sector_interval_us(),
+            ),
             measurement_angle_q16: (angle >> 16) as u16,
-            unlimited_angle_q16: (state.phase.hall().unlimited_angle() >> 16) as u16,
+            unlimited_angle_q16: (state.driver.phase().hall().unlimited_angle() >> 16) as u16,
             phase_a_counts: current.phase_a,
             phase_b_counts: current.phase_b,
             applied_d_ticks,
             applied_q_ticks,
-            voltage_limited: state.controller.voltage_limited(),
-            angle_rate_limited: angle != state.phase.hall().unlimited_angle(),
+            voltage_limited: output.voltage_limited,
+            angle_rate_limited: angle != state.driver.phase().hall().unlimited_angle(),
             ..DirectCurrentPeakEvent::default()
         });
     }
@@ -541,12 +540,6 @@ fn control_cycle() {
             .unsigned_abs(),
     );
     let _ = update_max(&MAXIMUM_PWM_SPAN, u32::from(pwm_span_ticks));
-    state.phase.update(&PhaseInput {
-        applied_voltage,
-        measured_current,
-        electrical_angle: angle,
-        control_period_ns: CONTROL_PERIOD_NS,
-    });
     if !hardware::write_pwm_duties(duty) || !hardware::enable_motor_outputs() {
         stop_control(state, true);
         return;
@@ -567,18 +560,24 @@ const fn ride_foc_controller() -> FocController {
     )
 }
 
-const fn ride_current_limiter() -> CurrentLimiter {
-    CurrentLimiter::new(
-        CurrentLimits::new(
-            Fixed::from_integer(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS as i32),
-            Fixed::from_integer(crate::config::PHASE_CURRENT_TRIP_COUNTS as i32),
-            Some(Fixed::from_integer(
-                crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS as i32,
-            )),
-            Some(Fixed::ZERO),
-        ),
+const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> FocDriver<PhaseManager<HallSensor>> {
+    FocDriver::new(
+        ride_foc_controller(),
+        phase,
+        ride_current_limits(),
         crate::config::PWM_ARR,
         BUS_MODULATION_FILTER_SHIFT,
+    )
+}
+
+const fn ride_current_limits() -> CurrentLimits {
+    CurrentLimits::new(
+        Fixed::from_integer(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS as i32),
+        Fixed::from_integer(crate::config::PHASE_CURRENT_TRIP_COUNTS as i32),
+        Some(Fixed::from_integer(
+            crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS as i32,
+        )),
+        Some(Fixed::ZERO),
     )
 }
 
@@ -667,7 +666,7 @@ fn recover_stationary_hall(state: &mut ControlState) -> bool {
     if state.hall_recovery_cycles < HALL_RECOVERY_STABLE_CYCLES {
         return false;
     }
-    if state.phase.hall_mut().seed(raw).is_err() {
+    if state.driver.phase_mut().hall_mut().seed(raw).is_err() {
         return false;
     }
     state.hall_recovery_cycles = 0;

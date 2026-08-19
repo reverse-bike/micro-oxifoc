@@ -89,7 +89,7 @@ pub mod timer;
 pub mod isr_prof;
 
 /// High-level motor driver combining FOC with sensors and PWM
-#[cfg(feature = "algorithms")]
+#[cfg(any(feature = "algorithms", feature = "fixed-point"))]
 pub mod motor;
 
 /// Race-free clear of selected **rc_w0** status flags (STM32 `TIMx_SR` and
@@ -289,10 +289,6 @@ pub mod foc {
     /// Synchronous high-level FOC current controller
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod controller;
-
-    /// Layered current-command, supply-current, and overcurrent limits.
-    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub mod current_limits;
 
     /// Fault registry shared across targets
     #[cfg(feature = "algorithms")]

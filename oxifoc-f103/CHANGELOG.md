@@ -5,6 +5,26 @@ every real `flash-f103 --yes` invocation, bump the crate version and add an
 entry here. Validation builds and rebuilding an unchanged image do not create a
 new version.
 
+## 0.1.4 - 2026-08-18
+
+Changes:
+
+- Moved fixed-point current-command, supply-current, and measured-overcurrent
+  handling into the canonical `motor/foc_driver.rs` module.
+- Made the F103 control state own one `FocDriver<PhaseManager<HallSensor>>`;
+  the driver now owns the controller, phase provider, current limits, and
+  filtered q-modulation state.
+- Applied the final current circle and DC-side clamp inside the driver after
+  the ride target ramp, matching OxiFOC's control-step ownership.
+- Removed the parallel `foc/current_limits.rs` module and the inactive
+  floating-point driver implementation. The `oxifoc-original` tag retains the
+  original source for reference.
+
+Reason: current limiting is part of OxiFOC's motor-driver sequencing, not an
+independent FOC math module. Keeping it in the driver preserves the proven
+ownership boundary while the F103 port replaces numeric representation and
+platform I/O without inventing a second architecture.
+
 ## 0.1.3 - 2026-08-18
 
 Changes:

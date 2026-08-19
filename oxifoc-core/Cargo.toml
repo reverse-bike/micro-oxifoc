@@ -124,7 +124,8 @@ icd = ["algorithms", "dep:ergot"]
 # embassy-futures is used only for its runtime-agnostic `select` (per-attempt timeout).
 delivery = ["icd", "dep:embassy-futures"]
 
-# Floating-point FOC stack (drivers, estimators, transforms, protocols, etc.)
+# Legacy floating-point estimators, detection, protocols, and runtime reference.
+# The active motor driver and current-control path are fixed-point.
 algorithms = [
     "dep:bitflags",
     "dep:heapless",
