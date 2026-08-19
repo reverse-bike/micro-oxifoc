@@ -205,10 +205,11 @@ pub fn service(
                         hall_angle_direction: event.hall_angle_direction,
                         edge_age_us: event.edge_age_us,
                         hall_interval_us: event.hall_interval_us,
-                        measurement_angle_q16: event.measurement_angle_q16,
-                        unlimited_angle_q16: event.unlimited_angle_q16,
-                        phase_a_counts: event.phase_a_counts,
-                        phase_b_counts: event.phase_b_counts,
+                        angle_error_q8: event.angle_error_q8,
+                        requested_d_ticks: event.requested_d_ticks,
+                        requested_q_ticks: event.requested_q_ticks,
+                        feedforward_d_ticks: event.feedforward_d_ticks,
+                        feedforward_q_ticks: event.feedforward_q_ticks,
                         applied_d_ticks: event.applied_d_ticks,
                         applied_q_ticks: event.applied_q_ticks,
                         voltage_limited: event.voltage_limited,
@@ -239,10 +240,7 @@ pub fn service(
             ),
             14 | 15 => {
                 let reset = safety::boot_diagnostics_snapshot();
-                if reset.pwm_failure.cause() != safety::pwm_failure_cause::NONE {
-                    let failure = reset.pwm_failure;
-                    protocol::pwm_failure_telemetry(page + 10, failure.words())
-                } else if page == 14 {
+                if page == 14 {
                     protocol::reset_summary_telemetry(protocol::ResetSummaryTelemetry {
                         reset_flags: reset.reset_flags,
                         retained_context_valid: reset.retained_context_valid,
@@ -263,6 +261,10 @@ pub fn service(
                         link_register: reset.link_register,
                     })
                 }
+            }
+            16 | 17 => {
+                let failure = safety::latest_pwm_failure_snapshot();
+                protocol::pwm_failure_telemetry(page + 8, failure.words())
             }
             _ => protocol::firmware_version_telemetry(),
         };

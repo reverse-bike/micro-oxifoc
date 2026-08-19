@@ -91,6 +91,8 @@ pub struct FocController<
     quadrature: PIController<N>,
     vector_limit_ticks: N,
     phase_limit_ticks: u16,
+    requested_voltage: Dq<N>,
+    feedforward_voltage: Dq<N>,
     applied_voltage: Dq<N>,
     applied_stationary: AlphaBeta<N>,
     measured_stationary: AlphaBeta<N>,
@@ -131,6 +133,8 @@ where
             quadrature,
             vector_limit_ticks,
             phase_limit_ticks,
+            requested_voltage: Dq::new(N::ZERO, N::ZERO),
+            feedforward_voltage: Dq::new(N::ZERO, N::ZERO),
             applied_voltage: Dq::new(N::ZERO, N::ZERO),
             applied_stationary: AlphaBeta {
                 alpha: N::ZERO,
@@ -149,6 +153,8 @@ where
     pub fn reset(&mut self) {
         self.direct.reset();
         self.quadrature.reset();
+        self.requested_voltage = Dq::new(N::ZERO, N::ZERO);
+        self.feedforward_voltage = Dq::new(N::ZERO, N::ZERO);
         self.applied_voltage = Dq::new(N::ZERO, N::ZERO);
         self.applied_stationary = AlphaBeta {
             alpha: N::ZERO,
@@ -163,6 +169,14 @@ where
 
     pub const fn applied_voltage(&self) -> Dq<N> {
         self.applied_voltage
+    }
+
+    pub const fn requested_voltage(&self) -> Dq<N> {
+        self.requested_voltage
+    }
+
+    pub const fn feedforward_voltage(&self) -> Dq<N> {
+        self.feedforward_voltage
     }
 
     pub const fn applied_stationary(&self) -> AlphaBeta<N> {
@@ -263,6 +277,8 @@ where
             direct_update.raw_output + feedforward.d + voltage_injection.d,
             quadrature_update.raw_output + feedforward.q + voltage_injection.q,
         );
+        self.requested_voltage = requested;
+        self.feedforward_voltage = feedforward;
         let (applied_d, applied_q, voltage_scale) =
             N::limit_vector(requested.d, requested.q, self.vector_limit_ticks);
         let applied = Dq::new(applied_d, applied_q);
@@ -527,6 +543,33 @@ mod tests {
         assert!((-331..=-328).contains(&reverse.q.integer()));
     }
 
+    #[test]
+    fn no_decoupling_contributes_zero_voltage_at_speed() {
+        let proportional = PIController::new(Fixed::ONE, Fixed::ZERO);
+        let mut controller: FixedFocController = FixedFocController::new(
+            proportional,
+            proportional,
+            Fixed::from_integer(1_273),
+            1_103,
+        );
+        let _ = controller.step_with_velocity_and_injection(
+            Fixed::ZERO,
+            Fixed::ZERO,
+            0,
+            -31_000,
+            Dq::new(Fixed::from_integer(11), Fixed::from_integer(-17)),
+            Dq::default(),
+            Fixed::ratio(523, 22_500),
+            1_125,
+        );
+
+        assert_eq!(controller.feedforward_voltage(), Dq::default());
+        assert_eq!(
+            controller.requested_voltage(),
+            Dq::new(Fixed::from_integer(11), Fixed::from_integer(-17))
+        );
+    }
+
     struct SaturatingFeedforward;
 
     impl DecouplingModel<Fixed> for SaturatingFeedforward {
@@ -553,8 +596,20 @@ mod tests {
         );
 
         assert!(controller.voltage_limited());
+        assert_eq!(
+            controller.requested_voltage(),
+            Dq::new(Fixed::from_integer(100), Fixed::ZERO)
+        );
+        assert_eq!(
+            controller.feedforward_voltage(),
+            Dq::new(Fixed::from_integer(100), Fixed::ZERO)
+        );
         assert_eq!(controller.applied_voltage().d.integer(), 50);
         assert_eq!(controller.direct.integral(), Fixed::ZERO);
+
+        controller.reset();
+        assert_eq!(controller.requested_voltage(), Dq::default());
+        assert_eq!(controller.feedforward_voltage(), Dq::default());
     }
 
     #[cfg(feature = "algorithms")]

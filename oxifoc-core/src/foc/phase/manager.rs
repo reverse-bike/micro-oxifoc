@@ -198,6 +198,8 @@ impl<H> PhaseManager<H> {
                         blend = Fixed::ZERO;
                         hall_error_q32 = 0;
                         Some(sensor)
+                    } else if blend == Fixed::ZERO {
+                        Some(sensor)
                     } else if blend == Fixed::ONE {
                         Some(estimate)
                     } else {
@@ -249,7 +251,9 @@ where
                         blend_low_erpm,
                         blend_high_erpm,
                     );
-                    if blend == Fixed::ONE {
+                    if blend == Fixed::ZERO {
+                        Some(sensor)
+                    } else if blend == Fixed::ONE {
                         Some(observer)
                     } else {
                         Some(blend_estimates(sensor, observer, blend))
@@ -298,8 +302,25 @@ fn crossover_blend(speed_erpm: u32, low_erpm: i32, high_erpm: i32) -> Fixed {
     } else if speed_erpm >= high {
         Fixed::ONE
     } else {
-        Fixed::ratio((speed_erpm - low) as i32, (high - low) as i32)
+        ratio_u32_q16(speed_erpm - low, high - low)
     }
+}
+
+/// Return an unsigned ratio in Q16.16 using the Cortex-M3's native divider.
+/// The operands are scaled together when the Q16 numerator would exceed a
+/// `u32`; the F103 crossover band needs no scaling and remains bit-exact.
+fn ratio_u32_q16(numerator: u32, denominator: u32) -> Fixed {
+    if denominator == 0 || numerator >= denominator {
+        return Fixed::ONE;
+    }
+    let bit_length = 32 - denominator.leading_zeros();
+    let shift = bit_length.saturating_sub(16);
+    let scaled_numerator = numerator >> shift;
+    let scaled_denominator = (denominator >> shift).max(1);
+    Fixed::from_bits(
+        (scaled_numerator.saturating_mul(1 << 16) / scaled_denominator)
+            .min(Fixed::ONE.to_bits() as u32) as i32,
+    )
 }
 
 fn blend_estimates(
@@ -399,6 +420,17 @@ mod tests {
         let estimate = manager.estimate_for_control(0, 62_500).unwrap();
         assert!((estimate.angle.wrapping_sub(0x1800_0000) as i32).unsigned_abs() < 0x1_0000);
         assert_eq!(manager.observer_diagnostics().blend, Fixed::ratio(1, 2));
+    }
+
+    #[test]
+    fn crossover_ratio_preserves_every_f103_blend_step() {
+        for numerator in 0..=3_000 {
+            assert_eq!(
+                ratio_u32_q16(numerator, 3_000),
+                Fixed::ratio(numerator as i32, 3_000),
+                "numerator={numerator}",
+            );
+        }
     }
 
     #[test]

@@ -390,9 +390,22 @@ pub const fn signed_angle_difference(angle: Turns, reference: Turns) -> i32 {
 }
 
 fn erpm_to_step(electrical_rpm: i32, control_frequency_hz: u32) -> i32 {
-    let denominator = u64::from(control_frequency_hz).saturating_mul(60).max(1);
-    ((i64::from(electrical_rpm) * (1_i64 << 32)) / denominator as i64)
+    let cycles_per_minute = control_frequency_hz.saturating_mul(60).max(1);
+    let step_per_erpm_q32 = reciprocal_q32_rounded(cycles_per_minute);
+    (i64::from(electrical_rpm) * i64::from(step_per_erpm_q32))
         .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Approximate `2^32 / denominator` with a rounded integer reciprocal.
+/// Expressing the seed conversion as a reciprocal multiply keeps its error
+/// bounded while using only the Cortex-M3's native 32-bit division.
+fn reciprocal_q32_rounded(denominator: u32) -> u32 {
+    if denominator <= 1 {
+        return u32::MAX;
+    }
+    let quotient = u32::MAX / denominator;
+    let remainder = (u32::MAX % denominator) + 1;
+    quotient.saturating_add(u32::from(remainder >= denominator - remainder))
 }
 
 fn expected_bemf_voltage(volts_per_erpm_q24: i32, electrical_rpm: i32) -> Fixed {
@@ -693,5 +706,20 @@ mod tests {
             assert!((actual - expected).unsigned_abs() < 256);
         }
         assert_eq!(divide_q16(Fixed::ONE.to_bits(), 0), 0);
+    }
+
+    #[test]
+    fn rounded_erpm_reciprocal_preserves_seed_speed() {
+        const FREQUENCY: u32 = 16_000;
+        assert_eq!(reciprocal_q32_rounded(FREQUENCY * 60), 4_474);
+
+        for electrical_rpm in -76_000..=76_000 {
+            let velocity_step = erpm_to_step(electrical_rpm, FREQUENCY);
+            let recovered = ((i64::from(velocity_step) * i64::from(FREQUENCY * 60)) >> 32) as i32;
+            assert!(
+                (recovered - electrical_rpm).unsigned_abs() <= 2,
+                "requested={electrical_rpm} recovered={recovered}",
+            );
+        }
     }
 }

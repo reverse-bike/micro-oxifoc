@@ -1,9 +1,120 @@
 # Changelog
 
-The F103 crate patch version identifies a CAN-flashed application image. Before
-every real `flash-f103 --yes` invocation, bump the crate version and add an
-entry here. Validation builds and rebuilding an unchanged image do not create a
-new version.
+The F103 crate version identifies a CAN-flashed application image. New features
+bump the minor version; bug fixes to an existing feature bump the patch version.
+Before every real `flash-f103 --yes` invocation, make exactly one appropriate
+bump and add an entry here. Validation builds and rebuilding an unchanged image
+do not create a new version.
+
+## 0.1.13 - 2026-08-19
+
+Changes:
+
+- Made each successful local fault acknowledgement start a new maximum-|d|
+  diagnostic episode. The next active 16 kHz sample is captured unconditionally,
+  even when d is exactly zero, and subsequent samples resume maximum-|d|
+  ownership. Event generation continues across acknowledgements, while the
+  fault-frozen event cannot leak in from an earlier acknowledged break.
+- Replaced the control-cycle counter's atomic read-modify-write with the
+  single-ISR-writer load/store it requires, removing the Cortex-M3 exclusive
+  retry sequence from every control pass.
+- Deferred observer diagnostic conversion while output is inactive, a fault is
+  latched, or the observer is being seeded on the first recovery pass. The
+  observer and phase-selection algorithms are unchanged; only CAN diagnostic
+  publication moves to the next eligible sample.
+
+Reason: the 0.1.12 ride log contained four separate TIM1 break episodes, not
+one latch that failed to clear: each acknowledgement successfully rearmed the
+controller and each later event captured a new PWM failure. The first three
+breaks nevertheless reported the same maximum-|d| context because that peak
+still belonged to the whole boot. The final recovery also reached 4,503 cycles
+against the 4,500-cycle period. Restarting only the diagnostic peak owner at
+the acknowledgement boundary makes every repeat independently actionable,
+while removing the exclusive counter update and non-control diagnostic work
+recovers deterministic ISR margin without changing torque, observer, or
+protection behavior. The CAN layout remains telemetry schema 9.
+
+## 0.1.12 - 2026-08-19
+
+Changes:
+
+- Replaced recoverable-fault power-stage shutdown with a latched safe-off
+  state. TIM1's six phase-output enables and their GPIO routes become inert,
+  while PA2, the timer, passive CC4 current sampling, CAN telemetry, and
+  watchdog supervision remain alive. IWDG accepts TIM1 progress alone only
+  while a fault is latched and the motor channels are verified disabled.
+- Added local fault acknowledgement. The ride state machine first revokes its
+  output lease, then permits the fault latch and TIM1 break interrupt to rearm
+  only from a valid throttle-rest sample while PB12 is inactive. No torque can
+  be authorized in the acknowledgement pass.
+- Made the retained PWM record first-failure-wins within each fault episode,
+  added RCC clock-security status to its condition flags, and kept its latest
+  complete value available without requiring a reboot. The maximum-|d| event
+  is also frozen when a hardware fault is observed.
+- Assigned separate scheduler slots to reset/crash pages 22--23 and PWM-fault
+  pages 24--25, so one diagnostic class can no longer hide the other. Project
+  telemetry advances to schema 9.
+
+Reason: the loaded 0.1.11 captures stayed within the 4,500-cycle control
+period and recorded no software phase-current trip, but several cutoffs were
+followed by IWDG resets. The first useful retained state showed TIM1's hardware
+break flag with valid compares; later records were secondary timing and
+safe-off observations that had replaced the initiating state. A hardware
+break is a recoverable OxiFOC output kill, not a reason to reboot the control
+and diagnostic runtime. Keeping the inactive control loop alive preserves the
+root event, prevents reset/restart cascades, and requires an explicit local
+safe-input acknowledgement before another ride can start.
+
+## 0.1.11 - 2026-08-19
+
+Changes:
+
+- Replaced the observer seed's signed 64-bit division with a rounded Q0.32
+  reciprocal and multiply. Across the controller's observed -76,000 to 76,000
+  electrical-RPM range, converting the resulting PLL step back to speed stays
+  within two electrical RPM of the requested seed.
+- Replaced the Hall-to-observer crossover's 64-bit fixed-point ratio with a
+  bounded unsigned Q16.16 calculation using the Cortex-M3's native 32-bit
+  divider. Every step in the configured 3,000-to-6,000-eRPM blend band remains
+  bit-identical.
+- Added the missing zero-blend endpoint fast path to `PhaseManager`, returning
+  Hall directly below crossover after applying the existing half-turn
+  ambiguity guard.
+
+Reason: the loaded 0.1.10 capture recorded seven low-speed cutoffs. Every
+retained record identified `ControlTiming` followed by an IWDG reset, with
+whole-handler times of 4,545 to 4,638 cycles against the 4,500-cycle period.
+All completed the normal control path, and the trips clustered around observer
+seeding and the start of the Hall-to-observer crossover. The linked image had
+exactly two calls to the software 64-bit division routine: one in each of those
+paths. Using the M3's hardware 32-bit divider removes that nondeterministic
+latency while preserving the configured crossover and observer behavior.
+
+## 0.1.10 - 2026-08-19
+
+Changes:
+
+- Restored the STM32F103 ride controller's OxiFOC specialization to
+  `NoDecoupling`. The generic fixed-point decoupling implementation and its
+  reference-equation tests remain available for a future minor release with an
+  explicit voltage-feasibility or field-weakening policy.
+- Extended the controller result with the complete pre-limit voltage request
+  and its motor-model feedforward component. The retained maximum-|d| event now
+  reports requested d/q, feedforward d/q, and applied d/q voltage ticks on CAN
+  pages 16 and 17; telemetry schema advances to 8.
+
+Reason: the unloaded 0.1.9 log reached about -31,000 electrical RPM while the
+voltage circle was limited to 1,273 ticks. At that operating point the
+reference-current feedforward alone requested approximately -505 d-axis and
+-1,704 q-axis ticks. It continued using the -579-count q reference after the
+voltage limit had reduced measured q current to a small fraction of that value,
+so the circular limiter also suppressed the d-axis PI correction and measured
+d current reached -1,035 counts. OxiFOC's own decoupling tests deliberately stop
+below this voltage-saturated regime because field weakening is not implemented.
+This patch removes the invalid F103 activation without changing OxiFOC's
+controller equations or saturation behavior. The retained pre-limit telemetry
+will distinguish PI demand, model feedforward, and circular limiting directly
+if decoupling is revisited.
 
 ## 0.1.9 - 2026-08-18
 

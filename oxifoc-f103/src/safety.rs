@@ -1,6 +1,8 @@
 //! Last-resort gate shutdown, watchdogs, and reset forensics.
 
 #[cfg(feature = "firmware")]
+use core::cell::UnsafeCell;
+#[cfg(feature = "firmware")]
 use core::hint::spin_loop;
 #[cfg(feature = "firmware")]
 use core::mem::MaybeUninit;
@@ -67,6 +69,7 @@ pub mod pwm_failure_cause {
 pub mod pwm_pin_flag {
     pub const BREAK_ACTIVE: u8 = 1;
     pub const POWER_STAGE_DISABLED: u8 = 1 << 1;
+    pub const CLOCK_SECURITY_FAILURE: u8 = 1 << 2;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -192,6 +195,22 @@ fn compact_reset_flags(raw: u32) -> u8 {
 }
 
 #[cfg(any(feature = "firmware", test))]
+const fn pwm_failure_slot_is_empty(header: u32) -> bool {
+    header as u8 == pwm_failure_cause::NONE
+}
+
+pub const fn watchdog_progressed(
+    previous_control_cycles: u32,
+    control_cycles: u32,
+    previous_injected_samples: u32,
+    injected_samples: u32,
+    latched_safe_off: bool,
+) -> bool {
+    control_cycles != previous_control_cycles
+        && (injected_samples != previous_injected_samples || latched_safe_off)
+}
+
+#[cfg(any(feature = "firmware", test))]
 fn boot_diagnostics(raw_reset_flags: u32, retained: RetainedContext) -> BootDiagnostics {
     let reset_flags = compact_reset_flags(raw_reset_flags);
     let watchdog_reset =
@@ -298,6 +317,17 @@ static BOOT_PWM_FAILURE_1: AtomicU32 = AtomicU32::new(0);
 static BOOT_PWM_FAILURE_2: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "firmware")]
 static BOOT_PWM_FAILURE_3: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "firmware")]
+struct PwmFailureCell(UnsafeCell<PwmFailureContext>);
+
+#[cfg(feature = "firmware")]
+// SAFETY: writes occur before interrupts start or in the non-nesting TIM1
+// handlers; foreground reads mask interrupts around the complete copy.
+unsafe impl Sync for PwmFailureCell {}
+
+#[cfg(feature = "firmware")]
+static LATEST_PWM_FAILURE: PwmFailureCell =
+    PwmFailureCell(UnsafeCell::new(PwmFailureContext::EMPTY));
 
 #[cfg(feature = "firmware")]
 #[unsafe(link_section = ".retained.reset_forensics")]
@@ -339,6 +369,13 @@ pub fn capture_boot_diagnostics() {
     BOOT_PWM_FAILURE_1.store(pwm_failure[1], Ordering::Relaxed);
     BOOT_PWM_FAILURE_2.store(pwm_failure[2], Ordering::Relaxed);
     BOOT_PWM_FAILURE_3.store(pwm_failure[3], Ordering::Relaxed);
+    store_latest_pwm_failure(pwm_failure);
+}
+
+#[cfg(feature = "firmware")]
+fn store_latest_pwm_failure(words: [u32; 4]) {
+    // SAFETY: callers satisfy PwmFailureCell's writer exclusion contract.
+    unsafe { *LATEST_PWM_FAILURE.0.get() = PwmFailureContext { words } }
 }
 
 #[cfg(feature = "firmware")]
@@ -365,6 +402,14 @@ pub fn boot_diagnostics_snapshot() -> BootDiagnostics {
             ],
         },
     }
+}
+
+#[cfg(feature = "firmware")]
+pub fn latest_pwm_failure_snapshot() -> PwmFailureContext {
+    cortex_m::interrupt::free(|_| {
+        // SAFETY: interrupts remain masked for the complete copy.
+        unsafe { *LATEST_PWM_FAILURE.0.get() }
+    })
 }
 
 #[cfg(feature = "firmware")]
@@ -427,15 +472,34 @@ pub fn record_safety_loss(reason: u8) {
 #[cfg(feature = "firmware")]
 pub fn record_pwm_failure(context: PwmFailureContext) {
     // SAFETY: TIM1_UP and TIM1_BRK run at the same priority and cannot preempt
-    // one another. The four aligned words preserve the exact failure snapshot
-    // for the watchdog reset that follows a latched PWM or break fault.
+    // one another. The cause word is written last and commits the complete
+    // first failure of the current fault episode.
     let words = context.words();
     unsafe {
-        let destination = core::ptr::addr_of_mut!((*retained_context_ptr()).pwm_failure).cast();
-        write_volatile(destination, words[0]);
+        let destination =
+            core::ptr::addr_of_mut!((*retained_context_ptr()).pwm_failure).cast::<u32>();
+        if !pwm_failure_slot_is_empty(read_volatile(destination)) {
+            return;
+        }
         write_volatile(destination.add(1), words[1]);
         write_volatile(destination.add(2), words[2]);
         write_volatile(destination.add(3), words[3]);
+        write_volatile(destination, words[0]);
+    }
+    store_latest_pwm_failure(words);
+}
+
+#[cfg(feature = "firmware")]
+pub(crate) fn clear_current_pwm_failure() {
+    // SAFETY: the hardware fault acknowledgement calls this with interrupts
+    // masked while every motor channel is disabled.
+    unsafe {
+        let destination =
+            core::ptr::addr_of_mut!((*retained_context_ptr()).pwm_failure).cast::<u32>();
+        write_volatile(destination, 0);
+        write_volatile(destination.add(1), 0);
+        write_volatile(destination.add(2), 0);
+        write_volatile(destination.add(3), 0);
     }
 }
 
@@ -601,6 +665,24 @@ mod tests {
             (6, 0x0b, 3, 0x0081, 0x9d19, 0x1ddd, [22, 1_125, 2_228])
         );
         assert_eq!(core::mem::size_of::<RetainedContext>(), 56);
+    }
+
+    #[test]
+    fn pwm_failure_capture_is_first_failure_wins_until_rearmed() {
+        assert!(pwm_failure_slot_is_empty(
+            PwmFailureContext::EMPTY.words()[0]
+        ));
+        assert!(!pwm_failure_slot_is_empty(
+            PwmFailureContext::new(2, 1, 5, 0, 0, 0, [0; 3]).words()[0]
+        ));
+    }
+
+    #[test]
+    fn a_latched_safe_off_fault_keeps_the_watchdog_alive_without_adc_progress() {
+        assert!(watchdog_progressed(100, 101, 200, 201, false));
+        assert!(!watchdog_progressed(100, 101, 200, 200, false));
+        assert!(watchdog_progressed(100, 101, 200, 200, true));
+        assert!(!watchdog_progressed(100, 100, 200, 201, true));
     }
 
     #[test]

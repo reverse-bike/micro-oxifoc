@@ -128,6 +128,9 @@ fn main() -> ! {
                 );
             } else {
                 foc::revoke_ride_authority();
+                if command.acknowledge_faults && peripherals::acknowledge_faults() {
+                    foc::begin_fault_diagnostic_episode();
+                }
             }
             last_ride_ms = now;
         }
@@ -147,9 +150,16 @@ fn main() -> ! {
         );
         if watchdog_started && now.wrapping_sub(last_watchdog_feed_ms) >= WATCHDOG_FEED_PERIOD_MS {
             let progress = foc::snapshot();
-            if progress.control_cycles != last_watchdog_control_cycles
-                && progress.injected_samples != last_watchdog_injected_samples
-            {
+            let latched_safe_off = progress.fault_flags != 0
+                && !progress.output_active
+                && peripherals::motor_outputs_disabled();
+            if safety::watchdog_progressed(
+                last_watchdog_control_cycles,
+                progress.control_cycles,
+                last_watchdog_injected_samples,
+                progress.injected_samples,
+                latched_safe_off,
+            ) {
                 safety::feed_main_loop();
                 last_watchdog_feed_ms = now;
                 last_watchdog_control_cycles = progress.control_cycles;

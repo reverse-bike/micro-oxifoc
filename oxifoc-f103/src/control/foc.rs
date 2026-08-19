@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FixedDecoupling, FixedFocController, PIController, Scalar,
+    Dq, Fixed, FixedFocController, NoDecoupling, PIController, Scalar,
     hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
     phase::{BackEmfObserver, ObserverDiagnostics, PhaseEstimate, PhaseManager, PhaseSource},
@@ -19,6 +19,7 @@ const CONTROL_HALL_VALID: u32 = 1;
 const CONTROL_CURRENT_VALID: u32 = 1 << 1;
 const CONTROL_OUTPUT_ACTIVE: u32 = 1 << 2;
 const CONTROL_VOLTAGE_LIMITED: u32 = 1 << 3;
+const CONTROL_DIRECT_EVENT_PENDING: u32 = 1 << 4;
 const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_WARNING_CYCLES: u32 = 3_900;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
@@ -26,11 +27,7 @@ const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
 // One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
 const BUS_MODULATION_FILTER_SHIFT: u8 = 5;
 
-type RideDecoupling = FixedDecoupling<
-    { crate::config::MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS },
-    { crate::config::MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS },
-    { crate::config::MOTOR_FLUX_LINKAGE_MILLIWEBERS.to_bits() },
->;
+type RideDecoupling = NoDecoupling;
 type RideFocController = FixedFocController<
     { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
     { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
@@ -84,10 +81,11 @@ pub struct DirectCurrentPeakEvent {
     pub hall_angle_direction: i8,
     pub edge_age_us: u16,
     pub hall_interval_us: u16,
-    pub measurement_angle_q16: u16,
-    pub unlimited_angle_q16: u16,
-    pub phase_a_counts: i16,
-    pub phase_b_counts: i16,
+    pub angle_error_q8: i8,
+    pub requested_d_ticks: i16,
+    pub requested_q_ticks: i16,
+    pub feedforward_d_ticks: i16,
+    pub feedforward_q_ticks: i16,
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
     pub voltage_limited: bool,
@@ -161,6 +159,8 @@ struct ControlDiagnostics {
     maximum_quadrature_error_abs: u32,
     maximum_pwm_span_ticks: u32,
     maximum_direct_event: DirectCurrentPeakEvent,
+    fault_direct_event: DirectCurrentPeakEvent,
+    fault_direct_event_valid: bool,
     safety_events: u32,
     last_safety_loss_reason: u8,
     phase_current_trips: u32,
@@ -236,6 +236,7 @@ pub fn start(offsets: CurrentOffsets) {
             command_was_enabled: false,
             diagnostics: ControlDiagnostics {
                 flags: initial_flags,
+                observer_configured: source_configured,
                 ..ControlDiagnostics::default()
             },
         });
@@ -272,7 +273,7 @@ pub fn authorize_ride_target(
         Ordering::Relaxed,
     );
     COMMAND_SAFETY_EPOCH.store(safety_epoch, Ordering::Relaxed);
-    let now = CONTROL_CYCLE.load(Ordering::Acquire);
+    let now = CONTROL_CYCLE.load(Ordering::Relaxed);
     COMMAND_DEADLINE.store(now.wrapping_add(lifetime_cycles), Ordering::Release);
     COMMAND_ENABLED.store(true, Ordering::Release);
 }
@@ -281,7 +282,28 @@ pub fn revoke_ride_authority() {
     COMMAND_ENABLED.store(false, Ordering::Release);
     TARGET_Q_COUNTS.store(0, Ordering::Relaxed);
     DC_CURRENT_LIMIT_COUNTS.store(0, Ordering::Relaxed);
-    COMMAND_DEADLINE.store(CONTROL_CYCLE.load(Ordering::Acquire), Ordering::Release);
+    COMMAND_DEADLINE.store(CONTROL_CYCLE.load(Ordering::Relaxed), Ordering::Release);
+}
+
+/// Starts a fresh control-peak capture after the hardware fault latch has been
+/// acknowledged. The first active control sample is captured even when d is
+/// exactly zero, then normal maximum-|d| ownership resumes for the episode.
+pub fn begin_fault_diagnostic_episode() {
+    cortex_m::interrupt::free(|_| {
+        if CONTROL_INITIALIZED.load(Ordering::Acquire) {
+            // SAFETY: CONTROL was initialized before its flag was published,
+            // and TIM1_UP remains masked by this critical section.
+            let state = unsafe { &mut *(*CONTROL.0.get()).as_mut_ptr() };
+            let generation = state.diagnostics.maximum_direct_event.generation;
+            state.diagnostics.maximum_direct_current_abs = 0;
+            state.diagnostics.maximum_direct_event = DirectCurrentPeakEvent {
+                generation,
+                ..DirectCurrentPeakEvent::default()
+            };
+            state.diagnostics.fault_direct_event_valid = false;
+            state.diagnostics.flags |= CONTROL_DIRECT_EVENT_PENDING;
+        }
+    });
 }
 
 pub fn snapshot() -> Snapshot {
@@ -314,7 +336,11 @@ pub fn snapshot() -> Snapshot {
             diagnostics.maximum_quadrature_error_abs,
         ),
         maximum_pwm_span_ticks: saturating_u32_to_u16(diagnostics.maximum_pwm_span_ticks),
-        maximum_direct_event: diagnostics.maximum_direct_event,
+        maximum_direct_event: if diagnostics.fault_direct_event_valid {
+            diagnostics.fault_direct_event
+        } else {
+            diagnostics.maximum_direct_event
+        },
         safety_events: diagnostics.safety_events,
         last_safety_loss_reason: diagnostics.last_safety_loss_reason,
         phase_current_trips: diagnostics.phase_current_trips,
@@ -384,6 +410,10 @@ const fn lease_is_active(now: u32, deadline: u32) -> bool {
 }
 
 fn stop_control(state: &mut ControlState, safety_loss: Option<SafetyLossReason>) {
+    if hardware::fault_flags() != 0 {
+        state.diagnostics.fault_direct_event = state.diagnostics.maximum_direct_event;
+        state.diagnostics.fault_direct_event_valid = true;
+    }
     hardware::disable_motor_outputs();
     hardware::write_pwm_neutral();
     publish_stopped_output(&mut state.diagnostics);
@@ -419,6 +449,8 @@ fn TIM1_UP() {
                 state.diagnostics.control_budget_overruns.wrapping_add(1);
             if hardware::fault_flags() & hardware::FAULT_CONTROL_TIMING == 0 {
                 hardware::latch_control_timing_fault();
+                state.diagnostics.fault_direct_event = state.diagnostics.maximum_direct_event;
+                state.diagnostics.fault_direct_event_valid = true;
                 publish_stopped_output(&mut state.diagnostics);
                 note_safety_loss(&mut state.diagnostics, SafetyLossReason::ControlTiming);
             }
@@ -428,7 +460,8 @@ fn TIM1_UP() {
 }
 
 fn control_cycle(started: u32) {
-    let control_cycle = CONTROL_CYCLE.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    let control_cycle = CONTROL_CYCLE.load(Ordering::Relaxed).wrapping_add(1);
+    CONTROL_CYCLE.store(control_cycle, Ordering::Relaxed);
     crate::safety::record_control_cycle(control_cycle);
 
     if !CONTROL_INITIALIZED.load(Ordering::Acquire) {
@@ -456,7 +489,7 @@ fn control_cycle(started: u32) {
         Err(_) => {
             publish_flag(&mut state.diagnostics, CONTROL_CURRENT_VALID, false);
             let timing_lost = lease_active || output_was_active;
-            if timing_lost {
+            if timing_lost && hardware::fault_flags() == 0 {
                 hardware::latch_control_timing_fault();
             }
             stop_control(
@@ -556,12 +589,6 @@ fn control_cycle(started: u32) {
     {
         estimate = state.driver.estimate_for_control(0, CONTROL_PERIOD_NS);
     }
-    if control_cycle & 0xff == 0 {
-        publish_observer_diagnostics(
-            &mut state.diagnostics,
-            state.driver.phase().observer_diagnostics(),
-        );
-    }
     let Some(estimate) = estimate else {
         publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, false);
         stop_control(
@@ -591,6 +618,13 @@ fn control_cycle(started: u32) {
         return;
     }
 
+    if control_cycle & 0xff == 0 && !command_started {
+        publish_observer_diagnostics(
+            &mut state.diagnostics,
+            state.driver.phase().observer_diagnostics(),
+        );
+    }
+
     let dc_current_limit = DC_CURRENT_LIMIT_COUNTS
         .load(Ordering::Relaxed)
         .min(u32::from(u16::MAX)) as u16;
@@ -601,8 +635,8 @@ fn control_cycle(started: u32) {
     let requested_q = state
         .target_ramp
         .next(TARGET_Q_COUNTS.load(Ordering::Relaxed));
-    // Bound the shared speed input once before it drives either phase advance
-    // or the dq speed-voltage feedforward terms.
+    // Bound the phase-derived speed before it reaches timing-dependent
+    // controller paths.
     let control_electrical_rpm = estimate.electrical_rpm.clamp(-76_000, 76_000);
     let control_estimate = PhaseEstimate {
         electrical_rpm: control_electrical_rpm,
@@ -668,10 +702,15 @@ fn control_cycle(started: u32) {
         CONTROL_VOLTAGE_LIMITED,
         output.voltage_limited,
     );
-    if update_max(
+    let direct_is_max = update_max(
         &mut state.diagnostics.maximum_direct_current_abs,
         u32::from(measured_d_counts.unsigned_abs()),
-    ) {
+    );
+    if direct_is_max || state.diagnostics.flags & CONTROL_DIRECT_EVENT_PENDING != 0 {
+        state.diagnostics.flags &= !CONTROL_DIRECT_EVENT_PENDING;
+        let unlimited_angle = state.driver.phase().hall().unlimited_angle();
+        let measurement_angle_q16 = (angle >> 16) as u16;
+        let unlimited_angle_q16 = (unlimited_angle >> 16) as u16;
         capture_direct_current_peak(
             &mut state.diagnostics,
             DirectCurrentPeakEvent {
@@ -684,14 +723,16 @@ fn control_cycle(started: u32) {
                 hall_interval_us: saturating_u32_to_u16(
                     state.driver.phase().hall().sector_interval_us(),
                 ),
-                measurement_angle_q16: (angle >> 16) as u16,
-                unlimited_angle_q16: (state.driver.phase().hall().unlimited_angle() >> 16) as u16,
-                phase_a_counts: current.phase_a,
-                phase_b_counts: current.phase_b,
+                angle_error_q8: (unlimited_angle_q16.wrapping_sub(measurement_angle_q16) as i16
+                    >> 8) as i8,
+                requested_d_ticks: fixed_to_i16(output.requested_voltage.d),
+                requested_q_ticks: fixed_to_i16(output.requested_voltage.q),
+                feedforward_d_ticks: fixed_to_i16(output.feedforward_voltage.d),
+                feedforward_q_ticks: fixed_to_i16(output.feedforward_voltage.q),
                 applied_d_ticks,
                 applied_q_ticks,
                 voltage_limited: output.voltage_limited,
-                angle_rate_limited: angle != state.driver.phase().hall().unlimited_angle(),
+                angle_rate_limited: angle != unlimited_angle,
                 ..DirectCurrentPeakEvent::default()
             },
         );

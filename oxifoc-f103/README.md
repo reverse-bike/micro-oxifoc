@@ -51,10 +51,11 @@ src/
 └── main.rs                synchronous initialization and foreground loop
 ```
 
-Every image prepared for a real CAN flash receives one patch-version bump and
-a brief change/reason entry in [CHANGELOG.md](CHANGELOG.md). Validation-only
-builds do not bump the version. Page 18 of project telemetry reports the crate
-version embedded in the running image so ride logs remain attributable.
+Every image prepared for a real CAN flash receives one version bump and a brief
+change/reason entry in [CHANGELOG.md](CHANGELOG.md). Feature additions bump the
+minor version; bug fixes bump the patch version. Validation-only builds do not
+bump the version. Page 18 of project telemetry reports the crate version
+embedded in the running image so ride logs remain attributable.
 
 Recovered firmware is used only to establish hardware and motor constants:
 pin assignments, peripheral timing, sensor conversions, Hall geometry, and
@@ -68,13 +69,16 @@ phase-voltage ticks. Commanded stationary voltage remains uncompensated, as in
 the original architecture, because the bridge correction makes applied
 voltage track that command for the observer.
 
-The controller also applies OxiFOC's reference-current dq decoupling and
-permanent-magnet back-EMF feedforward before the circular voltage limit. The
-compile-time model combines the recovered 39 uH phase inductance with the
-0.16 A/current-count conversion and uses the 12.2 mWb flux linkage, signed
-electrical speed, and live bus-voltage scale. Feedforward participates in
-voltage limiting but is excluded from the PI anti-windup charge, matching the
-original controller's saturation behavior without adding runtime model state.
+The shared controller retains OxiFOC's compile-time reference-current dq
+decoupling and permanent-magnet back-EMF feedforward strategy. Its fixed model
+combines the recovered 39 uH phase inductance with the 0.16 A/current-count
+conversion and uses the 12.2 mWb flux linkage, signed electrical speed, and
+live bus-voltage scale. The STM32F103 ride specialization currently selects
+`NoDecoupling`: reference-current feedforward is not valid once its request
+exceeds the voltage circle, and this firmware does not yet implement field
+weakening or another voltage-feasibility policy. Retained peak-|d| telemetry
+keeps the pre-limit request, feedforward contribution, and applied voltage
+separate for a future minor-version experiment.
 
 `PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
 observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
@@ -108,16 +112,20 @@ but are rejected until their providers are installed.
   retains separate maxima for TIM1 entry through phase selection and the FOC
   driver step. Subtracting both from page 6's whole-handler maximum bounds the
   remaining output-publication cost.
-- WWDG requires TIM1 interrupt progress, while IWDG is refreshed only when the
-  foreground observes both control-cycle and injected-ADC progress.
+- WWDG requires TIM1 interrupt progress, while IWDG normally requires both
+  control-cycle and injected-ADC progress. Once a fault is latched and all
+  motor channels are verified disabled, TIM1 progress alone keeps IWDG alive
+  so a blocked current trigger cannot erase fault telemetry with a reboot.
 
 Motor PWM pins are analog/inert while stopped and all six TIM1 motor channels
 remain disabled. After passive timer setup, PA2 is held in the
 hardware-validated active-low state so the gate driver is settled before a
-ride request; fatal shutdown raises it. MOE is retained while normally stopped
-only to keep the internal CC4 ADC trigger alive. Enabling motor channels
-requires a fresh 10 ms local authority lease, valid Hall/current samples, no
-latched fault, and an inactive PB12 break input.
+ride request; only fatal exception shutdown raises it. Normal stops and
+recoverable faults restore MOE after an inactive break solely to keep the
+internal CC4 ADC trigger alive; the six motor-channel enables remain clear.
+Enabling motor channels requires a fresh 10 ms local authority lease, valid
+Hall/current samples, no latched fault or pending TIM1 break, and an inactive
+PB12 break input.
 
 ## Local ride input
 
@@ -134,7 +142,9 @@ The active-low brake input is PC4 with a pull-up and four matching 1 kHz
 samples. Throttle is plausible at 250--3,750 ADC counts, is at rest through
 850, and reaches full demand at 3,252. Boot-high, invalid acquisition, brake,
 current trip, Hall loss, or another safety loss disarms the ride path until a
-fresh valid rest sample is observed.
+fresh valid rest sample is observed. A latched hardware fault is acknowledged
+only in a throttle-rest pass, after ride authority is revoked, and only while
+PB12 is inactive; that pass cannot energize the motor.
 
 The display is not a safety input. Losing CAN traffic does not revoke an
 already valid local ride request; every authority decision still comes from
@@ -174,27 +184,31 @@ on PA13. The application provides:
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
 span. Page 12 carries the full internal fault mask and safety-event count.
-Page 13 retains peak phase current, direct current, quadrature tracking error,
-and PWM span from boot so short transients remain visible at CAN telemetry
-rates. Pages 14--17 retain signed dq current and target, Hall state/direction,
-edge age and interval, measurement and unlimited Hall angles, phase A/B
-current, applied dq voltage, and limiting flags from the exact cycle that set
-the maximum |d|. A repeated event generation prevents readers from combining
-different peaks. Page 12 also retains the specific cause of the latest safety
-loss. Pages 19 and 20 report observer configuration/readiness/activity, blend,
+Page 13 retains peak phase current, quadrature tracking error, and PWM span
+from boot so short transients remain visible at CAN telemetry rates. Its direct
+current maximum restarts after each successful fault acknowledgement. Pages
+14--17 retain signed dq current and target, Hall state/direction,
+edge age and interval, Hall angle error, requested dq voltage, motor-model
+feedforward dq voltage, applied dq voltage, and limiting flags from the exact
+cycle that set the current episode's maximum |d|. Its first active sample is
+always captured. A hardware fault freezes the complete event, and a repeated
+generation prevents readers from combining different peaks.
+Page 12 also retains the specific cause of the latest safety loss. Pages 19
+and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 7 and the crate version. Page 21 reports retained pre-driver phase-path
+schema 9 and the crate version. Page 21 reports retained pre-driver phase-path
 and driver-step timing maxima. Pages 22 and 23 report the RCC reset cause and,
 after a watchdog reset, the retained fatal class, last control checkpoint,
 whole-handler timing, cycle number, exception detail, and low address words of
 the stacked PC/LR. The complete PC is recoverable because this application is
 confined to `0x08003800..0x08009E57`. Pages 24 and 25 preserve the exact PWM
-failure predicate, fault and pin state, TIM1 status/output registers, and
-attempted compares across a watchdog reset. They occupy the reset-forensics
-slots only when a PWM failure was retained; otherwise those slots remain pages
-22 and 23. The project-page scheduler advances through all seventeen slots
-without a wraparound phase discontinuity.
+failure predicate, fault and condition state (including RCC clock-security
+status), TIM1 status/output registers, and attempted compares. They report the
+first failure of the latest fault episode during the same boot or after a
+watchdog reset. Reset/crash and PWM-failure pages have independent slots, so
+all four are always emitted. The project-page scheduler advances through all
+nineteen slots without a wraparound phase discontinuity.
 The 56-byte retained record is linked at `0x20004F00`: above the recovered
 bootloader's `0x200000DC..0x20000CF7` zero-fill/stack range and outside the
 application's conservative 4 KiB runtime RAM region.
@@ -252,4 +266,18 @@ maximum to 4,259 cycles, but reproduced one top-speed cutoff. The retained
 record proved an IWDG reset followed a `PwmOutput` safety loss without an
 exception or timing overrun. Version 0.1.9 extends that record with the exact
 output predicate and TIM1 state so another event can identify the initiating
-hardware condition.
+hardware condition. Its unloaded run also exposed reference-current
+decoupling outside OxiFOC's tested voltage-feasible range: feedforward exceeded
+the voltage circle and measured d current reached -1,035 counts despite a zero
+d target. Version 0.1.10 restores the ride specialization to `NoDecoupling` and
+adds retained pre-limit request/feedforward telemetry on schema 8. Its loaded
+capture recorded seven low-speed `ControlTiming` losses followed by watchdog
+resets, with retained handler times of 4,545 to 4,638 cycles against the 4,500-
+cycle period. Version 0.1.11 replaces the two linked 64-bit divisions in the
+observer-seed and crossover paths with native 32-bit arithmetic and returns
+Hall directly at the zero-blend endpoint. Version 0.1.12 turns recoverable
+faults into a persistent safe-off state, rearms only from local throttle rest
+with inactive BKIN, and reports reset and first-failure context independently
+on schema 9. Version 0.1.13 gives every acknowledged break fresh maximum-|d|
+ownership and removes avoidable recovery-path timing work without changing the
+control strategy or wire layout.

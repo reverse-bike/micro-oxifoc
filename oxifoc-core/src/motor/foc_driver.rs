@@ -82,6 +82,10 @@ pub struct FocOutput {
     /// Positive q-axis authority remaining after both clamps.
     pub quadrature_limit: Fixed,
     pub measured_current: Dq,
+    /// Complete controller voltage request before the circular voltage limit.
+    pub requested_voltage: Dq,
+    /// Motor-model contribution included in `requested_voltage`.
+    pub feedforward_voltage: Dq,
     pub applied_voltage: Dq,
     pub duties: PwmDuty,
     pub voltage_limited: bool,
@@ -295,6 +299,8 @@ where
             self.controller.reset();
             return Err(StepError::Overcurrent);
         }
+        let requested_voltage = self.controller.requested_voltage();
+        let feedforward_voltage = self.controller.feedforward_voltage();
         let applied_voltage = self.controller.applied_voltage();
         self.note_applied_voltage(applied_voltage);
         let voltage_limited = self.controller.voltage_limited();
@@ -318,6 +324,8 @@ where
             target,
             quadrature_limit,
             measured_current,
+            requested_voltage,
+            feedforward_voltage,
             applied_voltage,
             duties,
             voltage_limited,
@@ -508,6 +516,44 @@ mod tests {
         let modulation = driver.filtered_q_modulation();
         assert!(modulation < Fixed::ratio(-47, 100));
         assert!(modulation > Fixed::ratio(-49, 100));
+    }
+
+    #[test]
+    fn output_preserves_pre_limit_voltage_diagnostics() {
+        let proportional = PIController::new(Fixed::ONE, Fixed::ZERO);
+        let mut driver: FocDriver<TestPhase> = FocDriver::new(
+            FocController::new(proportional, proportional, Fixed::from_integer(50), 100),
+            TestPhase,
+            CurrentLimits::new(
+                Fixed::from_integer(100),
+                Fixed::from_integer(200),
+                None,
+                None,
+            ),
+            200,
+            0,
+        );
+        let output = driver
+            .step_current_control(
+                Fixed::ZERO,
+                Fixed::ZERO,
+                PhaseEstimate {
+                    angle: 0,
+                    electrical_rpm: -31_000,
+                    trustworthy: true,
+                },
+                Dq::new(Fixed::from_integer(30), Fixed::from_integer(-40)),
+                100,
+                62_500,
+            )
+            .unwrap();
+
+        assert_eq!(
+            output.requested_voltage,
+            Dq::new(Fixed::from_integer(30), Fixed::from_integer(-40))
+        );
+        assert_eq!(output.feedforward_voltage, Dq::default());
+        assert_eq!(output.applied_voltage, output.requested_voltage);
     }
 
     #[test]

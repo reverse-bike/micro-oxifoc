@@ -42,6 +42,7 @@ pub struct Observation {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Command {
     pub energize: bool,
+    pub acknowledge_faults: bool,
     pub target_q_counts: i16,
     pub dc_current_limit_counts: u16,
     pub stage: Stage,
@@ -50,6 +51,7 @@ pub struct Command {
 impl Command {
     pub const OFF: Self = Self {
         energize: false,
+        acknowledge_faults: false,
         target_q_counts: 0,
         dc_current_limit_counts: 0,
         stage: Stage::Disarmed,
@@ -97,11 +99,18 @@ impl RideController {
     pub fn update(&mut self, observation: Observation) -> Command {
         let safety_event = observation.safety_events != self.observed_safety_events;
         self.observed_safety_events = observation.safety_events;
+        if observation.fault_flags != 0 {
+            self.state = State::Disarmed;
+            return Command {
+                acknowledge_faults: observation.throttle.is_valid()
+                    && observation.throttle.is_at_rest(),
+                ..Command::OFF
+            };
+        }
         let environment_limit = observation.environment_dc_limit_counts.unwrap_or(0);
         let safety_ready = !safety_event
             && observation.hall_valid
             && observation.current_valid
-            && observation.fault_flags == 0
             && environment_limit != 0;
         if observation.brake_active || !observation.throttle.is_valid() || !safety_ready {
             self.state = State::Disarmed;
@@ -260,6 +269,7 @@ impl RideController {
 fn active_command(target_q_counts: i16, environment_limit: u16, stage: Stage) -> Command {
     Command {
         energize: true,
+        acknowledge_faults: false,
         target_q_counts,
         dc_current_limit_counts: environment_limit,
         stage,
@@ -336,6 +346,36 @@ mod tests {
             assert_eq!(controller.update(stopped), Command::OFF);
             assert_eq!(controller.update(observation(3, FULL_ADC)), Command::OFF);
         }
+    }
+
+    #[test]
+    fn a_latched_fault_can_only_be_acknowledged_at_valid_throttle_rest() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+
+        let mut faulted = observation(1, FULL_ADC);
+        faulted.fault_flags = 1;
+        let command = controller.update(faulted);
+        assert_eq!(command, Command::OFF);
+        assert!(!command.acknowledge_faults);
+
+        faulted.now_ms = 2;
+        assert!(!controller.update(faulted).acknowledge_faults);
+
+        faulted.now_ms = 3;
+        faulted.throttle = ThrottleObservation::invalid_acquisition(REST_ADC);
+        assert!(!controller.update(faulted).acknowledge_faults);
+
+        faulted.now_ms = 4;
+        faulted.throttle = ThrottleObservation::from_raw(REST_ADC);
+        let acknowledgement = controller.update(faulted);
+        assert!(!acknowledgement.energize);
+        assert!(acknowledgement.acknowledge_faults);
+        assert_eq!(acknowledgement.stage, Stage::Disarmed);
+
+        let ready = controller.update(observation(5, REST_ADC));
+        assert!(!ready.acknowledge_faults);
+        assert_eq!(ready.stage, Stage::Ready);
     }
 
     #[test]

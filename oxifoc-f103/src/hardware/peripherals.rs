@@ -15,6 +15,7 @@ const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const RCC_APB2RSTR: *mut u32 = 0x4002_100c as *mut u32;
 const RCC_CR: *mut u32 = 0x4002_1000 as *mut u32;
 const RCC_CFGR: *mut u32 = 0x4002_1004 as *mut u32;
+const RCC_CIR: *const u32 = 0x4002_1008 as *const u32;
 const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
 const RCC_APB1RSTR: *mut u32 = 0x4002_1010 as *mut u32;
 const FLASH_ACR: *mut u32 = 0x4002_2000 as *mut u32;
@@ -33,6 +34,7 @@ const RCC_CR_HSERDY: u32 = 1 << 17;
 const RCC_CR_CSSON: u32 = 1 << 19;
 const RCC_CR_PLLON: u32 = 1 << 24;
 const RCC_CR_PLLRDY: u32 = 1 << 25;
+const RCC_CIR_CLOCK_SECURITY_FAILURE: u32 = 1 << 7;
 const RCC_CFGR_CLOCK_MASK: u32 = 0x003f_fcf3;
 const RCC_CFGR_HSE_PLL_X9_72MHZ: u32 = (0b100 << 8) | (0b10 << 14) | (1 << 16) | (0b0111 << 18);
 const RCC_CFGR_SWITCH_HSI: u32 = 0;
@@ -99,6 +101,8 @@ const TIM1_OFF_STATE_IDLE: u32 = 1 << 10;
 const TIM1_LOCK_LEVEL_1: u32 = 1 << 8;
 const TIM1_BREAK_ENABLE: u32 = 1 << 12;
 const TIM1_MAIN_OUTPUT_ENABLE: u32 = 1 << 15;
+const TIM1_BREAK_FLAG: u32 = 1 << 7;
+const TIM1_BREAK_INTERRUPT_ENABLE: u32 = 1 << 7;
 
 const ADC1_BASE: usize = 0x4001_2400;
 const ADC2_BASE: usize = 0x4001_2800;
@@ -494,14 +498,14 @@ pub fn start_tim1_control_loop() {
 pub fn enable_motor_outputs() -> bool {
     // SAFETY: duty preloads and Hall angle are established by the control ISR
     // before it reaches this function. BKIN can clear MOE asynchronously.
-    if break_input_active() {
+    if break_event_pending() {
         retain_current_pwm_failure(pwm_cause::BREAK_ACTIVE);
         latch_fault(FAULT_HARDWARE_BREAK);
         return false;
     }
     if fault_flags() != 0 {
         retain_current_pwm_failure(pwm_cause::FAULT_LATCHED);
-        emergency_shutdown();
+        disable_motor_outputs();
         return false;
     }
     // The gate-driver control is established once during passive setup so it
@@ -515,7 +519,7 @@ pub fn enable_motor_outputs() -> bool {
             && read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE != 0
             && read_volatile(GPIOA_ODR) & PA2_SET == 0
         {
-            let enabled = fault_flags() == 0 && !break_input_active();
+            let enabled = fault_flags() == 0 && !break_event_pending();
             if !enabled {
                 retain_current_pwm_failure(pwm_cause::POST_ENABLE);
             }
@@ -523,13 +527,13 @@ pub fn enable_motor_outputs() -> bool {
         }
         configure_active_motor_pins();
     }
-    if fault_flags() != 0 || break_input_active() {
+    if fault_flags() != 0 || break_event_pending() {
         retain_current_pwm_failure(pwm_cause::POST_PIN_CONFIGURATION);
-        emergency_shutdown();
+        disable_motor_outputs();
         return false;
     }
     let enabled = cortex_m::interrupt::free(|_| {
-        if fault_flags() != 0 || break_input_active() {
+        if fault_flags() != 0 || break_event_pending() {
             return false;
         }
         // SAFETY: interrupts are masked across the software enable sequence;
@@ -541,7 +545,7 @@ pub fn enable_motor_outputs() -> bool {
                 read_volatile(TIM1_BDTR) | TIM1_MAIN_OUTPUT_ENABLE,
             );
             if read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE == 0
-                || break_input_active()
+                || break_event_pending()
                 || read_volatile(GPIOA_ODR) & PA2_SET != 0
             {
                 return false;
@@ -551,14 +555,14 @@ pub fn enable_motor_outputs() -> bool {
                 && read_volatile(GPIOA_ODR) & PA2_SET == 0
         }
     });
-    let post_enable_failure = fault_flags() != 0 || break_input_active();
+    let post_enable_failure = fault_flags() != 0 || break_event_pending();
     if !enabled || post_enable_failure {
         retain_current_pwm_failure(if enabled {
             pwm_cause::POST_ENABLE
         } else {
             pwm_cause::ENABLE_READBACK
         });
-        emergency_shutdown();
+        disable_motor_outputs();
         return false;
     }
     true
@@ -585,6 +589,8 @@ fn retain_current_pwm_failure(cause: u8) {
 fn retain_pwm_failure(cause: u8, duty: PwmDuty) {
     let break_active = break_input_active();
     let power_stage_disabled = unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0;
+    let clock_security_failed =
+        unsafe { read_volatile(RCC_CIR) } & RCC_CIR_CLOCK_SECURITY_FAILURE != 0;
     // SAFETY: read-only inspection of TIM1 state at the exact rejected output
     // operation. All retained fields are intentionally narrowed to the
     // register widths implemented by STM32F103 TIM1.
@@ -593,7 +599,8 @@ fn retain_pwm_failure(cause: u8, duty: PwmDuty) {
             cause,
             fault_flags() as u8,
             (u8::from(break_active) * pwm_pin::BREAK_ACTIVE)
-                | (u8::from(power_stage_disabled) * pwm_pin::POWER_STAGE_DISABLED),
+                | (u8::from(power_stage_disabled) * pwm_pin::POWER_STAGE_DISABLED)
+                | (u8::from(clock_security_failed) * pwm_pin::CLOCK_SECURITY_FAILURE),
             read_volatile(TIM1_SR) as u16,
             read_volatile(TIM1_BDTR) as u16,
             read_volatile(TIM1_CCER) as u16,
@@ -615,11 +622,14 @@ pub fn disable_motor_outputs() {
         write_volatile(TIM1_CCER, TIM1_PASSIVE_CCER);
         configure_inert_motor_pins();
     }
-    if fault_flags() == 0 && !break_input_active() {
-        // SAFETY: motor-channel enables remain clear and PA2 remains in its
-        // settled active-low run-time state.
-        // MOE is restored solely so the internal CC4 event continues to
-        // trigger passive injected-current conversions.
+    restore_passive_sampling();
+}
+
+fn restore_passive_sampling() {
+    if !break_event_pending() {
+        // SAFETY: all six motor-channel enables remain clear and their pins
+        // are inert. MOE is used only to preserve the internal CC4 current-
+        // sampling event while the fault latch keeps motor output disabled.
         unsafe {
             write_volatile(
                 TIM1_BDTR,
@@ -647,9 +657,58 @@ pub fn break_input_active() -> bool {
     unsafe { read_volatile(GPIOB_IDR) & (1 << 12) == 0 }
 }
 
+fn break_event_pending() -> bool {
+    break_input_active() || unsafe { read_volatile(TIM1_SR) } & TIM1_BREAK_FLAG != 0
+}
+
 fn latch_fault(fault: u32) {
     FAULT_FLAGS.fetch_or(fault, Ordering::Release);
-    emergency_shutdown();
+    disable_motor_outputs();
+}
+
+pub fn acknowledge_faults() -> bool {
+    disable_motor_outputs();
+    if fault_flags() == 0 {
+        return true;
+    }
+    if break_input_active() || unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0 {
+        return false;
+    }
+    cortex_m::interrupt::free(|_| {
+        if break_input_active() {
+            return false;
+        }
+        let previous_faults = fault_flags();
+        // SAFETY: motor outputs and interrupts are disabled while the stale
+        // break flag is cleared and its interrupt is rearmed.
+        unsafe {
+            write_volatile(TIM1_SR, !TIM1_BREAK_FLAG);
+            write_volatile(
+                TIM1_DIER,
+                read_volatile(TIM1_DIER) | TIM1_BREAK_INTERRUPT_ENABLE,
+            );
+        }
+        FAULT_FLAGS.store(0, Ordering::Release);
+        restore_passive_sampling();
+        let ready = || unsafe {
+            !break_input_active()
+                && read_volatile(TIM1_SR) & TIM1_BREAK_FLAG == 0
+                && read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE != 0
+                && motor_outputs_disabled()
+        };
+        if !ready() {
+            FAULT_FLAGS.store(previous_faults, Ordering::Release);
+            disable_motor_outputs();
+            return false;
+        }
+        crate::safety::clear_current_pwm_failure();
+        if !ready() {
+            retain_current_pwm_failure(pwm_cause::BREAK_ACTIVE);
+            latch_fault(previous_faults | FAULT_HARDWARE_BREAK);
+            return false;
+        }
+        true
+    })
 }
 
 pub fn latch_hall_capture_fault() {
@@ -677,9 +736,13 @@ fn TIM1_BRK() {
     latch_fault(FAULT_HARDWARE_BREAK);
     // SAFETY: rc_w0 clear of BIF; disable repeat interrupts after latching off.
     unsafe {
-        write_volatile(TIM1_SR, !(1 << 7));
-        write_volatile(TIM1_DIER, read_volatile(TIM1_DIER) & !(1 << 7));
+        write_volatile(TIM1_SR, !TIM1_BREAK_FLAG);
+        write_volatile(
+            TIM1_DIER,
+            read_volatile(TIM1_DIER) & !TIM1_BREAK_INTERRUPT_ENABLE,
+        );
     }
+    restore_passive_sampling();
 }
 
 #[inline]
