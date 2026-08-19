@@ -43,6 +43,8 @@ pub trait Scalar:
     fn abs(self) -> Self;
     fn abs_ceil_u32(self) -> u32;
     fn circular_remaining(limit: Self, direct: Self) -> Self;
+    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool;
+    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self);
 
     #[inline]
     fn min(self, other: Self) -> Self {
@@ -197,6 +199,50 @@ impl Scalar for Fixed {
         let remaining = (limit * limit).saturating_sub(direct * direct) as u64;
         Self(integer_sqrt_u64(remaining).min(i32::MAX as u64) as i32)
     }
+
+    #[inline]
+    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool {
+        let direct = i64::from(direct.0);
+        let quadrature = i64::from(quadrature.0);
+        let limit = i64::from(limit.0.max(0));
+        direct
+            .saturating_mul(direct)
+            .saturating_add(quadrature.saturating_mul(quadrature))
+            > limit.saturating_mul(limit)
+    }
+
+    #[inline]
+    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self) {
+        let limit_bits = limit.0.max(0);
+        let direct_bits = i64::from(direct.0);
+        let quadrature_bits = i64::from(quadrature.0);
+        let magnitude_squared = direct_bits
+            .saturating_mul(direct_bits)
+            .saturating_add(quadrature_bits.saturating_mul(quadrature_bits));
+        let limit_squared = i64::from(limit_bits).saturating_mul(i64::from(limit_bits));
+        if magnitude_squared <= limit_squared {
+            return (direct, quadrature, Self::ONE);
+        }
+        if limit_bits == 0 {
+            return (Self::ZERO, Self::ZERO, Self::ZERO);
+        }
+        let (magnitude, magnitude_shift) =
+            conservative_magnitude(direct.0.unsigned_abs(), quadrature.0.unsigned_abs());
+        if magnitude == 0 {
+            return (Self::ZERO, Self::ZERO, Self::ZERO);
+        }
+        let limit_bits = limit_bits as u32;
+        let scale_bits = if magnitude_shift <= FRACTION_BITS {
+            let numerator = limit_bits << (FRACTION_BITS - magnitude_shift);
+            numerator / magnitude
+        } else {
+            let denominator = magnitude << (magnitude_shift - FRACTION_BITS);
+            limit_bits / denominator
+        }
+        .min(Self::ONE.0 as u32) as i32;
+        let scale = Self(scale_bits);
+        (direct * scale, quadrature * scale, scale)
+    }
 }
 
 #[cfg(feature = "algorithms")]
@@ -249,6 +295,27 @@ impl Scalar for f32 {
     fn circular_remaining(limit: Self, direct: Self) -> Self {
         libm::sqrtf((limit * limit - direct * direct).max(0.0))
     }
+
+    #[inline]
+    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool {
+        let limit = limit.max(0.0);
+        direct * direct + quadrature * quadrature > limit * limit
+    }
+
+    #[inline]
+    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self) {
+        let limit = limit.max(0.0);
+        let magnitude_squared = direct * direct + quadrature * quadrature;
+        if magnitude_squared <= limit * limit {
+            (direct, quadrature, 1.0)
+        } else if magnitude_squared == 0.0 || limit == 0.0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            let magnitude = libm::sqrtf(magnitude_squared);
+            let scale = limit / magnitude;
+            (direct * scale, quadrature * scale, scale)
+        }
+    }
 }
 
 const fn saturating_i64_to_i32(value: i64) -> i32 {
@@ -279,6 +346,30 @@ fn integer_sqrt_u64(mut radicand: u64) -> u64 {
     result
 }
 
+#[inline]
+fn conservative_magnitude(direct_bits: u32, quadrature_bits: u32) -> (u32, u32) {
+    let largest = direct_bits.max(quadrature_bits);
+    // Retain as many fractional bits as possible while keeping each scaled
+    // component at 15 bits. Their squared sum then fits in u32. Rounding both
+    // components and the root upward makes the resulting common vector scale
+    // conservative: fixed-point quantization cannot push it outside the circle.
+    let significant_bits = u32::BITS - largest.leading_zeros();
+    let shift = significant_bits.saturating_sub(15);
+    let rounding = (1_u32 << shift).saturating_sub(1);
+    let direct = direct_bits.saturating_add(rounding) >> shift;
+    let quadrature = quadrature_bits.saturating_add(rounding) >> shift;
+    let magnitude_squared = direct
+        .saturating_mul(direct)
+        .saturating_add(quadrature.saturating_mul(quadrature));
+    (integer_sqrt_ceil_u32(magnitude_squared), shift)
+}
+
+#[inline]
+fn integer_sqrt_ceil_u32(radicand: u32) -> u32 {
+    let floor = radicand.isqrt();
+    floor + u32::from(floor * floor != radicand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +391,83 @@ mod tests {
     fn actuator_quantization_is_toward_zero() {
         assert_eq!(Fixed::ratio(19, 10).trunc(), Fixed::from_integer(1));
         assert_eq!(Fixed::ratio(-19, 10).trunc(), Fixed::from_integer(-1));
+    }
+
+    #[test]
+    fn u32_square_root_rounds_up_without_overflow() {
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (15, 4),
+            (16, 4),
+            (17, 5),
+            (u32::MAX, 65_536),
+        ];
+        for (radicand, expected) in cases {
+            assert_eq!(integer_sqrt_ceil_u32(radicand), expected);
+        }
+    }
+
+    #[test]
+    fn fixed_vector_limit_is_conservative_and_direction_preserving() {
+        let limit = Fixed::from_integer(1_273);
+        let fractions: [i32; 5] = [0, 1, 17, 127, 255];
+        for direct_ticks in [-3_000_i32, -1_274, -1_000, -1, 0, 1, 1_000, 1_274, 3_000] {
+            for quadrature_ticks in [-3_000_i32, -1_274, -1_000, -1, 0, 1, 1_000, 1_274, 3_000] {
+                for fraction in fractions {
+                    let fraction_bits = fraction << 8;
+                    let direct = Fixed::from_bits(
+                        (direct_ticks << FRACTION_BITS).saturating_add(fraction_bits),
+                    );
+                    let quadrature = Fixed::from_bits(
+                        (quadrature_ticks << FRACTION_BITS).saturating_sub(fraction_bits),
+                    );
+                    let was_limited = Fixed::magnitude_exceeds(direct, quadrature, limit);
+                    let (applied_d, applied_q, scale) =
+                        Fixed::limit_vector(direct, quadrature, limit);
+
+                    assert!(!Fixed::magnitude_exceeds(applied_d, applied_q, limit));
+                    if was_limited {
+                        assert!(scale < Fixed::ONE);
+                        let cross_product = i128::from(applied_d.to_bits())
+                            * i128::from(quadrature.to_bits())
+                            - i128::from(applied_q.to_bits()) * i128::from(direct.to_bits());
+                        let quantization_bound = i128::from(direct.to_bits().unsigned_abs())
+                            + i128::from(quadrature.to_bits().unsigned_abs());
+                        assert!(cross_product.abs() <= quantization_bound);
+                    } else {
+                        assert_eq!(
+                            (applied_d, applied_q, scale),
+                            (direct, quadrature, Fixed::ONE)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_magnitude_bounds_the_exact_root_across_the_fixed_domain() {
+        let mut state = 0x6d2b_79f5_u32;
+        for _ in 0..100_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let direct = state & 0x7fff_ffff;
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let quadrature = state & 0x7fff_ffff;
+            let exact_squared = u64::from(direct) * u64::from(direct)
+                + u64::from(quadrature) * u64::from(quadrature);
+            let exact_floor = integer_sqrt_u64(exact_squared);
+            let exact_ceil = exact_floor + u64::from(exact_floor * exact_floor != exact_squared);
+            let (scaled, shift) = conservative_magnitude(direct, quadrature);
+            let estimate = u64::from(scaled) << shift;
+            let quantum = 1_u64 << shift;
+
+            assert!(estimate >= exact_ceil);
+            assert!(estimate - exact_ceil <= 3 * quantum);
+        }
     }
 }

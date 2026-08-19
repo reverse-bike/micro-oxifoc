@@ -5,7 +5,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FocController, PIController,
+    Dq, Fixed, FocController, PIController, Scalar,
+    current_limits::{CurrentLimiter, CurrentLimits},
     hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
     phase::{PhaseInput, PhaseManager, PhaseProvider},
@@ -21,6 +22,8 @@ const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_WARNING_CYCLES: u32 = 3_900;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
 const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
+// One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
+const BUS_MODULATION_FILTER_SHIFT: u8 = 5;
 
 static TARGET_Q_COUNTS: AtomicI32 = AtomicI32::new(0);
 static DC_CURRENT_LIMIT_COUNTS: AtomicU32 = AtomicU32::new(0);
@@ -128,6 +131,7 @@ pub struct Snapshot {
 
 struct ControlState {
     controller: FocController,
+    current_limiter: CurrentLimiter,
     target_ramp: QuadratureTargetRamp,
     phase: PhaseManager<HallSensor>,
     offsets: CurrentOffsets,
@@ -149,6 +153,7 @@ pub fn start(offsets: CurrentOffsets) {
     unsafe {
         CONTROL.0.get().write(Some(ControlState {
             controller: ride_foc_controller(),
+            current_limiter: ride_current_limiter(),
             target_ramp: QuadratureTargetRamp::new(
                 crate::config::TARGET_RAMP_CYCLES_PER_STEP,
                 crate::config::TARGET_RAMP_COUNTS_PER_STEP,
@@ -276,6 +281,7 @@ fn stop_control(state: &mut ControlState, safety_loss: bool) {
     LIVE_APPLIED_DQ.store(0, Ordering::Relaxed);
     LIVE_PWM_SPAN.store(0, Ordering::Relaxed);
     state.controller.reset();
+    state.current_limiter.reset();
     state.target_ramp.reset();
     state.command_was_enabled = false;
     if safety_loss {
@@ -449,17 +455,22 @@ fn control_cycle() {
         return;
     }
 
-    let phase_limit = state.controller.phase_current_limit_from_dc(
-        DC_CURRENT_LIMIT_COUNTS
-            .load(Ordering::Relaxed)
-            .min(u32::from(u16::MAX)) as u16,
-        crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS,
-        crate::config::PWM_ARR,
-    );
-    let requested = TARGET_Q_COUNTS
+    let dc_current_limit = DC_CURRENT_LIMIT_COUNTS
         .load(Ordering::Relaxed)
-        .max(-i32::from(phase_limit));
-    let target_q = state.target_ramp.next(requested);
+        .min(u32::from(u16::MAX)) as u16;
+    state.current_limiter.set_bus_limits(
+        Some(Fixed::from_integer(i32::from(dc_current_limit))),
+        Some(Fixed::ZERO),
+    );
+    let limited_target = state.current_limiter.clamp_targets_with_limit(Dq::new(
+        Fixed::ZERO,
+        Fixed::from_integer(TARGET_Q_COUNTS.load(Ordering::Relaxed)),
+    ));
+    let phase_limit = limited_target
+        .quadrature_limit
+        .abs_ceil_u32()
+        .min(u32::from(u16::MAX)) as u16;
+    let target_q = state.target_ramp.next(limited_target.target.q.integer());
     state
         .controller
         .set_actuation_advance(state.phase.hall().actuation_advance());
@@ -474,9 +485,15 @@ fn control_cycle() {
         state.phase.injection(),
         crate::config::PWM_NEUTRAL,
     );
+    if state.current_limiter.is_overcurrent(measured_current) {
+        PHASE_CURRENT_TRIPS.fetch_add(1, Ordering::Relaxed);
+        stop_control(state, true);
+        return;
+    }
     let measured_d_counts = fixed_to_i16(measured_current.d);
     let measured_q_counts = fixed_to_i16(measured_current.q);
     let applied_voltage = state.controller.applied_voltage();
+    state.current_limiter.note_applied_voltage(applied_voltage);
     let applied_d_ticks = fixed_to_i16(applied_voltage.d);
     let applied_q_ticks = fixed_to_i16(applied_voltage.q);
     let pwm_span_ticks = pwm_span(duty);
@@ -547,6 +564,21 @@ const fn ride_foc_controller() -> FocController {
         pi,
         crate::config::FOC_VECTOR_LIMIT_TICKS,
         crate::config::FOC_PHASE_LIMIT_TICKS,
+    )
+}
+
+const fn ride_current_limiter() -> CurrentLimiter {
+    CurrentLimiter::new(
+        CurrentLimits::new(
+            Fixed::from_integer(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS as i32),
+            Fixed::from_integer(crate::config::PHASE_CURRENT_TRIP_COUNTS as i32),
+            Some(Fixed::from_integer(
+                crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS as i32,
+            )),
+            Some(Fixed::ZERO),
+        ),
+        crate::config::PWM_ARR,
+        BUS_MODULATION_FILTER_SHIFT,
     )
 }
 

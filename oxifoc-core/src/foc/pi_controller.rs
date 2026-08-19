@@ -7,12 +7,14 @@ pub struct PIController<N: Scalar = Fixed> {
     proportional_gain: N,
     integral_gain_per_cycle: N,
     integral: N,
+    previous_error: N,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PIUpdate<N: Scalar> {
     pub next_integral: N,
     pub raw_output: N,
+    error: N,
 }
 
 impl<N: Scalar> PIController<N> {
@@ -21,11 +23,13 @@ impl<N: Scalar> PIController<N> {
             proportional_gain,
             integral_gain_per_cycle,
             integral: N::ZERO,
+            previous_error: N::ZERO,
         }
     }
 
     pub fn reset(&mut self) {
         self.integral = N::ZERO;
+        self.previous_error = N::ZERO;
     }
 
     pub const fn integral(&self) -> N {
@@ -35,15 +39,18 @@ impl<N: Scalar> PIController<N> {
     pub(crate) fn prepare_update(&self, target: N, measurement: N) -> PIUpdate<N> {
         let error = target - measurement;
         let proportional = (error * self.proportional_gain).trunc();
-        let next_integral = self.integral + error * self.integral_gain_per_cycle;
+        let trapezoidal_error = (error + self.previous_error) * N::HALF;
+        let next_integral = self.integral + trapezoidal_error * self.integral_gain_per_cycle;
         PIUpdate {
             next_integral,
             raw_output: proportional + next_integral.trunc(),
+            error,
         }
     }
 
     pub(crate) fn apply_back_calculation(&mut self, update: PIUpdate<N>, output_error: N) {
         self.integral = update.next_integral + output_error;
+        self.previous_error = update.error;
     }
 }
 
@@ -59,8 +66,8 @@ mod tests {
     fn configured_fixed_gains_preserve_the_integer_controller_response() {
         let pi = fixed_pi();
         let first = pi.prepare_update(Fixed::from_integer(480), Fixed::ZERO);
-        assert_eq!(first.raw_output.integer(), 257);
-        assert_eq!(first.next_integral.to_bits(), 1_161_600);
+        assert_eq!(first.raw_output.integer(), 248);
+        assert_eq!(first.next_integral.to_bits(), 580_800);
     }
 
     #[test]
@@ -68,7 +75,7 @@ mod tests {
         let mut pi = fixed_pi();
         let update = pi.prepare_update(Fixed::from_integer(480), Fixed::ZERO);
         pi.apply_back_calculation(update, Fixed::from_integer(-100));
-        assert_eq!(pi.integral().integer(), -82);
+        assert_eq!(pi.integral().integer(), -91);
     }
 
     #[cfg(feature = "algorithms")]

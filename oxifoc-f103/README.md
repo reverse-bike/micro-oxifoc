@@ -18,15 +18,16 @@ the device crate without pulling the floating-point or async stack into the
 image:
 
 - `oxifoc-core::foc` owns current-offset tracking, Clarke/Park,
-  `PIController`, `FocController`, voltage limiting, CORDIC, SVPWM, target
-  slew, `HallSensor`, and the phase provider/manager interfaces. These live in
-  OxiFOC's canonical modules rather than a parallel F103 algorithm tree.
+  `PIController`, `FocController`, layered current limiting, voltage limiting,
+  CORDIC, SVPWM, target slew, `HallSensor`, and the phase provider/manager
+  interfaces. These live in OxiFOC's canonical modules rather than a parallel
+  F103 algorithm tree.
 - `oxifoc-f103` owns the recovered pin map, direct register access, interrupt
   scheduling, board-specific gains and limits, ride safety, local inputs, and
   stock-bike CAN.
 
-The device crate follows the same layer names as the reference firmware while
-remaining synchronous:
+The device crate follows OxiFOC's device/core boundary while remaining
+synchronous:
 
 ```text
 src/
@@ -54,6 +55,11 @@ Every image prepared for a real CAN flash receives one patch-version bump and
 a brief change/reason entry in [CHANGELOG.md](CHANGELOG.md). Validation-only
 builds do not bump the version. Page 18 of project telemetry reports the crate
 version embedded in the running image so ride logs remain attributable.
+
+Recovered firmware is used only to establish hardware and motor constants:
+pin assignments, peripheral timing, sensor conversions, Hall geometry, and
+the reviewed electrical envelope. Current regulation, limiting, estimation,
+and modulation follow OxiFOC's control architecture.
 
 Hall is the installed phase provider. The `PhaseSource` API deliberately
 retains encoder, back-EMF observer, HFI, hybrid, manual, and open-loop strategy
@@ -121,15 +127,17 @@ ms and twelve net-forward Hall transitions. The software phase-current guard
 trips above 1,344 counts (134.4 A) on A, B, or reconstructed C, preserving at
 least the established 1.6-times margin over commanded phase current. The local
 39 V undervoltage debounce and controller/motor thermal envelopes can only
-reduce the 480-count projected DC-side limit. This is nominally 48 A at the
-loaded-run current fit, and is expected to produce approximately 40 A at the
-BMS based on the preceding 400-count ride. DC projection dynamically reduces
-the phase-current target as applied modulation rises. The 1,273-tick voltage-
-vector ceiling and 1,103-tick centered PWM window reproduce the stock F103
-modulation envelope. PI gains and target ramp are unchanged. The voltage vector
-alone is advanced by one measured electrical control-period step to compensate
-the ADC-to-PWM pipeline; current Park transformation remains at the sampled
-Hall angle.
+reduce the 480-count DC-side limit. This is nominally 48 A at the loaded-run
+current fit. The current limiter applies a circular `Id/Iq` command envelope,
+then derives the DC-side clamp from a 2 ms low-pass of q-axis modulation using
+`Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
+and each reconstructed physical phase have independent overcurrent checks. The
+1,273-tick voltage-vector ceiling preserves the requested dq direction, and
+the 1,103-tick centered PWM window reproduces the reviewed F103 modulation
+envelope. The PI controller uses OxiFOC's trapezoidal integrator and coordinated
+circular-limit anti-windup. The voltage vector alone is advanced by one
+measured electrical control-period step to compensate the ADC-to-PWM pipeline;
+current Park transformation remains at the sampled Hall angle.
 
 ## CAN and updater
 

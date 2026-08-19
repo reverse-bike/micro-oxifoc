@@ -75,28 +75,6 @@ where
         self.actuation_advance
     }
 
-    pub fn phase_current_limit_from_dc(
-        &self,
-        dc_current_limit_counts: u16,
-        maximum_phase_counts: u16,
-        pwm_period_ticks: u16,
-    ) -> u16 {
-        let direct = self.applied_voltage.d.abs_ceil_u32();
-        let quadrature = self.applied_voltage.q.abs_ceil_u32();
-        let maximum = direct.max(quadrature);
-        let minimum = direct.min(quadrature);
-        let magnitude = maximum.saturating_add(minimum.saturating_mul(3) >> 3);
-        if magnitude == 0 {
-            return maximum_phase_counts;
-        }
-        u32::from(dc_current_limit_counts)
-            .saturating_mul(u32::from(pwm_period_ticks))
-            .saturating_mul(2)
-            .checked_div(magnitude.saturating_mul(3))
-            .unwrap_or(u32::MAX)
-            .clamp(1, u32::from(maximum_phase_counts)) as u16
-    }
-
     pub fn step(
         &mut self,
         phase_a: N,
@@ -134,13 +112,19 @@ where
             direct_update.raw_output + voltage_injection.d,
             quadrature_update.raw_output + voltage_injection.q,
         );
-        let applied = limit_voltage_direct_priority(requested, self.vector_limit_ticks);
+        let (applied_d, applied_q, voltage_scale) =
+            N::limit_vector(requested.d, requested.q, self.vector_limit_ticks);
+        let applied = Dq::new(applied_d, applied_q);
         self.applied_voltage = applied;
-        self.voltage_limited = applied != requested;
-        self.direct
-            .apply_back_calculation(direct_update, applied.d - requested.d);
-        self.quadrature
-            .apply_back_calculation(quadrature_update, applied.q - requested.q);
+        self.voltage_limited = voltage_scale != N::ONE;
+        self.direct.apply_back_calculation(
+            direct_update,
+            direct_update.raw_output * (voltage_scale - N::ONE),
+        );
+        self.quadrature.apply_back_calculation(
+            quadrature_update,
+            quadrature_update.raw_output * (voltage_scale - N::ONE),
+        );
         let (voltage_alpha, voltage_beta) = inverse_park(applied.d, applied.q, sin, cos);
         let (voltage_alpha, voltage_beta) =
             self.apply_actuation_advance(voltage_alpha, voltage_beta);
@@ -168,11 +152,9 @@ where
     }
 }
 
-pub fn limit_voltage_direct_priority<N: Scalar>(voltage: Dq<N>, limit_ticks: N) -> Dq<N> {
-    let limit = limit_ticks.max(N::ZERO);
-    let direct = voltage.d.clamp(-limit, limit);
-    let quadrature_limit = N::circular_remaining(limit, direct);
-    Dq::new(direct, voltage.q.clamp(-quadrature_limit, quadrature_limit))
+pub fn limit_voltage<N: Scalar>(voltage: Dq<N>, limit_ticks: N) -> Dq<N> {
+    let (direct, quadrature, _) = N::limit_vector(voltage.d, voltage.q, limit_ticks);
+    Dq::new(direct, quadrature)
 }
 
 #[cfg(test)]
@@ -186,21 +168,33 @@ mod tests {
     }
 
     #[test]
-    fn vector_limit_is_direct_priority_and_circular() {
-        assert_eq!(
-            limit_voltage_direct_priority(
-                Dq::new(Fixed::from_integer(1_000), Fixed::from_integer(1_000)),
-                Fixed::from_integer(1_250),
-            ),
-            Dq::new(Fixed::from_integer(1_000), Fixed::from_integer(750)),
+    fn vector_limit_is_circular_and_preserves_direction() {
+        let diagonal = limit_voltage(
+            Dq::new(Fixed::from_integer(1_000), Fixed::from_integer(1_000)),
+            Fixed::from_integer(1_250),
         );
-        assert_eq!(
-            limit_voltage_direct_priority(
-                Dq::new(Fixed::from_integer(2_000), Fixed::from_integer(50)),
-                Fixed::from_integer(1_250),
-            ),
-            Dq::new(Fixed::from_integer(1_250), Fixed::ZERO),
+        assert!((diagonal.d - diagonal.q).abs_ceil_u32() <= 1);
+        assert!((882..=884).contains(&diagonal.d.integer()));
+        assert!(!Fixed::magnitude_exceeds(
+            diagonal.d,
+            diagonal.q,
+            Fixed::from_integer(1_250),
+        ));
+
+        let shallow = limit_voltage(
+            Dq::new(Fixed::from_integer(2_000), Fixed::from_integer(50)),
+            Fixed::from_integer(1_250),
         );
+        let cross_product_error = (i64::from(shallow.d.to_bits()) * 50
+            - i64::from(shallow.q.to_bits()) * 2_000)
+            .unsigned_abs();
+        assert!(cross_product_error <= 2_000);
+        assert!((1_248..=1_250).contains(&shallow.d.integer()));
+        assert!(!Fixed::magnitude_exceeds(
+            shallow.d,
+            shallow.q,
+            Fixed::from_integer(1_250),
+        ));
     }
 
     #[test]
@@ -277,22 +271,6 @@ mod tests {
         assert_eq!(controller.actuation_advance(), Fixed::ratio(1, 2));
         controller.set_actuation_advance(Fixed::from_integer(-2));
         assert_eq!(controller.actuation_advance(), Fixed::ratio(-1, 2));
-    }
-
-    #[test]
-    fn dc_projection_is_bounded_by_the_phase_envelope() {
-        let mut controller = fixed_controller();
-        assert_eq!(controller.phase_current_limit_from_dc(400, 838, 2_250), 838);
-        let _ = controller.step(
-            Fixed::ZERO,
-            Fixed::ZERO,
-            0,
-            Dq::new(Fixed::ZERO, Fixed::from_integer(-10_000)),
-            1_125,
-        );
-        assert_eq!(controller.phase_current_limit_from_dc(250, 838, 2_250), 300);
-        assert_eq!(controller.phase_current_limit_from_dc(400, 838, 2_250), 480);
-        assert_eq!(controller.phase_current_limit_from_dc(480, 838, 2_250), 576);
     }
 
     #[cfg(feature = "algorithms")]

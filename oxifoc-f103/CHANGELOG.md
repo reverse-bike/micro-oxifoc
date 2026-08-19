@@ -5,6 +5,38 @@ every real `flash-f103 --yes` invocation, bump the crate version and add an
 entry here. Validation builds and rebuilding an unchanged image do not create a
 new version.
 
+## 0.1.3 - 2026-08-18
+
+Changes:
+
+- Replaced saturated fixed-point voltage-vector normalization's iterative
+  64-bit square root with a dynamically scaled 32-bit integer root.
+- Retained OxiFOC's circular dq limit, common direction-preserving scale, and
+  coordinated anti-windup without adding a speed-dependent control path.
+
+Reason: the 0.1.2 top-speed capture repeatedly drove the 16 kHz interrupt to
+its complete 4,500-cycle budget and showed restart signatures. The expensive
+path ran whenever the voltage vector saturated. Conservatively rounding the
+scaled magnitude keeps the applied vector inside the same circle while using
+the Cortex-M3's bounded 32-bit arithmetic.
+
+## 0.1.2 - 2026-08-18
+
+Changes:
+
+- Restored OxiFOC's d-priority circular current-command envelope, filtered
+  q-modulation supply-current clamp, and measured dq overcurrent trip.
+- Restored direction-preserving circular voltage limiting, coordinated
+  anti-windup, and trapezoidal PI integration.
+- Documented that recovered stock firmware supplies hardware and motor
+  constants only; regulation, limiting, estimation, and modulation follow
+  OxiFOC.
+
+Reason: remove F103-specific limiting behavior that had diverged from the
+original OxiFOC control architecture. This image was flashed before its crate
+version was advanced, so its page-18 telemetry incorrectly reports 0.1.1; the
+ride capture is identified externally as 0.1.2.
+
 ## 0.1.1 - 2026-08-18
 
 Changes:

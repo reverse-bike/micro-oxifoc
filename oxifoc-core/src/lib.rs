@@ -290,6 +290,10 @@ pub mod foc {
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub mod controller;
 
+    /// Layered current-command, supply-current, and overcurrent limits.
+    #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
+    pub mod current_limits;
+
     /// Fault registry shared across targets
     #[cfg(feature = "algorithms")]
     pub mod fault;

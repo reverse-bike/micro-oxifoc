@@ -30,8 +30,10 @@ oxifoc-f103 control ISR
 ├── config + control + safety
 ├── hardware + sensors + transport
 └── oxifoc-core::foc
+    ├── CurrentLimiter<Fixed>
+    │   └── current circle → modulation-based bus clamp → dq trip
     ├── FocController<Fixed, CordicSinCos>
-    │   └── transforms → PIController → SVPWM
+    │   └── transforms → PIController → voltage circle → SVPWM
     └── PhaseManager → PhaseProvider → HallSensor
 ```
 
@@ -40,9 +42,11 @@ oxifoc-f103 control ISR
 ```mermaid
 graph TD
     ISR["<b>F103 control ISR</b><br/>sampling · safety · hardware"] --> PhaseManager
+    ISR --> CurrentLimiter
     ISR --> FocController
     PhaseManager["<b>PhaseManager&lt;H&gt;</b><br/>source ownership · selection"] --> PhaseProvider
     PhaseProvider["<b>PhaseProvider</b><br/>estimate · injection · update"] --> HallSensor
+    CurrentLimiter["<b>CurrentLimiter</b><br/>dq target circle · DC-bus projection · trip"] --> FocController
     FocController["<b>FocController&lt;N,T,M&gt;</b><br/>Clarke · Park · PI · inverse Park"] --> PIController
     FocController --> SinCos["<b>SinCos</b><br/>Q0.32 turns → Q16.16 sin/cos"]
     FocController --> SVPWM
