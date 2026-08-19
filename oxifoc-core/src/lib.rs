@@ -272,7 +272,7 @@ pub mod foc {
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub use control_types::{AlphaBeta, Dq, PwmDuty};
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
-    pub use controller::FocController;
+    pub use controller::{FixedFocController, FocController};
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]
     pub use numeric::{Fixed, Scalar};
     #[cfg(any(feature = "algorithms", feature = "fixed-point"))]

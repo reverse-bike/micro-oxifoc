@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FocController, PIController, Scalar,
+    Dq, Fixed, FixedFocController, PIController, Scalar,
     hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
     phase::{BackEmfObserver, ObserverDiagnostics, PhaseManager, PhaseSource},
@@ -25,6 +25,16 @@ const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM
 const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
 // One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
 const BUS_MODULATION_FILTER_SHIFT: u8 = 5;
+
+type RideFocController = FixedFocController<
+    { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
+    { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
+>;
+type RideFocDriver = FocDriver<
+    PhaseManager<HallSensor>,
+    { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
+    { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
+>;
 
 static TARGET_Q_COUNTS: AtomicI32 = AtomicI32::new(0);
 static DC_CURRENT_LIMIT_COUNTS: AtomicU32 = AtomicU32::new(0);
@@ -170,7 +180,7 @@ struct ControlDiagnostics {
 }
 
 struct ControlState {
-    driver: FocDriver<PhaseManager<HallSensor>>,
+    driver: RideFocDriver,
     target_ramp: QuadratureTargetRamp,
     offsets: CurrentOffsets,
     offset_tracker: CurrentOffsetTracker,
@@ -738,12 +748,12 @@ fn actuation_advance_from_erpm(electrical_rpm: i32) -> Fixed {
     Fixed::from_bits(bits)
 }
 
-const fn ride_foc_controller() -> FocController {
+const fn ride_foc_controller() -> RideFocController {
     let pi = PIController::new(
         crate::config::CURRENT_PI_PROPORTIONAL_GAIN,
         crate::config::CURRENT_PI_INTEGRAL_GAIN_PER_CYCLE,
     );
-    FocController::new(
+    RideFocController::new(
         pi,
         pi,
         crate::config::FOC_VECTOR_LIMIT_TICKS,
@@ -751,8 +761,8 @@ const fn ride_foc_controller() -> FocController {
     )
 }
 
-const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> FocDriver<PhaseManager<HallSensor>> {
-    FocDriver::new(
+const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> RideFocDriver {
+    RideFocDriver::new(
         ride_foc_controller(),
         phase,
         ride_current_limits(),

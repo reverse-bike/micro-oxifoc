@@ -61,6 +61,13 @@ pin assignments, peripheral timing, sensor conversions, Hall geometry, and
 the reviewed electrical envelope. Current regulation, limiting, estimation,
 and modulation follow OxiFOC's control architecture.
 
+The shared controller applies OxiFOC's current-sign dead-time compensation
+after inverse Park and actuation-frame advance, immediately before SVPWM. The
+hardware's 25 CKD-divided dead-time ticks are represented as 50/3 controller
+phase-voltage ticks. Commanded stationary voltage remains uncompensated, as in
+the original architecture, because the bridge correction makes applied
+voltage track that command for the observer.
+
 `PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
 observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
 confidence, PLL-lock, minimum-speed, and physical back-EMF validity gates pass

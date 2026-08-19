@@ -13,6 +13,12 @@ Changes:
   cause, fault and pin predicates, TIM1 status/output registers, and all three
   attempted compares. Pages 24 and 25 expose the record after reboot, and the
   project telemetry schema advances to 7.
+- Ported OxiFOC's phase-current-sign dead-time compensation at its original
+  location: after inverse Park and actuation advance, immediately before
+  SVPWM. The fixed controller expresses the board's 694 ns dead time as the
+  equivalent 50/3 phase-voltage ticks; compile-time numeric parameters keep
+  disabled and fixed-hardware variants on the same source path without adding
+  runtime state.
 
 Reason: the loaded 0.1.8 run reproduced a top-speed cutoff and proved that an
 IWDG reset followed a `PwmOutput` safety loss, with neither an exception nor a
@@ -20,7 +26,10 @@ control-loop overrun. The earlier record could not distinguish a transient
 BKIN assertion, disabled PA2, compare rejection, or failed TIM1 output-enable
 readback. Capturing the failed predicate before shutdown makes another event
 identify the initiating hardware condition instead of only its watchdog
-consequence.
+consequence. The inverter also loses a current-direction-dependent fraction of
+each PWM period to its configured dead time. Applying OxiFOC's compensation in
+the modulation path removes that repeatable voltage error from the PI loops
+without changing the voltage reported to the observer.
 
 ## 0.1.8 - 2026-08-18
 

@@ -13,6 +13,8 @@ pub struct FocController<
     N: Scalar = Fixed,
     T: SinCos<N> = CordicSinCos,
     M: TickModulator<N> = SvpwmTickModulator,
+    const DEAD_TIME_NUMERATOR: i32 = 0,
+    const DEAD_TIME_DENOMINATOR: i32 = 1,
 > {
     direct: PIController<N>,
     quadrature: PIController<N>,
@@ -26,7 +28,19 @@ pub struct FocController<
     backend: PhantomData<(T, M)>,
 }
 
-impl<N, T, M> FocController<N, T, M>
+pub type FixedFocController<
+    const DEAD_TIME_NUMERATOR: i32 = 0,
+    const DEAD_TIME_DENOMINATOR: i32 = 1,
+> = FocController<
+    Fixed,
+    CordicSinCos,
+    SvpwmTickModulator,
+    DEAD_TIME_NUMERATOR,
+    DEAD_TIME_DENOMINATOR,
+>;
+
+impl<N, T, M, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
+    FocController<N, T, M, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
 where
     N: Scalar,
     T: SinCos<N>,
@@ -87,6 +101,17 @@ where
 
     pub const fn voltage_limited(&self) -> bool {
         self.voltage_limited
+    }
+
+    /// OxiFOC's `t_dead * f_pwm` factor after conversion to the modulator's
+    /// phase-voltage tick domain. A zero numerator disables compensation;
+    /// enabled specializations require a nonzero denominator.
+    pub fn dead_time_comp_ticks(&self) -> N {
+        if DEAD_TIME_NUMERATOR == 0 {
+            N::ZERO
+        } else {
+            N::from_ratio(DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR)
+        }
     }
 
     /// Set the electrical angle traversed between the current sample and the
@@ -159,10 +184,12 @@ where
             alpha: voltage_alpha,
             beta: voltage_beta,
         };
+        let (modulated_alpha, modulated_beta) =
+            self.apply_dead_time_comp(voltage_alpha, voltage_beta, phase_a, phase_b);
         let duties = M::to_duties(
             AlphaBeta {
-                alpha: voltage_alpha,
-                beta: voltage_beta,
+                alpha: modulated_alpha,
+                beta: modulated_beta,
             },
             pwm_neutral,
             self.phase_limit_ticks,
@@ -180,6 +207,34 @@ where
         let sin = advance - advance_squared * advance * N::from_ratio(1, 6);
         let cos = N::ONE - advance_squared * N::HALF;
         (alpha * cos - beta * sin, alpha * sin + beta * cos)
+    }
+
+    #[inline]
+    fn apply_dead_time_comp(&self, alpha: N, beta: N, phase_a: N, phase_b: N) -> (N, N) {
+        let factor = self.dead_time_comp_ticks();
+        if factor == N::ZERO {
+            return (alpha, beta);
+        }
+
+        // These are the original OxiFOC inverse-Clarke phase-current signs.
+        // Using the two measured phases directly avoids reconstructing values
+        // the Clarke transform received earlier in this same control step.
+        let phase_c = -(phase_a + phase_b);
+        let signs = (u8::from(phase_a >= N::ZERO) << 2)
+            | (u8::from(phase_b >= N::ZERO) << 1)
+            | u8::from(phase_c >= N::ZERO);
+        let alpha_step = factor * N::TWO_THIRDS;
+        let beta_step = factor * N::TWO_INV_SQRT_3;
+        let (comp_alpha, comp_beta) = match signs {
+            4 => (alpha_step + alpha_step, N::ZERO),
+            6 => (alpha_step, beta_step),
+            2 => (-alpha_step, beta_step),
+            3 => (-(alpha_step + alpha_step), N::ZERO),
+            1 => (-alpha_step, -beta_step),
+            5 => (alpha_step, -beta_step),
+            _ => (N::ZERO, N::ZERO),
+        };
+        (alpha + comp_alpha, beta + comp_beta)
     }
 }
 
@@ -302,6 +357,54 @@ mod tests {
         assert_eq!(controller.actuation_advance(), Fixed::ratio(1, 2));
         controller.set_actuation_advance(Fixed::from_integer(-2));
         assert_eq!(controller.actuation_advance(), Fixed::ratio(-1, 2));
+    }
+
+    #[test]
+    fn dead_time_compensation_follows_all_six_phase_current_sign_regions() {
+        let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
+        let controller = FixedFocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
+        let alpha_step = Fixed::from_integer(9) * Fixed::TWO_THIRDS;
+        let beta_step = Fixed::from_integer(9) * Fixed::TWO_INV_SQRT_3;
+        for (phase_a, phase_b, expected_alpha, expected_beta) in [
+            (2, -1, alpha_step + alpha_step, Fixed::ZERO),
+            (1, 1, alpha_step, beta_step),
+            (-1, 2, -alpha_step, beta_step),
+            (-2, 1, -(alpha_step + alpha_step), Fixed::ZERO),
+            (-1, -1, -alpha_step, -beta_step),
+            (1, -2, alpha_step, -beta_step),
+        ] {
+            let compensated = controller.apply_dead_time_comp(
+                Fixed::ZERO,
+                Fixed::ZERO,
+                Fixed::from_integer(phase_a),
+                Fixed::from_integer(phase_b),
+            );
+            assert_eq!(compensated, (expected_alpha, expected_beta));
+        }
+    }
+
+    #[test]
+    fn dead_time_compensation_changes_only_the_modulator_command() {
+        let mut plain = fixed_controller();
+        let pi = PIController::new(Fixed::ratio(512, 1_024), Fixed::ratio(605, 16_384));
+        let mut compensated =
+            FixedFocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
+        let input = (
+            Fixed::from_integer(100),
+            Fixed::from_integer(-60),
+            0,
+            Dq::new(Fixed::ZERO, Fixed::ZERO),
+            1_125,
+        );
+        let (plain_current, plain_duty) = plain.step(input.0, input.1, input.2, input.3, input.4);
+        let (compensated_current, compensated_duty) =
+            compensated.step(input.0, input.1, input.2, input.3, input.4);
+
+        assert_eq!(compensated_current, plain_current);
+        assert_eq!(compensated.applied_voltage(), plain.applied_voltage());
+        assert_eq!(compensated.applied_stationary(), plain.applied_stationary());
+        assert_ne!(compensated_duty, plain_duty);
+        assert_eq!(compensated.dead_time_comp_ticks(), Fixed::from_integer(9));
     }
 
     #[cfg(feature = "algorithms")]

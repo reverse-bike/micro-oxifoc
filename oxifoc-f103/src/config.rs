@@ -18,6 +18,12 @@ pub const PWM_ARR: u16 = 2_250;
 pub const PWM_NEUTRAL: u16 = PWM_ARR / 2;
 pub const PWM_DEAD_TIME_TICKS: u8 = 25;
 pub const PWM_SAMPLE_CC4: u16 = 2_248;
+// OxiFOC's normalized t_dead*f_pwm factor expressed in this controller's
+// phase-voltage tick domain: (25 / 36 MHz) * 16 kHz * (2 * 2,250 / 3).
+pub const FOC_DEAD_TIME_COMP_NUMERATOR: i32 = 50;
+pub const FOC_DEAD_TIME_COMP_DENOMINATOR: i32 = 3;
+pub const FOC_DEAD_TIME_COMP_TICKS: Fixed =
+    Fixed::ratio(FOC_DEAD_TIME_COMP_NUMERATOR, FOC_DEAD_TIME_COMP_DENOMINATOR);
 // The S310 application uses a 1,273-tick voltage circle and approximately
 // 22..2,227 timer compares with this same 2,250-tick PWM period.
 pub const FOC_PHASE_LIMIT_TICKS: u16 = 1_103;
@@ -262,6 +268,7 @@ mod tests {
         assert_eq!(FOC_VECTOR_LIMIT_TICKS.integer(), 1_273);
         assert_eq!(FOC_PHASE_LIMIT_TICKS, 1_103);
         assert_eq!(FOC_HARD_PHASE_LIMIT_TICKS, 1_103);
+        assert_eq!(FOC_DEAD_TIME_COMP_TICKS, Fixed::ratio(50, 3));
         assert!(PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
 
         let mut maximum_span = 0;

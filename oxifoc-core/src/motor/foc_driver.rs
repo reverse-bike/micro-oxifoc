@@ -7,7 +7,7 @@
 
 use crate::foc::phase::{PhaseEstimate, PhaseInput, PhaseProvider};
 use crate::foc::trig::Turns;
-use crate::foc::{AlphaBeta, Dq, Fixed, FocController, PwmDuty, Scalar};
+use crate::foc::{AlphaBeta, Dq, Fixed, FixedFocController, PwmDuty, Scalar};
 
 /// Current-command, supply-current, and measured-overcurrent limits.
 ///
@@ -86,8 +86,12 @@ pub struct FocOutput {
 }
 
 /// Owns current regulation, current limits, and the selected phase provider.
-pub struct FocDriver<Phase> {
-    controller: FocController,
+pub struct FocDriver<
+    Phase,
+    const DEAD_TIME_NUMERATOR: i32 = 0,
+    const DEAD_TIME_DENOMINATOR: i32 = 1,
+> {
+    controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>,
     phase: Phase,
     current_limits: CurrentLimits,
     bus_mod_q_filt_ticks: Fixed,
@@ -98,9 +102,11 @@ pub struct FocDriver<Phase> {
     previous_applied_voltage: AlphaBeta,
 }
 
-impl<Phase> FocDriver<Phase> {
+impl<Phase, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
+    FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
+{
     pub const fn new(
-        controller: FocController,
+        controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>,
         phase: Phase,
         current_limits: CurrentLimits,
         pwm_period_ticks: u16,
@@ -239,7 +245,8 @@ impl<Phase> FocDriver<Phase> {
     }
 }
 
-impl<Phase> FocDriver<Phase>
+impl<Phase, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
+    FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
 where
     Phase: PhaseProvider<Fixed, Angle = Turns>,
 {
@@ -331,8 +338,8 @@ fn phase_current_limit(bus_limit: Fixed, q_voltage_ticks: u32, pwm_period_ticks:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foc::PIController;
     use crate::foc::phase::PhaseSource;
+    use crate::foc::{FocController, PIController};
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct TestPhase;
@@ -455,7 +462,7 @@ mod tests {
             Some(Fixed::ZERO),
         );
         let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
-        let mut driver = FocDriver::new(
+        let mut driver: FocDriver<TestPhase> = FocDriver::new(
             FocController::new(pi, pi, Fixed::from_integer(1_273), 1_103),
             TestPhase,
             limits,
@@ -493,7 +500,7 @@ mod tests {
     #[test]
     fn observer_receives_previous_voltage_with_the_current_sample() {
         let proportional = PIController::new(Fixed::ONE, Fixed::ZERO);
-        let mut driver = FocDriver::new(
+        let mut driver: FocDriver<CapturingPhase> = FocDriver::new(
             FocController::new(proportional, proportional, Fixed::from_integer(100), 100),
             CapturingPhase::default(),
             CurrentLimits::new(
