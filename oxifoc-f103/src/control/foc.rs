@@ -6,10 +6,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FixedFocController, PIController, Scalar,
+    Dq, Fixed, FixedDecoupling, FixedFocController, PIController, Scalar,
     hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
-    phase::{BackEmfObserver, ObserverDiagnostics, PhaseManager, PhaseSource},
+    phase::{BackEmfObserver, ObserverDiagnostics, PhaseEstimate, PhaseManager, PhaseSource},
     ramp::QuadratureTargetRamp,
 };
 use oxifoc_core::motor::foc_driver::{CurrentLimits, FocDriver, StepError};
@@ -26,14 +26,21 @@ const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
 // One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
 const BUS_MODULATION_FILTER_SHIFT: u8 = 5;
 
+type RideDecoupling = FixedDecoupling<
+    { crate::config::MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS },
+    { crate::config::MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS },
+    { crate::config::MOTOR_FLUX_LINKAGE_MILLIWEBERS.to_bits() },
+>;
 type RideFocController = FixedFocController<
     { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
     { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
+    RideDecoupling,
 >;
 type RideFocDriver = FocDriver<
     PhaseManager<HallSensor>,
     { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
     { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
+    RideDecoupling,
 >;
 
 static TARGET_Q_COUNTS: AtomicI32 = AtomicI32::new(0);
@@ -594,7 +601,14 @@ fn control_cycle(started: u32) {
     let requested_q = state
         .target_ramp
         .next(TARGET_Q_COUNTS.load(Ordering::Relaxed));
-    let actuation_advance = actuation_advance_from_erpm(estimate.electrical_rpm);
+    // Bound the shared speed input once before it drives either phase advance
+    // or the dq speed-voltage feedforward terms.
+    let control_electrical_rpm = estimate.electrical_rpm.clamp(-76_000, 76_000);
+    let control_estimate = PhaseEstimate {
+        electrical_rpm: control_electrical_rpm,
+        ..estimate
+    };
+    let actuation_advance = actuation_advance_from_erpm(control_electrical_rpm);
     state.driver.set_actuation_advance(actuation_advance);
     state.driver.set_volts_per_pwm_tick(Fixed::from_bits(
         OBSERVER_VOLTS_PER_PWM_TICK_BITS.load(Ordering::Relaxed),
@@ -607,7 +621,7 @@ fn control_cycle(started: u32) {
     let output = match state.driver.step_current_control(
         Fixed::from_integer(i32::from(current.phase_a)),
         Fixed::from_integer(i32::from(current.phase_b)),
-        angle,
+        control_estimate,
         Dq::new(Fixed::ZERO, Fixed::from_integer(requested_q)),
         crate::config::PWM_NEUTRAL,
         CONTROL_PERIOD_NS,
@@ -744,7 +758,7 @@ fn saturating_i32_to_i16(value: i32) -> i16 {
 fn actuation_advance_from_erpm(electrical_rpm: i32) -> Fixed {
     // Q16.16 radians per control period. 1757/4096 approximates
     // 2*pi*65536/(60*16000) to 0.006%, with no division in the ISR.
-    let bits = electrical_rpm.clamp(-76_000, 76_000).saturating_mul(1_757) >> 12;
+    let bits = (electrical_rpm * 1_757) >> 12;
     Fixed::from_bits(bits)
 }
 

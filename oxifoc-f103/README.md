@@ -68,6 +68,14 @@ phase-voltage ticks. Commanded stationary voltage remains uncompensated, as in
 the original architecture, because the bridge correction makes applied
 voltage track that command for the observer.
 
+The controller also applies OxiFOC's reference-current dq decoupling and
+permanent-magnet back-EMF feedforward before the circular voltage limit. The
+compile-time model combines the recovered 39 uH phase inductance with the
+0.16 A/current-count conversion and uses the 12.2 mWb flux linkage, signed
+electrical speed, and live bus-voltage scale. Feedforward participates in
+voltage limiting but is excluded from the PI anti-windup charge, matching the
+original controller's saturation behavior without adding runtime model state.
+
 `PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
 observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
 confidence, PLL-lock, minimum-speed, and physical back-EMF validity gates pass

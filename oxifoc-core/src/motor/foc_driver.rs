@@ -7,7 +7,9 @@
 
 use crate::foc::phase::{PhaseEstimate, PhaseInput, PhaseProvider};
 use crate::foc::trig::Turns;
-use crate::foc::{AlphaBeta, Dq, Fixed, FixedFocController, PwmDuty, Scalar};
+use crate::foc::{
+    AlphaBeta, DecouplingModel, Dq, Fixed, FixedFocController, NoDecoupling, PwmDuty, Scalar,
+};
 
 /// Current-command, supply-current, and measured-overcurrent limits.
 ///
@@ -90,8 +92,9 @@ pub struct FocDriver<
     Phase,
     const DEAD_TIME_NUMERATOR: i32 = 0,
     const DEAD_TIME_DENOMINATOR: i32 = 1,
+    Decoupling: DecouplingModel<Fixed> = NoDecoupling,
 > {
-    controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>,
+    controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
     phase: Phase,
     current_limits: CurrentLimits,
     bus_mod_q_filt_ticks: Fixed,
@@ -102,11 +105,15 @@ pub struct FocDriver<
     previous_applied_voltage: AlphaBeta,
 }
 
-impl<Phase, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
-    FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
+impl<
+    Phase,
+    const DEAD_TIME_NUMERATOR: i32,
+    const DEAD_TIME_DENOMINATOR: i32,
+    Decoupling: DecouplingModel<Fixed>,
+> FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>
 {
     pub const fn new(
-        controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>,
+        controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
         phase: Phase,
         current_limits: CurrentLimits,
         pwm_period_ticks: u16,
@@ -245,8 +252,12 @@ impl<Phase, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
     }
 }
 
-impl<Phase, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
-    FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
+impl<
+    Phase,
+    const DEAD_TIME_NUMERATOR: i32,
+    const DEAD_TIME_DENOMINATOR: i32,
+    Decoupling: DecouplingModel<Fixed>,
+> FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>
 where
     Phase: PhaseProvider<Fixed, Angle = Turns>,
 {
@@ -263,19 +274,21 @@ where
         &mut self,
         phase_a: Fixed,
         phase_b: Fixed,
-        electrical_angle: Turns,
+        estimate: PhaseEstimate<Turns>,
         target: Dq,
         pwm_neutral: u16,
         control_period_ns: u32,
     ) -> Result<FocOutput, StepError> {
         let (target, quadrature_limit) = self.clamp_targets_with_limit(target);
         let injection = self.phase.injection();
-        let (measured_current, duties) = self.controller.step_with_injection(
+        let (measured_current, duties) = self.controller.step_with_velocity_and_injection(
             phase_a,
             phase_b,
-            electrical_angle,
+            estimate.angle,
+            estimate.electrical_rpm,
             target,
             injection,
+            self.volts_per_pwm_tick,
             pwm_neutral,
         );
         if self.current_limits.is_overcurrent(measured_current) {
@@ -518,7 +531,11 @@ mod tests {
             .step_current_control(
                 Fixed::ZERO,
                 Fixed::ZERO,
-                0,
+                PhaseEstimate {
+                    angle: 0,
+                    electrical_rpm: 0,
+                    trustworthy: true,
+                },
                 Dq::new(Fixed::from_integer(10), Fixed::ZERO),
                 100,
                 62_500,
@@ -530,7 +547,11 @@ mod tests {
             .step_current_control(
                 Fixed::from_integer(2),
                 Fixed::from_integer(-1),
-                0,
+                PhaseEstimate {
+                    angle: 0,
+                    electrical_rpm: 0,
+                    trustworthy: true,
+                },
                 Dq::default(),
                 100,
                 62_500,

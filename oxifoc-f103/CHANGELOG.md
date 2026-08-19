@@ -19,6 +19,11 @@ Changes:
   equivalent 50/3 phase-voltage ticks; compile-time numeric parameters keep
   disabled and fixed-hardware variants on the same source path without adding
   runtime state.
+- Ported OxiFOC's reference-current dq decoupling and permanent-magnet back-EMF
+  feedforward before the circular voltage limit. The compile-time motor model
+  uses the recovered 39 uH phase inductance, 12.2 mWb flux linkage, and
+  0.16 A/current-count scale with the active signed electrical speed and live
+  bus-voltage conversion.
 
 Reason: the loaded 0.1.8 run reproduced a top-speed cutoff and proved that an
 IWDG reset followed a `PwmOutput` safety loss, with neither an exception nor a
@@ -30,6 +35,11 @@ consequence. The inverter also loses a current-direction-dependent fraction of
 each PWM period to its configured dead time. Applying OxiFOC's compensation in
 the modulation path removes that repeatable voltage error from the PI loops
 without changing the voltage reported to the observer.
+Reference-current decoupling removes the predictable speed-dependent d-axis
+and q-axis voltage disturbances before they consume PI authority. Keeping the
+feedforward inside the voltage circle, but outside the PI anti-windup charge,
+preserves OxiFOC's saturation and recovery behavior while targeting the loaded
+run's remaining d leakage and high-speed current-tracking error.
 
 ## 0.1.8 - 2026-08-18
 

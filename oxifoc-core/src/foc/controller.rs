@@ -9,10 +9,81 @@ use super::svpwm::{SvpwmTickModulator, TickModulator};
 use super::transforms::{clarke, inverse_park, park};
 use super::trig::{CordicSinCos, SinCos};
 
+/// Compile-time motor model used for reference-current dq decoupling and
+/// permanent-magnet back-EMF feedforward.
+pub trait DecouplingModel<N: Scalar> {
+    fn feedforward(electrical_rpm: i32, target: Dq<N>, volts_per_pwm_tick: N) -> Dq<N>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDecoupling;
+
+impl<N: Scalar> DecouplingModel<N> for NoDecoupling {
+    #[inline]
+    fn feedforward(_electrical_rpm: i32, _target: Dq<N>, _volts_per_pwm_tick: N) -> Dq<N> {
+        Dq::new(N::ZERO, N::ZERO)
+    }
+}
+
+/// Fixed-point motor model. Inductance parameters are pre-combined with the
+/// current-sense scale as Q16.16 mWb per ADC count; flux is Q16.16 mWb.
+pub struct FixedDecoupling<
+    const LD_FLUX_PER_COUNT_BITS: i32,
+    const LQ_FLUX_PER_COUNT_BITS: i32,
+    const FLUX_LINKAGE_MWB_BITS: i32,
+>;
+
+impl<
+    const LD_FLUX_PER_COUNT_BITS: i32,
+    const LQ_FLUX_PER_COUNT_BITS: i32,
+    const FLUX_LINKAGE_MWB_BITS: i32,
+> DecouplingModel<Fixed>
+    for FixedDecoupling<LD_FLUX_PER_COUNT_BITS, LQ_FLUX_PER_COUNT_BITS, FLUX_LINKAGE_MWB_BITS>
+{
+    #[inline]
+    fn feedforward(electrical_rpm: i32, target: Dq<Fixed>, volts_per_pwm_tick: Fixed) -> Dq<Fixed> {
+        let volts_per_tick_bits = volts_per_pwm_tick.to_bits();
+        // 512 Q16.16 V/tick corresponds to 17.6 V across a 2,250-tick PWM
+        // period, well below this controller's undervoltage cutoff. It also
+        // bounds every whole-tick feedforward result inside Q16.16.
+        if electrical_rpm == 0 || volts_per_tick_bits < 512 {
+            return Dq::default();
+        }
+
+        // The motor driver constrains current references before this point;
+        // the phase source likewise supplies a plausibility-limited speed.
+        let direct_counts = target.d.to_bits() >> 16;
+        let quadrature_counts = target.q.to_bits() >> 16;
+
+        // 6863 is 2*pi/60 in Q16.16. Combining it at compile time with each
+        // Q16.16 mWb motor parameter yields a Q8 tick numerator. Feedforward
+        // is resolved to whole timer ticks because that is the actuator's
+        // finest output; the current references used by this loop are whole
+        // ADC counts as well.
+        let ld_scale_q8 =
+            ((6_863_i64 * i64::from(LD_FLUX_PER_COUNT_BITS) + 128_000) / 256_000) as i32;
+        let lq_scale_q8 =
+            ((6_863_i64 * i64::from(LQ_FLUX_PER_COUNT_BITS) + 128_000) / 256_000) as i32;
+        let flux_scale_q8 =
+            ((6_863_i64 * i64::from(FLUX_LINKAGE_MWB_BITS) + 128_000) / 256_000) as i32;
+        let inductive_ticks = |counts: i32, scale_q8: i32| {
+            electrical_rpm * counts * scale_q8 / volts_per_tick_bits / 256
+        };
+        let direct_ticks = inductive_ticks(quadrature_counts, lq_scale_q8).saturating_neg();
+        let quadrature_ticks = inductive_ticks(direct_counts, ld_scale_q8)
+            + electrical_rpm * flux_scale_q8 / volts_per_tick_bits / 256;
+        Dq::new(
+            Fixed::from_bits(direct_ticks << 16),
+            Fixed::from_bits(quadrature_ticks << 16),
+        )
+    }
+}
+
 pub struct FocController<
     N: Scalar = Fixed,
     T: SinCos<N> = CordicSinCos,
     M: TickModulator<N> = SvpwmTickModulator,
+    D: DecouplingModel<N> = NoDecoupling,
     const DEAD_TIME_NUMERATOR: i32 = 0,
     const DEAD_TIME_DENOMINATOR: i32 = 1,
 > {
@@ -25,26 +96,29 @@ pub struct FocController<
     measured_stationary: AlphaBeta<N>,
     voltage_limited: bool,
     actuation_advance: N,
-    backend: PhantomData<(T, M)>,
+    backend: PhantomData<(T, M, D)>,
 }
 
 pub type FixedFocController<
     const DEAD_TIME_NUMERATOR: i32 = 0,
     const DEAD_TIME_DENOMINATOR: i32 = 1,
+    D = NoDecoupling,
 > = FocController<
     Fixed,
     CordicSinCos,
     SvpwmTickModulator,
+    D,
     DEAD_TIME_NUMERATOR,
     DEAD_TIME_DENOMINATOR,
 >;
 
-impl<N, T, M, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
-    FocController<N, T, M, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
+impl<N, T, M, D, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
+    FocController<N, T, M, D, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
 where
     N: Scalar,
     T: SinCos<N>,
     M: TickModulator<N>,
+    D: DecouplingModel<N>,
 {
     pub const fn new(
         direct: PIController<N>,
@@ -153,6 +227,30 @@ where
         voltage_injection: Dq<N>,
         pwm_neutral: u16,
     ) -> (Dq<N>, PwmDuty) {
+        self.step_with_velocity_and_injection(
+            phase_a,
+            phase_b,
+            electrical_angle,
+            0,
+            target,
+            voltage_injection,
+            N::ONE,
+            pwm_neutral,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_velocity_and_injection(
+        &mut self,
+        phase_a: N,
+        phase_b: N,
+        electrical_angle: T::Angle,
+        electrical_rpm: i32,
+        target: Dq<N>,
+        voltage_injection: Dq<N>,
+        volts_per_pwm_tick: N,
+        pwm_neutral: u16,
+    ) -> (Dq<N>, PwmDuty) {
         let (sin, cos) = T::sin_cos(electrical_angle);
         let (alpha, beta) = clarke(phase_a, phase_b);
         self.measured_stationary = AlphaBeta { alpha, beta };
@@ -160,9 +258,10 @@ where
         let measured = Dq::new(measured_d, measured_q);
         let direct_update = self.direct.prepare_update(target.d, measured.d);
         let quadrature_update = self.quadrature.prepare_update(target.q, measured.q);
+        let feedforward = D::feedforward(electrical_rpm, target, volts_per_pwm_tick);
         let requested = Dq::new(
-            direct_update.raw_output + voltage_injection.d,
-            quadrature_update.raw_output + voltage_injection.q,
+            direct_update.raw_output + feedforward.d + voltage_injection.d,
+            quadrature_update.raw_output + feedforward.q + voltage_injection.q,
         );
         let (applied_d, applied_q, voltage_scale) =
             N::limit_vector(requested.d, requested.q, self.vector_limit_ticks);
@@ -405,6 +504,57 @@ mod tests {
         assert_eq!(compensated.applied_stationary(), plain.applied_stationary());
         assert_ne!(compensated_duty, plain_duty);
         assert_eq!(compensated.dead_time_comp_ticks(), Fixed::from_integer(9));
+    }
+
+    #[test]
+    fn fixed_decoupling_matches_the_reference_current_speed_voltage_terms() {
+        type Motor = FixedDecoupling<409, 409, 799_539>;
+        let volts_per_tick = Fixed::ratio(523, 22_500);
+        let forward = Motor::feedforward(
+            6_000,
+            Dq::new(Fixed::ZERO, Fixed::from_integer(838)),
+            volts_per_tick,
+        );
+        assert!((-143..=-140).contains(&forward.d.integer()));
+        assert!((328..=331).contains(&forward.q.integer()));
+
+        let reverse = Motor::feedforward(
+            -6_000,
+            Dq::new(Fixed::ZERO, Fixed::from_integer(-838)),
+            volts_per_tick,
+        );
+        assert!((-143..=-140).contains(&reverse.d.integer()));
+        assert!((-331..=-328).contains(&reverse.q.integer()));
+    }
+
+    struct SaturatingFeedforward;
+
+    impl DecouplingModel<Fixed> for SaturatingFeedforward {
+        fn feedforward(_electrical_rpm: i32, _target: Dq<Fixed>, _volts_per_tick: Fixed) -> Dq {
+            Dq::new(Fixed::from_integer(100), Fixed::ZERO)
+        }
+    }
+
+    #[test]
+    fn feedforward_is_inside_the_circle_but_outside_pi_anti_windup() {
+        type Controller =
+            FocController<Fixed, CordicSinCos, SvpwmTickModulator, SaturatingFeedforward>;
+        let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
+        let mut controller = Controller::new(pi, pi, Fixed::from_integer(50), 100);
+        let _ = controller.step_with_velocity_and_injection(
+            Fixed::ZERO,
+            Fixed::ZERO,
+            0,
+            1_000,
+            Dq::default(),
+            Dq::default(),
+            Fixed::ONE,
+            100,
+        );
+
+        assert!(controller.voltage_limited());
+        assert_eq!(controller.applied_voltage().d.integer(), 50);
+        assert_eq!(controller.direct.integral(), Fixed::ZERO);
     }
 
     #[cfg(feature = "algorithms")]

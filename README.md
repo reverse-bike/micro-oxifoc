@@ -32,8 +32,8 @@ oxifoc-f103 control ISR
 └── oxifoc-core::motor::foc_driver::FocDriver<PhaseManager<HallSensor>>
     ├── CurrentLimits + filtered q modulation
     │   └── current circle → DC-bus clamp → measured dq trip
-    ├── FocController<Fixed, CordicSinCos>
-    │   └── transforms → PIController → voltage circle → SVPWM
+    ├── FocController<Fixed, CordicSinCos, SvpwmTickModulator, RideDecoupling>
+    │   └── transforms → PIController + dq feedforward → voltage circle → SVPWM
     └── PhaseManager → PhaseProvider → HallSensor
 ```
 
@@ -48,7 +48,7 @@ graph TD
     PhaseManager["<b>PhaseManager&lt;H&gt;</b><br/>source ownership · selection"] --> PhaseProvider
     PhaseProvider["<b>PhaseProvider</b><br/>estimate · injection · update"] --> HallSensor
     CurrentLimits["<b>CurrentLimits</b><br/>dq target circle · supply limits · trip threshold"]
-    FocController["<b>FocController&lt;N,T,M&gt;</b><br/>Clarke · Park · PI · inverse Park"] --> PIController
+    FocController["<b>FocController&lt;N,T,M,D&gt;</b><br/>Clarke · Park · PI · dq feedforward · inverse Park"] --> PIController
     FocController --> SinCos["<b>SinCos</b><br/>Q0.32 turns → Q16.16 sin/cos"]
     FocController --> SVPWM
 ```
