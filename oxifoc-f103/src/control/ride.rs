@@ -181,6 +181,9 @@ impl RideController {
             return Command::OFF;
         }
 
+        let startup_progress = observation
+            .hall_progress
+            .wrapping_sub(run.starting_hall_progress);
         if observation.hall_sequence != run.last_hall_sequence {
             let first_edge = matches!(run.stage, Stage::AwaitingFirstEdge);
             run.last_hall_sequence = observation.hall_sequence;
@@ -193,10 +196,7 @@ impl RideController {
                 run.stage = Stage::StartupTracking;
             }
             if matches!(run.stage, Stage::StartupTracking)
-                && observation
-                    .hall_progress
-                    .wrapping_sub(run.starting_hall_progress)
-                    >= STARTUP_FORWARD_TRANSITIONS
+                && startup_progress >= STARTUP_FORWARD_TRANSITIONS
             {
                 run.stage = Stage::Tracking;
             }
@@ -208,8 +208,11 @@ impl RideController {
                     || deadline_reached(observation.now_ms, run.startup_deadline_ms)
             }
             Stage::StartupTracking => {
-                deadline_reached(observation.now_ms, run.hall_deadline_ms)
-                    || deadline_reached(observation.now_ms, run.startup_deadline_ms)
+                // Reversing a rolling wheel necessarily has a no-edge interval at zero speed.
+                // The absolute startup deadline bounds that interval until forward recovery.
+                deadline_reached(observation.now_ms, run.startup_deadline_ms)
+                    || (startup_progress >= 0
+                        && deadline_reached(observation.now_ms, run.hall_deadline_ms))
             }
             Stage::Tracking | Stage::Coasting => {
                 deadline_reached(observation.now_ms, run.hall_deadline_ms)
@@ -446,6 +449,60 @@ mod tests {
         first_edge_overdue.hall_sequence = 1;
         first_edge_overdue.hall_progress = 1;
         assert_eq!(controller.update(first_edge_overdue), Command::OFF);
+    }
+
+    #[test]
+    fn reverse_roll_start_keeps_authority_until_forward_progress_resumes() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+
+        let mut reverse_edge = observation(100, FULL_ADC);
+        reverse_edge.hall_sequence = 1;
+        reverse_edge.hall_progress = -1;
+        assert_eq!(
+            controller.update(reverse_edge).stage,
+            Stage::StartupTracking
+        );
+
+        let mut turning_around = observation(601, FULL_ADC);
+        turning_around.hall_sequence = 1;
+        turning_around.hall_progress = -1;
+        assert_eq!(
+            controller.update(turning_around).stage,
+            Stage::StartupTracking
+        );
+
+        let mut recovered_start = observation(700, FULL_ADC);
+        recovered_start.hall_sequence = 2;
+        recovered_start.hall_progress = 0;
+        recovered_start.hall_interval_us = 50_000;
+        assert_eq!(
+            controller.update(recovered_start).stage,
+            Stage::StartupTracking
+        );
+
+        let mut forward_edge_overdue = observation(801, FULL_ADC);
+        forward_edge_overdue.hall_sequence = 2;
+        forward_edge_overdue.hall_progress = 0;
+        assert_eq!(controller.update(forward_edge_overdue), Command::OFF);
+    }
+
+    #[test]
+    fn reverse_roll_start_still_obeys_the_absolute_startup_deadline() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        controller.update(observation(1, FULL_ADC));
+
+        let mut reverse_edge = observation(100, FULL_ADC);
+        reverse_edge.hall_sequence = 1;
+        reverse_edge.hall_progress = -1;
+        assert!(controller.update(reverse_edge).energize);
+
+        let mut startup_overdue = observation(2_001, FULL_ADC);
+        startup_overdue.hall_sequence = 1;
+        startup_overdue.hall_progress = -1;
+        assert_eq!(controller.update(startup_overdue), Command::OFF);
     }
 
     #[test]

@@ -6,6 +6,31 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.16 - 2026-08-19
+
+Changes:
+
+- Kept ride authority active while signed Hall progress remains behind its
+  startup position, allowing forward torque to decelerate a backward-rolling
+  wheel through the unavoidable no-edge interval at zero speed. The existing
+  two-second absolute startup deadline still bounds the maneuver, and the
+  dynamic Hall-edge deadline resumes as soon as progress recovers to zero.
+- Raised the projected DC-side ride-current limit from 390 to 400 counts,
+  nominally 40 A in the phase-derived projection and approximately 41 A at the
+  BMS using the previously observed three-percent projection error.
+
+Reason: rider validation of 0.1.15 found the 390-count limit conservative and
+reproduced a throttle cutoff when the bike was rolling backward. No telemetry
+was captured for that ride; inspection of the deterministic ride policy showed
+that the first valid backward edge entered startup tracking, then the ordinary
+100--500 ms Hall deadline expired while torque naturally slowed the wheel
+through zero. The Hall sensor already represents signed progress and safely
+handles adjacent reversals, so retaining authority only while that progress is
+negative restores the expected maneuver without weakening invalid-state,
+transition-rate, current, fault, or absolute-startup protections. FOC,
+observer, Hall geometry, crossover thresholds, and telemetry schema remain
+unchanged.
+
 ## 0.1.15 - 2026-08-19
 
 Changes:

@@ -61,7 +61,7 @@ pub const OBSERVER_BLEND_LOW_ERPM: i32 = 3_000;
 pub const OBSERVER_BLEND_HIGH_ERPM: i32 = 6_000;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 838;
-pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 390;
+pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 400;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn ride_current_envelope_matches_the_pack_safe_configuration() {
         assert_eq!(RIDE_PHASE_CURRENT_LIMIT_COUNTS, 838);
-        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 390);
+        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 400);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
             i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
@@ -261,7 +261,7 @@ mod tests {
         );
         assert_eq!(
             i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
-            39_000
+            40_000
         );
         assert!(
             u32::from(PHASE_CURRENT_TRIP_COUNTS) * 5

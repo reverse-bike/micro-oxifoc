@@ -159,13 +159,16 @@ Forward torque is negative q. Demand increases by four current counts per
 millisecond and reductions apply immediately. The ride ceiling is 838 phase-
 current counts (83.8 A at the loaded-run fit of 100 mA/count), including during
 the two-second startup window. Startup requires its first Hall edge within 500
-ms and twelve net-forward Hall transitions. The software phase-current guard
-trips above 1,344 counts (134.4 A) on A, B, or reconstructed C, preserving at
-least the established 1.6-times margin over commanded phase current. The local
-39 V undervoltage debounce and controller/motor thermal envelopes can only
-reduce the 390-count DC-side limit. This is nominally 39 A in the phase-derived
-projection and approximately 40 A at the BMS. The current limiter applies a
-circular `Id/Iq` command envelope,
+ms and twelve net-forward Hall transitions. While measured startup progress is
+negative, the absolute two-second deadline allows the wheel to decelerate
+through the no-edge interval at zero speed; the ordinary edge deadline resumes
+as soon as progress recovers to the starting position. The software phase-
+current guard trips above 1,344 counts (134.4 A) on A, B, or reconstructed C,
+preserving at least the established 1.6-times margin over commanded phase
+current. The local 39 V undervoltage debounce and controller/motor thermal
+envelopes can only reduce the 400-count DC-side limit. This is nominally 40 A
+in the phase-derived projection and approximately 41 A at the BMS. The current
+limiter applies a circular `Id/Iq` command envelope,
 then derives the DC-side clamp from a 2 ms low-pass of q-axis modulation using
 `Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
 and each reconstructed physical phase have independent overcurrent checks. The
@@ -226,7 +229,7 @@ application's conservative 4 KiB runtime RAM region.
 
 On page 9, byte 1 remains a saturated one-byte current-limit value for older
 tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
-recover the full effective DC limit (390 when it is not being derated).
+recover the full effective DC limit (400 when it is not being derated).
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -296,4 +299,6 @@ terminal model and unifies the firmware on its ride-validated nominal
 100 mA/current-count conversion. Schema 10 adds live Hall speed and the PLL
 acquisition-gate state for the next loaded validation. Version 0.1.15 restores
 the original low-speed Hall-sector-center and direction-reversal behavior and
-sets the projected DC-side limit to 390 counts.
+sets the projected DC-side limit to 390 counts. Version 0.1.16 keeps ride
+authority through a measured backward startup while retaining the absolute
+startup deadline, and raises the projected DC-side limit to 400 counts.
