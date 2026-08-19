@@ -236,6 +236,12 @@ pub fn service(
                 protocol::ControlTimingBreakdownTelemetry {
                     maximum_pre_driver_cycles: control.maximum_pre_driver_cycles,
                     maximum_driver_step_cycles: control.maximum_driver_step_cycles,
+                    // Valid Hall intervals are at least 100 us, so quarter-eRPM
+                    // resolution covers the complete accepted speed range.
+                    hall_electrical_rpm_div4: (control.electrical_rpm >> 2) as i16,
+                    observer_acquisition_flags: protocol::observer_acquisition_flags(
+                        control.observer_phase_error_q16,
+                    ),
                 },
             ),
             14 | 15 => {

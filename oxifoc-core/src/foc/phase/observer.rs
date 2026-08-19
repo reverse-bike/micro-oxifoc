@@ -3,7 +3,7 @@
 //! [`BackEmfObserver`] is OxiFOC's MXLEMMING-style flux integrator and PLL,
 //! expressed in the fixed-point units used by the F103 control loop. Voltage
 //! and current inputs remain physical volts and amps; flux is represented in
-//! milliwebers so the 39 uH motor inductance retains useful Q16.16 precision.
+//! milliwebers so sub-0.1 mH motor inductance retains useful Q16.16 precision.
 //! The observer runs at the current-loop rate and is selected by
 //! [`super::PhaseManager`], including Hall-to-observer crossover policy.
 

@@ -1,6 +1,6 @@
 [package]
 name = "oxifoc-f103"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 publish = false
 description = "26,200-byte Hall/back-EMF CAN FOC firmware for STM32F103"

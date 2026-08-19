@@ -57,10 +57,11 @@ minor version; bug fixes bump the patch version. Validation-only builds do not
 bump the version. Page 18 of project telemetry reports the crate version
 embedded in the running image so ride logs remain attributable.
 
-Recovered firmware is used only to establish hardware and motor constants:
-pin assignments, peripheral timing, sensor conversions, Hall geometry, and
-the reviewed electrical envelope. Current regulation, limiting, estimation,
-and modulation follow OxiFOC's control architecture.
+Recovered firmware establishes the hardware map, peripheral timing, Hall
+geometry, and reviewed electrical envelope. Ride telemetry supplies the
+effective loaded motor model where the recovered constants and physical sensor
+scale are ambiguous. Current regulation, limiting, estimation, and modulation
+follow OxiFOC's control architecture.
 
 The shared controller applies OxiFOC's current-sign dead-time compensation
 after inverse Park and actuation-frame advance, immediately before SVPWM. The
@@ -71,14 +72,15 @@ voltage track that command for the observer.
 
 The shared controller retains OxiFOC's compile-time reference-current dq
 decoupling and permanent-magnet back-EMF feedforward strategy. Its fixed model
-combines the recovered 39 uH phase inductance with the 0.16 A/current-count
-conversion and uses the 12.2 mWb flux linkage, signed electrical speed, and
-live bus-voltage scale. The STM32F103 ride specialization currently selects
-`NoDecoupling`: reference-current feedforward is not valid once its request
-exceeds the voltage circle, and this firmware does not yet implement field
-weakening or another voltage-feasibility policy. Retained peak-|d| telemetry
-keeps the pre-limit request, feedforward contribution, and applied voltage
-separate for a future minor-version experiment.
+uses one nominal 100 mA/current-count conversion throughout the F103 firmware
+and the loaded terminal fit of 43 mOhm effective phase resistance, 75 uH
+effective phase inductance, and 13.4 mWb flux linkage. The STM32F103 ride
+specialization currently selects `NoDecoupling`: reference-current feedforward
+is not valid once its request exceeds the voltage circle, and this firmware
+does not yet implement field weakening or another voltage-feasibility policy.
+Retained peak-|d| telemetry keeps the pre-limit request, feedforward
+contribution, and applied voltage separate for a future minor-version
+experiment.
 
 `PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
 observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
@@ -110,8 +112,9 @@ but are rejected until their providers are installed.
 - DWT measures every 16 kHz control pass. Page 6 of `0x2F7` reports the maximum
   and warning count; a pass over 4,500 cycles latches output off. Page 21
   retains separate maxima for TIM1 entry through phase selection and the FOC
-  driver step. Subtracting both from page 6's whole-handler maximum bounds the
-  remaining output-publication cost.
+  driver step, plus signed Hall electrical speed at 4 eRPM/count and the
+  observer PLL acquisition-gate state. Subtracting both timing fields from
+  page 6's whole-handler maximum bounds the remaining output-publication cost.
 - WWDG requires TIM1 interrupt progress, while IWDG normally requires both
   control-cycle and injected-ADC progress. Once a fault is latched and all
   motor channels are verified disabled, TIM1 progress alone keeps IWDG alive
@@ -197,17 +200,22 @@ Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 9 and the crate version. Page 21 reports retained pre-driver phase-path
-and driver-step timing maxima. Pages 22 and 23 report the RCC reset cause and,
-after a watchdog reset, the retained fatal class, last control checkpoint,
-whole-handler timing, cycle number, exception detail, and low address words of
-the stacked PC/LR. The complete PC is recoverable because this application is
-confined to `0x08003800..0x08009E57`. Pages 24 and 25 preserve the exact PWM
-failure predicate, fault and condition state (including RCC clock-security
-status), TIM1 status/output registers, and attempted compares. They report the
-first failure of the latest fault episode during the same boot or after a
-watchdog reset. Reset/crash and PWM-failure pages have independent slots, so
-all four are always emitted. The project-page scheduler advances through all
+schema 10 and the crate version. Page 21 reports retained pre-driver phase-path
+and driver-step timing maxima, signed Hall speed at 4 eRPM/count, and observer
+acquisition flags. Bit 0 is set while the filtered internal PLL error is at or
+above the unchanged 0.2-radian acquisition threshold; the remaining bits are
+reserved. Page 19 supplies readiness, confidence, and observer eRPM, while
+page 20 supplies the full PLL error and external-validity progress.
+Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
+retained fatal class, last control checkpoint, whole-handler timing, cycle
+number, exception detail, and low address words of the stacked PC/LR. The
+complete PC is recoverable because this application is confined to
+`0x08003800..0x08009E57`. Pages 24 and 25 preserve the exact PWM failure
+predicate, fault and condition state (including RCC clock-security status),
+TIM1 status/output registers, and attempted compares. They report the first
+failure of the latest fault episode during the same boot or after a watchdog
+reset. Reset/crash and PWM-failure pages have independent slots, so all four
+are always emitted. The project-page scheduler advances through all
 nineteen slots without a wraparound phase discontinuity.
 The 56-byte retained record is linked at `0x20004F00`: above the recovered
 bootloader's `0x200000DC..0x20000CF7` zero-fill/stack range and outside the
@@ -280,4 +288,7 @@ faults into a persistent safe-off state, rearms only from local throttle rest
 with inactive BKIN, and reports reset and first-failure context independently
 on schema 9. Version 0.1.13 gives every acknowledged break fresh maximum-|d|
 ownership and removes avoidable recovery-path timing work without changing the
-control strategy or wire layout.
+control strategy or wire layout. Version 0.1.14 corrects the observer's loaded
+terminal model and unifies the firmware on its ride-validated nominal
+100 mA/current-count conversion. Schema 10 adds live Hall speed and the PLL
+acquisition-gate state for the next loaded validation.

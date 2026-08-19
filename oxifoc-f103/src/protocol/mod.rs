@@ -117,7 +117,9 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 18 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 9;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 10;
+pub const OBSERVER_ACQUIRE_BLOCK_PLL_ERROR: u8 = 1 << 0;
+pub const OBSERVER_ACQUIRE_MAX_PLL_ERROR_Q16: u16 = 2_086;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -280,6 +282,12 @@ pub struct ObserverModelTelemetry {
 pub struct ControlTimingBreakdownTelemetry {
     pub maximum_pre_driver_cycles: u16,
     pub maximum_driver_step_cycles: u16,
+    pub hall_electrical_rpm_div4: i16,
+    pub observer_acquisition_flags: u8,
+}
+
+pub fn observer_acquisition_flags(phase_error_q16: u16) -> u8 {
+    u8::from(phase_error_q16 >= OBSERVER_ACQUIRE_MAX_PLL_ERROR_Q16)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -610,11 +618,14 @@ pub fn observer_model_telemetry(snapshot: ObserverModelTelemetry) -> Frame {
 }
 
 /// Page 21 separates TIM1 entry through phase selection from the FOC driver
-/// step. Together with page 6's whole-handler maximum, these fields expose the
-/// residual post-driver cost without instrumenting another hot-path boundary.
+/// step, Hall speed at 4 eRPM/count, and observer acquisition state. Bit zero
+/// marks the quantized 0.2-radian PLL-error gate; the remaining flag bits are
+/// reserved. Together with page 6's whole-handler maximum, the timing fields
+/// expose the residual post-driver cost without another hot-path boundary.
 pub fn control_timing_breakdown_telemetry(snapshot: ControlTimingBreakdownTelemetry) -> Frame {
     let pre_driver = snapshot.maximum_pre_driver_cycles.to_le_bytes();
     let driver = snapshot.maximum_driver_step_cycles.to_le_bytes();
+    let hall_rpm = snapshot.hall_electrical_rpm_div4.to_le_bytes();
     Frame::new(
         0x2f7,
         8,
@@ -624,9 +635,9 @@ pub fn control_timing_breakdown_telemetry(snapshot: ControlTimingBreakdownTeleme
             pre_driver[1],
             driver[0],
             driver[1],
-            0,
-            0,
-            0,
+            hall_rpm[0],
+            hall_rpm[1],
+            snapshot.observer_acquisition_flags,
         ],
     )
 }
@@ -718,6 +729,12 @@ pub fn firmware_version_telemetry() -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_acquisition_flags_track_the_quantized_pll_gate() {
+        assert_eq!(observer_acquisition_flags(2_085), 0);
+        assert_eq!(observer_acquisition_flags(2_086), 1);
+    }
 
     #[test]
     fn updater_magic_requires_exact_prefix_and_minimum_length() {
@@ -991,13 +1008,15 @@ mod tests {
             control_timing_breakdown_telemetry(ControlTimingBreakdownTelemetry {
                 maximum_pre_driver_cycles: 321,
                 maximum_driver_step_cycles: 2_345,
+                hall_electrical_rpm_div4: -3_250,
+                observer_acquisition_flags: OBSERVER_ACQUIRE_BLOCK_PLL_ERROR,
             })
             .data,
-            [21, 0x41, 0x01, 0x29, 0x09, 0, 0, 0]
+            [21, 0x41, 0x01, 0x29, 0x09, 0x4e, 0xf3, 1]
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 9, b'0', b'.', b'1', b'.', b'1', b'3']
+            [18, 10, b'0', b'.', b'1', b'.', b'1', b'4']
         );
     }
 

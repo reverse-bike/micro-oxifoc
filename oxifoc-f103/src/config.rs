@@ -42,17 +42,21 @@ pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
     -1,
 );
 
-// Fitted from controller dq current against BMS battery current during the
-// loaded ride; it is used for reporting and configuring the DC-side envelope.
-pub const CURRENT_MA_PER_COUNT: i32 = 100;
-// The observer model uses the calibrated analog-front-end conversion rather
-// than the battery-current fit used by ride policy and telemetry above.
-pub const PHASE_CURRENT_AMPS_PER_ADC_COUNT: Fixed = Fixed::ratio(4, 25);
-pub const MOTOR_PHASE_RESISTANCE_OHMS: Fixed = Fixed::ratio(884, 10_000);
-pub const MOTOR_PHASE_INDUCTANCE_MILLIHENRIES: Fixed = Fixed::ratio(39, 1_000);
-pub const MOTOR_FLUX_LINKAGE_MILLIWEBERS: Fixed = Fixed::ratio(122, 10);
-// 39 uH * 0.16 A/count = 0.00624 mWb/count, rounded to Q16.16.
-pub const MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS: i32 = 409;
+// Loaded terminal power balance gives approximately 94--100 mA per phase-ADC
+// count. Inverter losses bias that estimate upward, so 100 mA/count remains a
+// nominal conversion; the protection and current-loop envelopes stay in the
+// directly observed ADC-count domain.
+pub const PHASE_CURRENT_MA_PER_ADC_COUNT: i32 = 100;
+pub const PHASE_CURRENT_AMPS_PER_ADC_COUNT: Fixed =
+    Fixed::ratio(PHASE_CURRENT_MA_PER_ADC_COUNT, 1_000);
+// Effective loaded terminal model. These values reproduce 4.3 mV/count of
+// resistive drop and 7.5 uH*A/count of inductive flux in the observer's input
+// domain without claiming an independently measured winding R or L.
+pub const MOTOR_PHASE_RESISTANCE_OHMS: Fixed = Fixed::ratio(43, 1_000);
+pub const MOTOR_PHASE_INDUCTANCE_MILLIHENRIES: Fixed = Fixed::ratio(75, 1_000);
+pub const MOTOR_FLUX_LINKAGE_MILLIWEBERS: Fixed = Fixed::ratio(134, 10);
+// 75 uH * 0.10 A/count = 0.0075 mWb/count, rounded to Q16.16.
+pub const MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS: i32 = 492;
 pub const OBSERVER_BLEND_LOW_ERPM: i32 = 3_000;
 pub const OBSERVER_BLEND_HIGH_ERPM: i32 = 6_000;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
@@ -252,16 +256,39 @@ mod tests {
         assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 480);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
-            i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
+            i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
             83_800
         );
         assert_eq!(
-            i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * CURRENT_MA_PER_COUNT,
+            i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
             48_000
         );
         assert!(
             u32::from(PHASE_CURRENT_TRIP_COUNTS) * 5
                 >= u32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * 8
+        );
+    }
+
+    #[test]
+    fn observer_model_uses_the_loaded_terminal_fit_in_the_adc_count_domain() {
+        assert_eq!(PHASE_CURRENT_MA_PER_ADC_COUNT, 100);
+        assert_eq!(PHASE_CURRENT_AMPS_PER_ADC_COUNT, Fixed::ratio(1, 10));
+        assert_eq!(MOTOR_PHASE_RESISTANCE_OHMS, Fixed::ratio(43, 1_000));
+        assert_eq!(MOTOR_PHASE_INDUCTANCE_MILLIHENRIES, Fixed::ratio(75, 1_000));
+        assert_eq!(MOTOR_FLUX_LINKAGE_MILLIWEBERS, Fixed::ratio(134, 10));
+        assert_eq!(MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS, 492);
+
+        let resistive_volts_per_count =
+            MOTOR_PHASE_RESISTANCE_OHMS * PHASE_CURRENT_AMPS_PER_ADC_COUNT;
+        assert!(
+            (resistive_volts_per_count.to_bits() - Fixed::ratio(43, 10_000).to_bits()).abs() <= 2
+        );
+        let inductive_flux_mwb_per_count =
+            MOTOR_PHASE_INDUCTANCE_MILLIHENRIES * PHASE_CURRENT_AMPS_PER_ADC_COUNT;
+        assert!(
+            (inductive_flux_mwb_per_count.to_bits() - MOTOR_INDUCTIVE_FLUX_MWB_PER_COUNT_BITS)
+                .abs()
+                <= 1
         );
     }
 

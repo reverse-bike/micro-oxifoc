@@ -6,6 +6,40 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.14 - 2026-08-19
+
+Changes:
+
+- Unified phase-current conversion, DC-side projection, reporting, and the
+  observer on one nominal 100 mA/ADC-count scale. Current regulation and all
+  protection thresholds remain in their existing ADC-count domain.
+- Replaced the observer model with the loaded terminal fit: 43 mOhm effective
+  phase resistance, 75 uH effective phase inductance, and 13.4 mWb flux
+  linkage. This preserves the measured 4.3 mV/current-count resistive term and
+  7.5 uH*A/current-count inductive term.
+- Extended page 21 with signed Hall electrical speed at 4 eRPM/count and the
+  internal PLL acquisition-gate state. Existing pages 19 and 20 retain
+  readiness, confidence, observer speed, full PLL error, and external-validity
+  travel. Project telemetry advances to schema 10.
+
+Reason: four loaded ride logs put the motor's steady terminal behavior at
+approximately 4.3 mV/current-count of resistive drop, while the observer was
+configured for 14.1 mV/current-count. In the Hall-to-observer band this made
+the modeled resistive subtraction overwhelm back-EMF under load, collapse the
+flux estimate, and repeatedly lose readiness with large Hall disagreement and
+d-axis current before hardware BKIN breaks. Independent DC power balance gives
+approximately 94--100 mA per phase-current count; 160 mA/count would make the
+reported motor-terminal power exceed BMS input power by roughly 60 percent at
+full throttle. The preceding high-speed pull was Hall-driven after the
+observer lost readiness, so it did not validate observer-only operation under
+load. Hall geometry, crossover thresholds, the 0.2-radian acquisition gate,
+and current-count limits are deliberately unchanged for this isolated model
+correction. The flag byte reports the PLL acquisition threshold in the same
+quantized units already carried by page 20; it does not participate in observer
+readiness decisions. The other acquisition conditions remain derivable from
+pages 19 and 20 without duplicating their comparisons in the size-constrained
+firmware.
+
 ## 0.1.13 - 2026-08-19
 
 Changes:
