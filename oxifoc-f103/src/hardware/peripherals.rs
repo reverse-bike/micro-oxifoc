@@ -6,7 +6,10 @@
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use oxifoc_core::foc::PwmDuty;
 use stm32f1::stm32f103::interrupt;
+
+use crate::safety::{PwmFailureContext, pwm_failure_cause as pwm_cause, pwm_pin_flag as pwm_pin};
 
 const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const RCC_APB2RSTR: *mut u32 = 0x4002_100c as *mut u32;
@@ -476,7 +479,7 @@ pub fn start_tim1_control_loop() {
         write_volatile(TIM1_SR, 0);
         write_volatile(TIM1_DIER, 1 | (1 << 7));
         set_interrupt_priority(24, 0);
-        set_interrupt_priority(25, 0x10);
+        set_interrupt_priority(25, 0);
         cortex_m::peripheral::NVIC::unmask(stm32f1::stm32f103::Interrupt::TIM1_UP);
         cortex_m::peripheral::NVIC::unmask(stm32f1::stm32f103::Interrupt::TIM1_BRK);
         write_volatile(
@@ -492,16 +495,19 @@ pub fn enable_motor_outputs() -> bool {
     // SAFETY: duty preloads and Hall angle are established by the control ISR
     // before it reaches this function. BKIN can clear MOE asynchronously.
     if break_input_active() {
+        retain_current_pwm_failure(pwm_cause::BREAK_ACTIVE);
         latch_fault(FAULT_HARDWARE_BREAK);
         return false;
     }
     if fault_flags() != 0 {
+        retain_current_pwm_failure(pwm_cause::FAULT_LATCHED);
         emergency_shutdown();
         return false;
     }
     // The gate-driver control is established once during passive setup so it
     // has settled before the first ride request.
     if unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0 {
+        retain_current_pwm_failure(pwm_cause::POWER_STAGE_DISABLED);
         return false;
     }
     unsafe {
@@ -509,11 +515,16 @@ pub fn enable_motor_outputs() -> bool {
             && read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE != 0
             && read_volatile(GPIOA_ODR) & PA2_SET == 0
         {
-            return fault_flags() == 0 && !break_input_active();
+            let enabled = fault_flags() == 0 && !break_input_active();
+            if !enabled {
+                retain_current_pwm_failure(pwm_cause::POST_ENABLE);
+            }
+            return enabled;
         }
         configure_active_motor_pins();
     }
     if fault_flags() != 0 || break_input_active() {
+        retain_current_pwm_failure(pwm_cause::POST_PIN_CONFIGURATION);
         emergency_shutdown();
         return false;
     }
@@ -540,11 +551,55 @@ pub fn enable_motor_outputs() -> bool {
                 && read_volatile(GPIOA_ODR) & PA2_SET == 0
         }
     });
-    if !enabled || fault_flags() != 0 || break_input_active() {
+    let post_enable_failure = fault_flags() != 0 || break_input_active();
+    if !enabled || post_enable_failure {
+        retain_current_pwm_failure(if enabled {
+            pwm_cause::POST_ENABLE
+        } else {
+            pwm_cause::ENABLE_READBACK
+        });
         emergency_shutdown();
         return false;
     }
     true
+}
+
+#[inline(never)]
+fn current_pwm_duty() -> PwmDuty {
+    // SAFETY: read-only inspection of the three TIM1 compare preloads.
+    unsafe {
+        PwmDuty {
+            a: read_volatile(TIM1_CCR1) as u16,
+            b: read_volatile(TIM1_CCR2) as u16,
+            c: read_volatile(TIM1_CCR3) as u16,
+        }
+    }
+}
+
+#[inline(never)]
+fn retain_current_pwm_failure(cause: u8) {
+    retain_pwm_failure(cause, current_pwm_duty());
+}
+
+#[inline(never)]
+fn retain_pwm_failure(cause: u8, duty: PwmDuty) {
+    let break_active = break_input_active();
+    let power_stage_disabled = unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0;
+    // SAFETY: read-only inspection of TIM1 state at the exact rejected output
+    // operation. All retained fields are intentionally narrowed to the
+    // register widths implemented by STM32F103 TIM1.
+    unsafe {
+        crate::safety::record_pwm_failure(PwmFailureContext::new(
+            cause,
+            fault_flags() as u8,
+            (u8::from(break_active) * pwm_pin::BREAK_ACTIVE)
+                | (u8::from(power_stage_disabled) * pwm_pin::POWER_STAGE_DISABLED),
+            read_volatile(TIM1_SR) as u16,
+            read_volatile(TIM1_BDTR) as u16,
+            read_volatile(TIM1_CCER) as u16,
+            duty.as_array(),
+        ));
+    }
 }
 
 #[inline]
@@ -618,6 +673,7 @@ pub fn configure_can_interrupt_priority() {
 
 #[interrupt]
 fn TIM1_BRK() {
+    retain_current_pwm_failure(pwm_cause::BREAK_ACTIVE);
     latch_fault(FAULT_HARDWARE_BREAK);
     // SAFETY: rc_w0 clear of BIF; disable repeat interrupts after latching off.
     unsafe {
@@ -639,12 +695,13 @@ pub fn tim1_counting_down() -> bool {
 }
 
 #[inline]
-pub fn write_pwm_duties(duty: oxifoc_core::foc::PwmDuty) -> bool {
+pub fn write_pwm_duties(duty: PwmDuty) -> bool {
     let neutral = crate::config::PWM_NEUTRAL;
     if [duty.a, duty.b, duty.c].into_iter().any(|compare| {
         compare > crate::config::PWM_ARR
             || compare.abs_diff(neutral) > crate::config::FOC_HARD_PHASE_LIMIT_TICKS
     }) {
+        retain_pwm_failure(pwm_cause::COMPARE_RANGE, duty);
         latch_fault(FAULT_PWM_RANGE);
         return false;
     }
@@ -661,7 +718,7 @@ pub fn write_pwm_duties(duty: oxifoc_core::foc::PwmDuty) -> bool {
 
 #[inline]
 pub fn write_pwm_neutral() {
-    let _ = write_pwm_duties(oxifoc_core::foc::PwmDuty {
+    let _ = write_pwm_duties(PwmDuty {
         a: crate::config::PWM_NEUTRAL,
         b: crate::config::PWM_NEUTRAL,
         c: crate::config::PWM_NEUTRAL,

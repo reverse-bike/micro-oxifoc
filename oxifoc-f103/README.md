@@ -154,7 +154,7 @@ on PA13. The application provides:
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
   including local brake, wheel speed/distance, temperatures, and fault pages;
 - updater reset on `0x67F#AA552A002A...`;
-- commissioning pages 6 and 8--23 on `0x2F7`.
+- commissioning pages 6 and 8--25 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
@@ -169,14 +169,18 @@ different peaks. Page 12 also retains the specific cause of the latest safety
 loss. Pages 19 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 6 and the crate version. Page 21 reports retained pre-driver phase-path
+schema 7 and the crate version. Page 21 reports retained pre-driver phase-path
 and driver-step timing maxima. Pages 22 and 23 report the RCC reset cause and,
 after a watchdog reset, the retained fatal class, last control checkpoint,
 whole-handler timing, cycle number, exception detail, and low address words of
 the stacked PC/LR. The complete PC is recoverable because this application is
-confined to `0x08003800..0x08009E57`. The project-page scheduler advances
-through all seventeen pages without a wraparound phase discontinuity.
-The 40-byte retained record is linked at `0x20004F00`: above the recovered
+confined to `0x08003800..0x08009E57`. Pages 24 and 25 preserve the exact PWM
+failure predicate, fault and pin state, TIM1 status/output registers, and
+attempted compares across a watchdog reset. They occupy the reset-forensics
+slots only when a PWM failure was retained; otherwise those slots remain pages
+22 and 23. The project-page scheduler advances through all seventeen slots
+without a wraparound phase discontinuity.
+The 56-byte retained record is linked at `0x20004F00`: above the recovered
 bootloader's `0x200000DC..0x20000CF7` zero-fill/stack range and outside the
 application's conservative 4 KiB runtime RAM region.
 
@@ -227,6 +231,10 @@ schema-5 timing boundary around the complete pre-driver phase path. Its loaded
 capture held the observer through 56.3 km/h and felt good, but reached 4,334
 cycles, accumulated 2,509 warning passes, and restarted once without a power
 cycle. Version 0.1.8 retains reset/crash context across watchdog resets and
-removes read-modify-write diagnostic atomics from the control interrupt. A
-loaded 0.1.8 capture confirming both the reset cause and recovered timing
-margin is the next commissioning gate.
+removes read-modify-write diagnostic atomics from the control interrupt. Its
+loaded capture reduced timing warnings to 117 and held the whole-handler
+maximum to 4,259 cycles, but reproduced one top-speed cutoff. The retained
+record proved an IWDG reset followed a `PwmOutput` safety loss without an
+exception or timing overrun. Version 0.1.9 extends that record with the exact
+output predicate and TIM1 state so another event can identify the initiating
+hardware condition.

@@ -53,6 +53,22 @@ pub mod checkpoint {
     pub const COMPLETE: u8 = 6;
 }
 
+pub mod pwm_failure_cause {
+    pub const NONE: u8 = 0;
+    pub const COMPARE_RANGE: u8 = 1;
+    pub const BREAK_ACTIVE: u8 = 2;
+    pub const FAULT_LATCHED: u8 = 3;
+    pub const POWER_STAGE_DISABLED: u8 = 4;
+    pub const POST_PIN_CONFIGURATION: u8 = 5;
+    pub const ENABLE_READBACK: u8 = 6;
+    pub const POST_ENABLE: u8 = 7;
+}
+
+pub mod pwm_pin_flag {
+    pub const BREAK_ACTIVE: u8 = 1;
+    pub const POWER_STAGE_DISABLED: u8 = 1 << 1;
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BootDiagnostics {
     pub reset_flags: u8,
@@ -65,6 +81,64 @@ pub struct BootDiagnostics {
     pub maximum_control_cycles: u32,
     pub program_counter: u32,
     pub link_register: u32,
+    pub pwm_failure: PwmFailureContext,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PwmFailureContext {
+    words: [u32; 4],
+}
+
+impl PwmFailureContext {
+    pub const EMPTY: Self = Self { words: [0; 4] };
+
+    pub fn new(
+        cause: u8,
+        fault_flags: u8,
+        pin_flags: u8,
+        timer_status: u16,
+        timer_bdtr: u16,
+        timer_ccer: u16,
+        compares: [u16; 3],
+    ) -> Self {
+        Self {
+            words: [
+                u32::from_le_bytes([cause, fault_flags, pin_flags, 0]),
+                u32::from(timer_status) | (u32::from(timer_bdtr) << 16),
+                u32::from(timer_ccer) | (u32::from(compares[0]) << 16),
+                u32::from(compares[1]) | (u32::from(compares[2]) << 16),
+            ],
+        }
+    }
+
+    pub const fn cause(self) -> u8 {
+        self.words[0] as u8
+    }
+
+    pub const fn words(self) -> [u32; 4] {
+        self.words
+    }
+
+    #[cfg(test)]
+    fn decoded(self) -> (u8, u8, u8, u16, u16, u16, [u16; 3]) {
+        let header = self.words[0].to_le_bytes();
+        let timer = self.words[1].to_le_bytes();
+        let ccer_a = self.words[2].to_le_bytes();
+        let b_c = self.words[3].to_le_bytes();
+        (
+            header[0],
+            header[1],
+            header[2],
+            u16::from_le_bytes([timer[0], timer[1]]),
+            u16::from_le_bytes([timer[2], timer[3]]),
+            u16::from_le_bytes([ccer_a[0], ccer_a[1]]),
+            [
+                u16::from_le_bytes([ccer_a[2], ccer_a[3]]),
+                u16::from_le_bytes([b_c[0], b_c[1]]),
+                u16::from_le_bytes([b_c[2], b_c[3]]),
+            ],
+        )
+    }
 }
 
 #[repr(C)]
@@ -81,6 +155,7 @@ struct RetainedContext {
     maximum_control_cycles: u32,
     program_counter: u32,
     link_register: u32,
+    pwm_failure: PwmFailureContext,
 }
 
 #[cfg(any(feature = "firmware", test))]
@@ -97,6 +172,7 @@ impl RetainedContext {
             maximum_control_cycles: 0,
             program_counter: 0,
             link_register: 0,
+            pwm_failure: PwmFailureContext::EMPTY,
         }
     }
 
@@ -132,6 +208,7 @@ fn boot_diagnostics(raw_reset_flags: u32, retained: RetainedContext) -> BootDiag
             maximum_control_cycles: retained.maximum_control_cycles,
             program_counter: retained.program_counter,
             link_register: retained.link_register,
+            pwm_failure: retained.pwm_failure,
         }
     } else {
         BootDiagnostics {
@@ -213,6 +290,14 @@ static BOOT_MAXIMUM_CONTROL_CYCLES: AtomicU32 = AtomicU32::new(0);
 static BOOT_PROGRAM_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "firmware")]
 static BOOT_LINK_REGISTER: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "firmware")]
+static BOOT_PWM_FAILURE_0: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "firmware")]
+static BOOT_PWM_FAILURE_1: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "firmware")]
+static BOOT_PWM_FAILURE_2: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "firmware")]
+static BOOT_PWM_FAILURE_3: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(feature = "firmware")]
 #[unsafe(link_section = ".retained.reset_forensics")]
@@ -249,6 +334,11 @@ pub fn capture_boot_diagnostics() {
     BOOT_MAXIMUM_CONTROL_CYCLES.store(diagnostics.maximum_control_cycles, Ordering::Relaxed);
     BOOT_PROGRAM_COUNTER.store(diagnostics.program_counter, Ordering::Relaxed);
     BOOT_LINK_REGISTER.store(diagnostics.link_register, Ordering::Relaxed);
+    let pwm_failure = diagnostics.pwm_failure.words();
+    BOOT_PWM_FAILURE_0.store(pwm_failure[0], Ordering::Relaxed);
+    BOOT_PWM_FAILURE_1.store(pwm_failure[1], Ordering::Relaxed);
+    BOOT_PWM_FAILURE_2.store(pwm_failure[2], Ordering::Relaxed);
+    BOOT_PWM_FAILURE_3.store(pwm_failure[3], Ordering::Relaxed);
 }
 
 #[cfg(feature = "firmware")]
@@ -266,6 +356,14 @@ pub fn boot_diagnostics_snapshot() -> BootDiagnostics {
         maximum_control_cycles: BOOT_MAXIMUM_CONTROL_CYCLES.load(Ordering::Relaxed),
         program_counter: BOOT_PROGRAM_COUNTER.load(Ordering::Relaxed),
         link_register: BOOT_LINK_REGISTER.load(Ordering::Relaxed),
+        pwm_failure: PwmFailureContext {
+            words: [
+                BOOT_PWM_FAILURE_0.load(Ordering::Relaxed),
+                BOOT_PWM_FAILURE_1.load(Ordering::Relaxed),
+                BOOT_PWM_FAILURE_2.load(Ordering::Relaxed),
+                BOOT_PWM_FAILURE_3.load(Ordering::Relaxed),
+            ],
+        },
     }
 }
 
@@ -323,6 +421,21 @@ pub fn record_safety_loss(reason: u8) {
             core::ptr::addr_of_mut!((*retained_context_ptr()).detail),
             i32::from(reason),
         );
+    }
+}
+
+#[cfg(feature = "firmware")]
+pub fn record_pwm_failure(context: PwmFailureContext) {
+    // SAFETY: TIM1_UP and TIM1_BRK run at the same priority and cannot preempt
+    // one another. The four aligned words preserve the exact failure snapshot
+    // for the watchdog reset that follows a latched PWM or break fault.
+    let words = context.words();
+    unsafe {
+        let destination = core::ptr::addr_of_mut!((*retained_context_ptr()).pwm_failure).cast();
+        write_volatile(destination, words[0]);
+        write_volatile(destination.add(1), words[1]);
+        write_volatile(destination.add(2), words[2]);
+        write_volatile(destination.add(3), words[3]);
     }
 }
 
@@ -480,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn pwm_failure_context_has_a_lossless_four_word_retained_form() {
+        let context =
+            PwmFailureContext::new(6, 0x0b, 3, 0x0081, 0x9d19, 0x1ddd, [22, 1_125, 2_228]);
+        assert_eq!(
+            context.decoded(),
+            (6, 0x0b, 3, 0x0081, 0x9d19, 0x1ddd, [22, 1_125, 2_228])
+        );
+        assert_eq!(core::mem::size_of::<RetainedContext>(), 56);
+    }
+
+    #[test]
     fn valid_context_is_reported_only_after_a_watchdog_reset() {
         let retained = RetainedContext {
             fatal_reason: u32::from(fatal_reason::HARD_FAULT),
@@ -490,6 +614,15 @@ mod tests {
             maximum_control_cycles: 4_498,
             program_counter: 0x0800_9abc,
             link_register: 0xffff_fff9,
+            pwm_failure: PwmFailureContext::new(
+                6,
+                1,
+                3,
+                0x0081,
+                0x9d19,
+                0x1ddd,
+                [22, 1_125, 2_228],
+            ),
             ..RetainedContext::active()
         };
         let watchdog = boot_diagnostics(RCC_RESET_INDEPENDENT_WATCHDOG, retained);
@@ -498,10 +631,15 @@ mod tests {
         assert_eq!(watchdog.checkpoint, checkpoint::DRIVER_COMPLETE);
         assert_eq!(watchdog.control_cycle, 0x1234_5678);
         assert_eq!(watchdog.program_counter, 0x0800_9abc);
+        assert_eq!(
+            watchdog.pwm_failure,
+            PwmFailureContext::new(6, 1, 3, 0x0081, 0x9d19, 0x1ddd, [22, 1_125, 2_228],)
+        );
 
         let power = boot_diagnostics(RCC_RESET_POWER, retained);
         assert!(!power.retained_context_valid);
         assert_eq!(power.fatal_reason, fatal_reason::NONE);
+        assert_eq!(power.pwm_failure, PwmFailureContext::default());
     }
 
     #[test]

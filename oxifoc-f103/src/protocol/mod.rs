@@ -117,7 +117,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 16 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 6;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 7;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -683,6 +683,26 @@ pub fn crash_context_telemetry(snapshot: CrashContextTelemetry) -> Frame {
     )
 }
 
+/// Pages 24 and 25 preserve the exact rejected output state across a watchdog
+/// reset. Page 24 carries the predicate and relevant TIM1 state; page 25
+/// carries all three attempted compares.
+pub fn pwm_failure_telemetry(page: u8, words: [u32; 4]) -> Frame {
+    let header = words[0].to_le_bytes();
+    let timer = words[1].to_le_bytes();
+    let ccer_a = words[2].to_le_bytes();
+    let b_c = words[3].to_le_bytes();
+    let data = if page == 24 {
+        [
+            24, header[0], header[1], header[2], timer[0], timer[3], ccer_a[0], ccer_a[1],
+        ]
+    } else {
+        [
+            25, header[0], ccer_a[2], ccer_a[3], b_c[0], b_c[1], b_c[2], b_c[3],
+        ]
+    };
+    Frame::new(0x2f7, 8, data)
+}
+
 /// Page 18 identifies the exact crate version and project telemetry schema in
 /// ride logs without changing the stock identity responses.
 pub fn firmware_version_telemetry() -> Frame {
@@ -757,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn project_telemetry_rotates_through_all_seventeen_pages() {
+    fn project_telemetry_rotates_through_all_seventeen_slots() {
         let mut page = 0;
         let mut visits = [0_u8; 17];
         for _ in 0..170 {
@@ -979,7 +999,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 6, b'0', b'.', b'1', b'.', b'8', 0]
+            [18, 7, b'0', b'.', b'1', b'.', b'9', 0]
         );
     }
 
@@ -1006,6 +1026,21 @@ mod tests {
             })
             .data,
             [23, 0xfd, 0x78, 0x56, 0xbc, 0x9a, 0xf9, 0xff]
+        );
+
+        let pwm = [
+            u32::from_le_bytes([6, 0x0b, 3, 0]),
+            u32::from(0x0081_u16) | (u32::from(0x9d19_u16) << 16),
+            u32::from(0x1ddd_u16) | (u32::from(22_u16) << 16),
+            u32::from(1_125_u16) | (u32::from(2_228_u16) << 16),
+        ];
+        assert_eq!(
+            pwm_failure_telemetry(24, pwm).data,
+            [24, 6, 0x0b, 3, 0x81, 0x9d, 0xdd, 0x1d]
+        );
+        assert_eq!(
+            pwm_failure_telemetry(25, pwm).data,
+            [25, 6, 22, 0, 0x65, 0x04, 0xb4, 0x08]
         );
     }
 }

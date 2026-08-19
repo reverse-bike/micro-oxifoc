@@ -5,6 +5,23 @@ every real `flash-f103 --yes` invocation, bump the crate version and add an
 entry here. Validation builds and rebuilding an unchanged image do not create a
 new version.
 
+## 0.1.9 - 2026-08-18
+
+Changes:
+
+- Extended the watchdog-retained safety record with the exact PWM failure
+  cause, fault and pin predicates, TIM1 status/output registers, and all three
+  attempted compares. Pages 24 and 25 expose the record after reboot, and the
+  project telemetry schema advances to 7.
+
+Reason: the loaded 0.1.8 run reproduced a top-speed cutoff and proved that an
+IWDG reset followed a `PwmOutput` safety loss, with neither an exception nor a
+control-loop overrun. The earlier record could not distinguish a transient
+BKIN assertion, disabled PA2, compare rejection, or failed TIM1 output-enable
+readback. Capturing the failed predicate before shutdown makes another event
+identify the initiating hardware condition instead of only its watchdog
+consequence.
+
 ## 0.1.8 - 2026-08-18
 
 Changes:

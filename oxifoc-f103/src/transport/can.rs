@@ -237,26 +237,32 @@ pub fn service(
                     maximum_driver_step_cycles: control.maximum_driver_step_cycles,
                 },
             ),
-            14 => {
+            14 | 15 => {
                 let reset = safety::boot_diagnostics_snapshot();
-                protocol::reset_summary_telemetry(protocol::ResetSummaryTelemetry {
-                    reset_flags: reset.reset_flags,
-                    retained_context_valid: reset.retained_context_valid,
-                    fatal_reason: reset.fatal_reason,
-                    checkpoint: reset.checkpoint,
-                    last_control_cycles: reset.last_control_cycles.min(u32::from(u16::MAX)) as u16,
-                    maximum_control_cycles: reset.maximum_control_cycles.min(u32::from(u16::MAX))
-                        as u16,
-                })
-            }
-            15 => {
-                let reset = safety::boot_diagnostics_snapshot();
-                protocol::crash_context_telemetry(protocol::CrashContextTelemetry {
-                    detail: reset.detail,
-                    control_cycle: reset.control_cycle,
-                    program_counter: reset.program_counter,
-                    link_register: reset.link_register,
-                })
+                if reset.pwm_failure.cause() != safety::pwm_failure_cause::NONE {
+                    let failure = reset.pwm_failure;
+                    protocol::pwm_failure_telemetry(page + 10, failure.words())
+                } else if page == 14 {
+                    protocol::reset_summary_telemetry(protocol::ResetSummaryTelemetry {
+                        reset_flags: reset.reset_flags,
+                        retained_context_valid: reset.retained_context_valid,
+                        fatal_reason: reset.fatal_reason,
+                        checkpoint: reset.checkpoint,
+                        last_control_cycles: reset.last_control_cycles.min(u32::from(u16::MAX))
+                            as u16,
+                        maximum_control_cycles: reset
+                            .maximum_control_cycles
+                            .min(u32::from(u16::MAX))
+                            as u16,
+                    })
+                } else {
+                    protocol::crash_context_telemetry(protocol::CrashContextTelemetry {
+                        detail: reset.detail,
+                        control_cycle: reset.control_cycle,
+                        program_counter: reset.program_counter,
+                        link_register: reset.link_register,
+                    })
+                }
             }
             _ => protocol::firmware_version_telemetry(),
         };
