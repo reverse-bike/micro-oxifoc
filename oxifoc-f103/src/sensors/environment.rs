@@ -203,15 +203,15 @@ mod tests {
     fn missing_local_sensor_data_removes_drive_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
         assert_eq!(monitor.update(0, RawLocalSensors::default()), None);
-        assert_eq!(monitor.update(50, nominal()), Some(480));
+        assert_eq!(monitor.update(50, nominal()), Some(390));
     }
 
     #[test]
     fn local_temperatures_derate_to_zero() {
-        assert_eq!(thermal_limit_counts(700, 700, 800), 480);
-        assert_eq!(thermal_limit_counts(750, 700, 800), 240);
+        assert_eq!(thermal_limit_counts(700, 700, 800), 390);
+        assert_eq!(thermal_limit_counts(750, 700, 800), 195);
         assert_eq!(thermal_limit_counts(800, 700, 800), 0);
-        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 240);
+        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 195);
 
         let mut monitor = EnvironmentMonitor::new(0);
         let mut hot = nominal();
@@ -235,7 +235,7 @@ mod tests {
         for sample in 20..40 {
             assert_eq!(monitor.update(sample * 50, nominal()), Some(0));
         }
-        assert_eq!(monitor.update(40 * 50, nominal()), Some(480));
+        assert_eq!(monitor.update(40 * 50, nominal()), Some(390));
         assert_eq!(monitor.derating_reasons(), 0);
     }
 

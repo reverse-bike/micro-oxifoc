@@ -103,9 +103,11 @@ but are rejected until their providers are installed.
 - TIM2 captures both polarities of the remapped XOR Hall input at 1 MHz. Ride
   control uses the hardware-validated stock boundary table
   `[5699, 16526, 26499, 37754, 49151, 59124]`. The later occupancy-derived
-  candidate was rejected by hardware testing and is not used. Above 500 eRPM,
-  boundary corrections are rate-limited to 1.5 times the measured per-cycle
-  angle travel rather than being applied as a single transform-frame jump.
+  candidate was rejected by hardware testing and is not used. Below 500 eRPM,
+  commutation snaps to the calibrated center of the live Hall sector; above
+  that threshold, boundary corrections are rate-limited to 1.5 times the
+  measured per-cycle angle travel rather than being applied as a single
+  transform-frame jump.
 - TIM3 captures the PB4 wheel input. Its qualified speed and volatile distance
   feed stock CAN telemetry; its independent quiet state is required for an
   updater reset.
@@ -161,8 +163,9 @@ ms and twelve net-forward Hall transitions. The software phase-current guard
 trips above 1,344 counts (134.4 A) on A, B, or reconstructed C, preserving at
 least the established 1.6-times margin over commanded phase current. The local
 39 V undervoltage debounce and controller/motor thermal envelopes can only
-reduce the 480-count DC-side limit. This is nominally 48 A at the loaded-run
-current fit. The current limiter applies a circular `Id/Iq` command envelope,
+reduce the 390-count DC-side limit. This is nominally 39 A in the phase-derived
+projection and approximately 40 A at the BMS. The current limiter applies a
+circular `Id/Iq` command envelope,
 then derives the DC-side clamp from a 2 ms low-pass of q-axis modulation using
 `Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
 and each reconstructed physical phase have independent overcurrent checks. The
@@ -223,7 +226,7 @@ application's conservative 4 KiB runtime RAM region.
 
 On page 9, byte 1 remains a saturated one-byte current-limit value for older
 tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
-recover the full effective DC limit (480 when it is not being derated).
+recover the full effective DC limit (390 when it is not being derated).
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -291,4 +294,6 @@ ownership and removes avoidable recovery-path timing work without changing the
 control strategy or wire layout. Version 0.1.14 corrects the observer's loaded
 terminal model and unifies the firmware on its ride-validated nominal
 100 mA/current-count conversion. Schema 10 adds live Hall speed and the PLL
-acquisition-gate state for the next loaded validation.
+acquisition-gate state for the next loaded validation. Version 0.1.15 restores
+the original low-speed Hall-sector-center and direction-reversal behavior and
+sets the projected DC-side limit to 390 counts.

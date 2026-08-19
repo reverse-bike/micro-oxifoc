@@ -6,6 +6,39 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.15 - 2026-08-19
+
+Changes:
+
+- Restored OxiFOC's low-speed Hall behavior in the fixed-point sensor: below
+  500 eRPM, without a complete interval, or after the edge-derived speed has
+  decayed below the threshold, commutation uses the calibrated sector center.
+  A genuinely moving high-speed estimate retains the existing eight-sector
+  stale cutoff and ready-observer fallback.
+- Made an adjacent first Hall edge opposite the direction remembered at ride
+  entry establish a fresh center-to-boundary interval instead of invalidating
+  the sensor. Invalid Hall states, skipped states, and sub-100-us transitions
+  remain fail-closed.
+- Reduced the projected DC-side ride-current limit from 480 to 390 counts,
+  targeting approximately 40 A at the BMS while retaining the 838-count phase
+  circle and 1,344-count measured-current trip.
+
+Reason: the 0.1.14 ride validated the corrected observer model through full
+blend at approximately 17,000 eRPM and 49 A without a BKIN break, but exposed
+two independent limits. At high speed the battery output disconnected after
+8.5 seconds continuously above 45 A; controller Vbus collapsed and the next
+boot reported a power reset without a controller fault. The phase-derived DC
+projection under-reported BMS current by about three percent, so 390 counts is
+the corresponding conservative 40 A target. At creep speed, retained events
+showed a backward Hall edge followed by a stale phase estimate and large
+d-current. The tagged original OxiFOC snaps to the Hall-sector center below
+500 eRPM and explicitly tolerates direction reversal, whereas the fixed-point
+port merely disabled its rate limiter while continuing to use the crossed
+boundary and rejected one ride-entry reversal case. Restoring those semantics
+bounds low-speed angle error without weakening the existing raw-state,
+transition, edge-rate, or ride-timeout safety checks. Hall geometry, observer
+parameters, crossover thresholds, and telemetry schema remain unchanged.
+
 ## 0.1.14 - 2026-08-19
 
 Changes:

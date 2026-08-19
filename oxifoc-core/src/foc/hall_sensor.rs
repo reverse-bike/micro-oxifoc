@@ -7,6 +7,7 @@ use crate::foc::trig::Turns;
 const MIN_EDGE_INTERVAL_US: u32 = 100;
 const STALE_SECTOR_MULTIPLE: u32 = 8;
 const RATE_LIMIT_MIN_ERPM: u32 = 500;
+const Q16_TURN_UNITS: u32 = 1 << 16;
 const HALF_MICROSECOND_NS: u32 = 500;
 const TAU_NUMERATOR: u32 = 710;
 const TAU_DENOMINATOR: u32 = 113;
@@ -140,7 +141,7 @@ pub enum HallError {
 pub struct HallSensor {
     geometry: &'static HallGeometry,
     raw: u8,
-    base_angle_q16: u16,
+    sector_boundary_q16: u16,
     measured_width_q16: u16,
     entered_width_q16: u16,
     entered_duration_us: u32,
@@ -160,7 +161,7 @@ impl HallSensor {
         Self {
             geometry,
             raw: 0,
-            base_angle_q16: 0,
+            sector_boundary_q16: 0,
             measured_width_q16: 0,
             entered_width_q16: 0,
             entered_duration_us: 0,
@@ -181,15 +182,16 @@ impl HallSensor {
             self.valid = false;
             return Err(HallError::InvalidState);
         };
+        let center_q16 = sector.boundary_q16.wrapping_add(sector.width_q16 / 2);
         self.raw = raw;
-        self.base_angle_q16 = sector.boundary_q16.wrapping_add(sector.width_q16 / 2);
+        self.sector_boundary_q16 = sector.boundary_q16;
         self.measured_width_q16 = sector.width_q16;
         self.entered_width_q16 = sector.width_q16;
         self.entered_duration_us = 0;
         self.measured_interval_us = 0;
         self.direction = 0;
         self.next_interval_since_run_start = false;
-        self.rate_limited_angle = u32::from(self.base_angle_q16) << 16;
+        self.rate_limited_angle = u32::from(center_q16) << 16;
         self.unlimited_angle = self.rate_limited_angle;
         self.control_step_q16 = 0;
         self.actuation_advance = Fixed::ZERO;
@@ -220,7 +222,6 @@ impl HallSensor {
             self.valid = false;
             return Err(HallError::InvalidState);
         };
-        let previous_angle_q16 = self.base_angle_q16;
         let previous_width = previous_sector.width_q16;
         let previous_direction = self.direction;
         let interval_since_run_start = self.next_interval_since_run_start;
@@ -243,11 +244,14 @@ impl HallSensor {
         let (measured_interval_us, measured_width_q16) = if interval_since_run_start {
             if previous_direction == direction && self.measured_interval_us != 0 {
                 (self.measured_interval_us, self.measured_width_q16)
-            } else if previous_direction == 0 {
+            } else {
+                let previous_center_q16 = previous_sector
+                    .boundary_q16
+                    .wrapping_add(previous_sector.width_q16 / 2);
                 let partial_width = if direction < 0 {
-                    previous_angle_q16.wrapping_sub(boundary_q16)
+                    previous_center_q16.wrapping_sub(boundary_q16)
                 } else {
-                    boundary_q16.wrapping_sub(previous_angle_q16)
+                    boundary_q16.wrapping_sub(previous_center_q16)
                 };
                 if partial_width == 0 {
                     self.valid = false;
@@ -255,9 +259,6 @@ impl HallSensor {
                 }
                 let equivalent = scale_interval(interval_us, previous_width, partial_width);
                 (equivalent, previous_width)
-            } else {
-                self.valid = false;
-                return Err(HallError::InvalidTransition);
             }
         } else {
             (interval_us, previous_width)
@@ -270,7 +271,7 @@ impl HallSensor {
         }
 
         self.raw = raw;
-        self.base_angle_q16 = boundary_q16;
+        self.sector_boundary_q16 = entered_sector.boundary_q16;
         self.measured_width_q16 = measured_width_q16;
         self.entered_width_q16 = entered_sector.width_q16;
         if previous_direction == 0 && !interval_since_run_start {
@@ -294,10 +295,18 @@ impl HallSensor {
         if !self.valid {
             return None;
         }
-        if self.direction == 0 || self.entered_duration_us == 0 {
-            return Some(u32::from(self.base_angle_q16) << 16);
+        let center_q16 = self
+            .sector_boundary_q16
+            .wrapping_add(self.entered_width_q16 / 2);
+        let center = u32::from(center_q16) << 16;
+        if self.entered_duration_us == 0 {
+            return Some(center);
         }
 
+        let center_snap_after_us = self.center_snap_after_us();
+        if self.entered_duration_us > center_snap_after_us {
+            return Some(center);
+        }
         let elapsed = edge_age_us;
         if elapsed
             > self
@@ -306,15 +315,20 @@ impl HallSensor {
         {
             return None;
         }
+        if elapsed > center_snap_after_us {
+            return Some(center);
+        }
         let scale_shift = (32 - self.entered_duration_us.leading_zeros()).saturating_sub(16);
         let scaled_elapsed = elapsed.min(self.entered_duration_us) >> scale_shift;
         let scaled_sector = self.entered_duration_us >> scale_shift;
         let fraction_q16 = (scaled_elapsed << 16) / scaled_sector.max(1);
         let advance_q16 = ((u32::from(self.entered_width_q16) * fraction_q16) >> 16) as u16;
         let angle_q16 = if self.direction < 0 {
-            self.base_angle_q16.wrapping_sub(advance_q16)
+            self.sector_boundary_q16
+                .wrapping_add(self.entered_width_q16)
+                .wrapping_sub(advance_q16)
         } else {
-            self.base_angle_q16.wrapping_add(advance_q16)
+            self.sector_boundary_q16.wrapping_add(advance_q16)
         };
         Some(u32::from(angle_q16) << 16)
     }
@@ -385,16 +399,38 @@ impl HallSensor {
     }
 
     pub const fn is_stationary(&self) -> bool {
-        self.direction == 0 || self.measured_interval_us == 0
+        self.measured_interval_us == 0
     }
 
     fn electrical_rpm_magnitude(&self) -> i32 {
-        if self.direction == 0 || self.measured_interval_us == 0 {
+        if self.measured_interval_us == 0 {
             return 0;
         }
-        let rpm_q8 =
-            u32::from(self.measured_width_q16).saturating_mul(234_375) / self.measured_interval_us;
-        (rpm_q8 / 256).min(i32::MAX as u32) as i32
+        sector_erpm(self.measured_width_q16, self.measured_interval_us)
+    }
+
+    fn angle_electrical_rpm_at(&self, edge_age_us: u32) -> i32 {
+        let magnitude = if self.measured_interval_us == 0 {
+            0
+        } else if edge_age_us <= self.entered_duration_us {
+            self.electrical_rpm_magnitude()
+        } else {
+            sector_erpm(self.entered_width_q16, edge_age_us)
+        };
+        if self.direction < 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+
+    fn center_snap_after_us(&self) -> u32 {
+        // A Q0.16 sector takes width * 60e6 / (65536 * eRPM) microseconds.
+        // Divide numerator and denominator by 64 so every possible sector
+        // width remains inside the Cortex-M3's native 32-bit arithmetic.
+        let numerator_per_width = 60_000_000 / RATE_LIMIT_MIN_ERPM / 64;
+        u32::from(self.entered_width_q16).saturating_mul(numerator_per_width)
+            / (Q16_TURN_UNITS / 64)
     }
 }
 
@@ -414,6 +450,11 @@ fn scale_interval(interval: u32, numerator: u16, denominator: u16) -> u32 {
         .saturating_add(remainder * numerator / denominator)
 }
 
+fn sector_erpm(width_q16: u16, interval_us: u32) -> i32 {
+    let rpm_q8 = u32::from(width_q16).saturating_mul(234_375) / interval_us.max(1);
+    (rpm_q8 / 256).min(i32::MAX as u32) as i32
+}
+
 impl PhaseProvider<Fixed> for HallSensor {
     type Angle = Turns;
 
@@ -425,7 +466,7 @@ impl PhaseProvider<Fixed> for HallSensor {
         self.angle(elapsed_since_edge_us)
             .map(|angle| PhaseEstimate {
                 angle,
-                electrical_rpm: self.angle_electrical_rpm(),
+                electrical_rpm: self.angle_electrical_rpm_at(elapsed_since_edge_us),
                 trustworthy: self.is_valid(),
             })
     }
@@ -440,8 +481,8 @@ impl PhaseProvider<Fixed> for HallSensor {
         }
         let target = self.angle(elapsed_since_edge_us)?;
         self.unlimited_angle = target;
-        let electrical_rpm = self.angle_electrical_rpm();
-        if electrical_rpm.unsigned_abs() < RATE_LIMIT_MIN_ERPM || self.measured_interval_us == 0 {
+        let electrical_rpm = self.angle_electrical_rpm_at(elapsed_since_edge_us);
+        if electrical_rpm.unsigned_abs() < RATE_LIMIT_MIN_ERPM {
             self.rate_limited_angle = target;
         } else {
             let maximum_step = self.maximum_control_step().clamp(1, i32::MAX as u32) as i32;
@@ -460,7 +501,7 @@ impl PhaseProvider<Fixed> for HallSensor {
 impl HallSensor {
     fn refresh_control_rate(&mut self, control_period_ns: u32) {
         self.control_period_ns = control_period_ns;
-        if self.direction == 0 || self.measured_interval_us == 0 || control_period_ns == 0 {
+        if self.measured_interval_us == 0 || control_period_ns == 0 {
             self.control_step_q16 = 0;
             self.actuation_advance = Fixed::ZERO;
             return;
@@ -617,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn low_speed_control_estimate_preserves_the_unlimited_angle() {
+    fn low_speed_control_estimate_snaps_to_the_calibrated_sector_center() {
         let mut hall = tracker();
         hall.seed(5).unwrap();
         hall.update_edge(4, 200_000).unwrap();
@@ -625,8 +666,42 @@ mod tests {
 
         let unlimited = hall.angle(50_000).unwrap();
         let limited = hall.estimate_for_control(50_000, 62_500).unwrap().angle;
+        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
 
+        assert_eq!(unlimited, center);
         assert_eq!(limited, unlimited);
+    }
+
+    #[test]
+    fn creep_speed_keeps_the_sector_center_after_interpolation_would_be_stale() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 200_000).unwrap();
+        hall.update_edge(6, 200_000).unwrap();
+
+        let stale_after = hall
+            .entered_duration_us()
+            .saturating_mul(STALE_SECTOR_MULTIPLE)
+            .saturating_add(1);
+        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
+
+        assert_eq!(hall.angle(stale_after), Some(center));
+    }
+
+    #[test]
+    fn a_missing_edge_decays_a_moving_estimate_to_the_sector_center() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 10_000).unwrap();
+        hall.update_edge(6, 10_000).unwrap();
+
+        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
+        let center_age = hall.entered_duration_us().saturating_mul(3);
+
+        assert_eq!(hall.angle(center_age), Some(center));
+        let estimate = hall.estimate_for_control(center_age, 62_500).unwrap();
+        assert_eq!(estimate.angle, center);
+        assert!(estimate.electrical_rpm.unsigned_abs() < RATE_LIMIT_MIN_ERPM);
     }
 
     #[test]
@@ -652,6 +727,21 @@ mod tests {
         assert!((9_900..=10_100).contains(&hall.sector_interval_us()));
         assert!((950..=1_050).contains(&hall.electrical_rpm()));
         assert!(hall.angle(5_000).unwrap() != hall.angle(0).unwrap());
+    }
+
+    #[test]
+    fn first_run_edge_accepts_an_adjacent_direction_reversal_as_a_fresh_start() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 1_000).unwrap();
+        assert_eq!(hall.angle_direction(), -1);
+        assert_eq!(hall.sector_interval_us(), 0);
+
+        hall.discard_next_interval();
+        hall.update_edge(5, 5_000).unwrap();
+
+        assert_eq!(hall.angle_direction(), 1);
+        assert!((9_900..=10_100).contains(&hall.sector_interval_us()));
     }
 
     #[test]
