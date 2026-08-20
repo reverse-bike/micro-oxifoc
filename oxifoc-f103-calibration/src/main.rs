@@ -113,6 +113,8 @@ fn main() -> ! {
             && (calibration_config::CALIBRATION_BUS_MINIMUM_MV
                 ..=calibration_config::CALIBRATION_BUS_MAXIMUM_MV)
                 .contains(&bus_voltage_mv);
+        let hall_quiet = peripherals::hall_is_quiet(500_000);
+        let motor_outputs_disabled = peripherals::motor_outputs_disabled();
         let control_snapshot = control::snapshot();
         if control_snapshot.active && !local_ready {
             control::abort(Failure::LocalInterlock);
@@ -144,8 +146,8 @@ fn main() -> ! {
                         && local_ready
                         && !snapshot.active
                         && snapshot.fault_flags == 0
-                        && peripherals::motor_outputs_disabled()
-                        && peripherals::hall_is_quiet(500_000);
+                        && motor_outputs_disabled
+                        && hall_quiet;
                     if armed {
                         arm_deadline_ms = now.wrapping_add(protocol::ARM_WINDOW_MS);
                     }
@@ -157,7 +159,7 @@ fn main() -> ! {
                         && deadline_active(now, arm_deadline_ms)
                         && received == challenge
                         && local_ready
-                        && peripherals::hall_is_quiet(500_000);
+                        && hall_quiet;
                     if start_ready {
                         let _ = control::request_resistance();
                     }
@@ -170,7 +172,7 @@ fn main() -> ! {
                         && deadline_active(now, arm_deadline_ms)
                         && received == challenge
                         && local_ready
-                        && peripherals::hall_is_quiet(500_000);
+                        && hall_quiet;
                     if start_ready {
                         let _ = control::request_inductance();
                     }
@@ -183,7 +185,7 @@ fn main() -> ! {
                         && deadline_active(now, arm_deadline_ms)
                         && received == challenge
                         && local_ready
-                        && peripherals::hall_is_quiet(500_000);
+                        && hall_quiet;
                     if start_ready {
                         let _ = control::request_flux_linkage();
                     }
@@ -196,7 +198,7 @@ fn main() -> ! {
                         && deadline_active(now, arm_deadline_ms)
                         && received == challenge
                         && local_ready
-                        && peripherals::hall_is_quiet(500_000);
+                        && hall_quiet;
                     if start_ready {
                         let _ = control::request_hall();
                     }
@@ -216,6 +218,10 @@ fn main() -> ! {
                 local_ready,
                 output_active: control.output_active,
                 voltage_limited: control.voltage_limited,
+                hall_quiet,
+                motor_outputs_disabled,
+                can_rx_fifo_overrun: transport::can::rx_fifo_overrun_seen(),
+                can_command_queue_drop: transport::can::command_queue_drop_seen(),
                 low_current_counts: control.low.current_counts,
                 low_voltage_ticks: control.low.voltage_ticks,
                 high_current_counts: control.high.current_counts,
@@ -238,7 +244,8 @@ fn main() -> ! {
                 inductance_d_nwb_per_count: control.inductance_d_nwb_per_count,
                 inductance_q_nwb_per_count: control.inductance_q_nwb_per_count,
                 residual_dead_time_uv: control.residual_dead_time_uv,
-                pulse_step_tick_bits: control.pulse_step_tick_bits,
+                pulse_step_d_ticks: control.pulse_step_d_ticks,
+                pulse_step_q_ticks: control.pulse_step_q_ticks,
                 last_pulse_di_counts: control.last_pulse_di_counts,
                 proportional_d_q16: control.proportional_d_q16,
                 proportional_q_q16: control.proportional_q_q16,
@@ -249,6 +256,7 @@ fn main() -> ! {
                 average_bemf_d_uv: control.average_bemf_d_uv,
                 average_bemf_q_uv: control.average_bemf_q_uv,
                 flux_measurement_erpm: control.flux_measurement_erpm,
+                hall_measurement_erpm: control.hall_measurement_erpm,
                 sync_minimum_percent: control.sync_minimum_percent,
                 hall_centers_q16: control.hall_centers_q16,
                 hall_valid_mask: control.hall_valid_mask,

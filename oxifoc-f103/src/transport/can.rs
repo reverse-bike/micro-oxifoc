@@ -35,6 +35,10 @@ const CAN_FFA1R: *mut u32 = (CAN_BASE + 0x214) as *mut u32;
 const CAN_FA1R: *mut u32 = (CAN_BASE + 0x21c) as *mut u32;
 const CAN_F0R1: *mut u32 = (CAN_BASE + 0x240) as *mut u32;
 const CAN_F0R2: *mut u32 = (CAN_BASE + 0x244) as *mut u32;
+#[cfg(feature = "calibration-image")]
+const CAN_F1R1: *mut u32 = (CAN_BASE + 0x248) as *mut u32;
+#[cfg(feature = "calibration-image")]
+const CAN_F1R2: *mut u32 = (CAN_BASE + 0x24c) as *mut u32;
 
 const CAN_INIT_TIMEOUT: u32 = 1_000_000;
 const CAN_BTR_250K: u32 = (0b10 << 20) | (0b111 << 16) | 11;
@@ -43,7 +47,10 @@ const CAN_RESET_ACK: u32 = 1;
 const CAN_FIFO_PENDING_INTERRUPT: u32 = 1 << 1;
 const CAN_FIFO_RELEASE: u32 = 1 << 5;
 const CAN_FIFO_OVERRUN: u32 = 1 << 4;
+#[cfg(feature = "firmware")]
 const CAN_STANDARD_DATA_FILTER_MASK: u32 = (1 << 2) | (1 << 1);
+#[cfg(feature = "calibration-image")]
+const CALIBRATION_FILTER_BANKS: u32 = 0b11;
 
 #[cfg(feature = "firmware")]
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -70,6 +77,10 @@ static RECEIVED_FRAME: ReceivedFrameCell =
     ReceivedFrameCell(UnsafeCell::new(Frame::new(0, 0, [0; 8])));
 #[cfg(feature = "calibration-image")]
 static RX_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "calibration-image")]
+static RX_FIFO_OVERRUN_SEEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "calibration-image")]
+static COMMAND_QUEUE_DROP_SEEN: AtomicBool = AtomicBool::new(false);
 
 pub fn initialize() -> bool {
     // SAFETY: one-time peripheral setup before CAN IRQ is unmasked.
@@ -95,13 +106,41 @@ pub fn initialize() -> bool {
         write_volatile(CAN_BTR, CAN_BTR_250K);
 
         write_volatile(CAN_FMR, read_volatile(CAN_FMR) | 1);
-        write_volatile(CAN_FA1R, read_volatile(CAN_FA1R) & !1);
-        write_volatile(CAN_FM1R, read_volatile(CAN_FM1R) & !1);
-        write_volatile(CAN_FS1R, read_volatile(CAN_FS1R) | 1);
-        write_volatile(CAN_FFA1R, read_volatile(CAN_FFA1R) & !1);
-        write_volatile(CAN_F0R1, 0);
-        write_volatile(CAN_F0R2, CAN_STANDARD_DATA_FILTER_MASK);
-        write_volatile(CAN_FA1R, read_volatile(CAN_FA1R) | 1);
+        #[cfg(feature = "firmware")]
+        {
+            write_volatile(CAN_FA1R, read_volatile(CAN_FA1R) & !1);
+            write_volatile(CAN_FM1R, read_volatile(CAN_FM1R) & !1);
+            write_volatile(CAN_FS1R, read_volatile(CAN_FS1R) | 1);
+            write_volatile(CAN_FFA1R, read_volatile(CAN_FFA1R) & !1);
+            write_volatile(CAN_F0R1, 0);
+            write_volatile(CAN_F0R2, CAN_STANDARD_DATA_FILTER_MASK);
+            write_volatile(CAN_FA1R, read_volatile(CAN_FA1R) | 1);
+        }
+        #[cfg(feature = "calibration-image")]
+        {
+            // Two 16-bit identifier-list banks admit only calibration,
+            // updater, and identity traffic. Ignoring the rest of the bike
+            // bus in hardware protects the three-frame FIFO during the
+            // nearly full-budget Hall and flux control passes.
+            write_volatile(
+                CAN_FA1R,
+                read_volatile(CAN_FA1R) & !CALIBRATION_FILTER_BANKS,
+            );
+            write_volatile(CAN_FM1R, read_volatile(CAN_FM1R) | CALIBRATION_FILTER_BANKS);
+            write_volatile(
+                CAN_FS1R,
+                read_volatile(CAN_FS1R) & !CALIBRATION_FILTER_BANKS,
+            );
+            write_volatile(
+                CAN_FFA1R,
+                read_volatile(CAN_FFA1R) & !CALIBRATION_FILTER_BANKS,
+            );
+            write_volatile(CAN_F0R1, filter16_pair(0x2f2, 0x67f));
+            write_volatile(CAN_F0R2, filter16_pair(0x210, 0x211));
+            write_volatile(CAN_F1R1, filter16_pair(0x212, 0x212));
+            write_volatile(CAN_F1R2, filter16_pair(0x212, 0x212));
+            write_volatile(CAN_FA1R, read_volatile(CAN_FA1R) | CALIBRATION_FILTER_BANKS);
+        }
         write_volatile(CAN_FMR, read_volatile(CAN_FMR) & !1);
 
         write_volatile(CAN_IER, CAN_FIFO_PENDING_INTERRUPT);
@@ -327,11 +366,22 @@ pub fn take_received_frame() -> Option<Frame> {
 }
 
 #[cfg(feature = "calibration-image")]
+pub fn rx_fifo_overrun_seen() -> bool {
+    RX_FIFO_OVERRUN_SEEN.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "calibration-image")]
+pub fn command_queue_drop_seen() -> bool {
+    COMMAND_QUEUE_DROP_SEEN.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "calibration-image")]
 fn retain_received_frame(frame: Frame) {
     let stop = frame.len >= 4
         && u32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]])
             == u32::from_le_bytes(*b"STOP");
     if RX_PENDING.load(Ordering::Acquire) && !stop {
+        COMMAND_QUEUE_DROP_SEEN.store(true, Ordering::Release);
         return;
     }
     // SAFETY: this function runs only in the CAN receive interrupt. The
@@ -389,6 +439,8 @@ fn USB_LP_CAN_RX0() {
     unsafe {
         let fifo = read_volatile(CAN_RF0R);
         if fifo & CAN_FIFO_OVERRUN != 0 {
+            #[cfg(feature = "calibration-image")]
+            RX_FIFO_OVERRUN_SEEN.store(true, Ordering::Release);
             write_volatile(CAN_RF0R, CAN_FIFO_OVERRUN);
         }
         while read_volatile(CAN_RF0R) & 3 != 0 {
@@ -430,6 +482,11 @@ fn USB_LP_CAN_RX0() {
             write_volatile(CAN_RF0R, CAN_FIFO_RELEASE);
         }
     }
+}
+
+#[cfg(feature = "calibration-image")]
+const fn filter16_pair(low_id: u16, high_id: u16) -> u32 {
+    ((low_id as u32) << 5) | ((high_id as u32) << 21)
 }
 
 unsafe fn wait_msr(mask: u32, set: bool) -> bool {

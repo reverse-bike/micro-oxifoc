@@ -2,8 +2,8 @@
 
 use oxifoc_f103::protocol::Frame;
 
-pub const SCHEMA: u8 = 2;
-pub const FIRMWARE_VERSION: [u8; 3] = [0, 1, 0];
+pub const SCHEMA: u8 = 3;
+pub const FIRMWARE_VERSION: [u8; 3] = [0, 2, 0];
 pub const ARM_WINDOW_MS: u32 = 10_000;
 pub const COMMAND_ID: u16 = 0x2f2;
 pub const STATUS_ID: u16 = 0x2f7;
@@ -55,6 +55,10 @@ pub struct Status {
     pub local_ready: bool,
     pub output_active: bool,
     pub voltage_limited: bool,
+    pub hall_quiet: bool,
+    pub motor_outputs_disabled: bool,
+    pub can_rx_fifo_overrun: bool,
+    pub can_command_queue_drop: bool,
     pub low_current_counts: i16,
     pub low_voltage_ticks: i16,
     pub high_current_counts: i16,
@@ -76,7 +80,8 @@ pub struct Status {
     pub inductance_d_nwb_per_count: u32,
     pub inductance_q_nwb_per_count: u32,
     pub residual_dead_time_uv: u32,
-    pub pulse_step_tick_bits: i32,
+    pub pulse_step_d_ticks: i16,
+    pub pulse_step_q_ticks: i16,
     pub last_pulse_di_counts: i16,
     pub proportional_d_q16: i32,
     pub proportional_q_q16: i32,
@@ -87,6 +92,7 @@ pub struct Status {
     pub average_bemf_d_uv: i32,
     pub average_bemf_q_uv: i32,
     pub flux_measurement_erpm: i16,
+    pub hall_measurement_erpm: i16,
     pub sync_minimum_percent: u8,
     pub hall_centers_q16: [u16; 8],
     pub hall_valid_mask: u8,
@@ -105,7 +111,11 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             data[6] = u8::from(status.armed)
                 | (u8::from(status.local_ready) << 1)
                 | (u8::from(status.output_active) << 2)
-                | (u8::from(status.voltage_limited) << 3);
+                | (u8::from(status.voltage_limited) << 3)
+                | (u8::from(status.hall_quiet) << 4)
+                | (u8::from(status.motor_outputs_disabled) << 5)
+                | (u8::from(status.can_rx_fifo_overrun) << 6)
+                | (u8::from(status.can_command_queue_drop) << 7);
             data[7] = status.routine;
         }
         1 => {
@@ -150,9 +160,10 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             );
         }
         8 => {
-            data[1..5].copy_from_slice(&status.residual_dead_time_uv.to_le_bytes());
-            let pulse_ticks = saturating_i32_to_i16(status.pulse_step_tick_bits >> 16);
-            data[5..7].copy_from_slice(&pulse_ticks.to_le_bytes());
+            let residual_dead_time_mv = (status.residual_dead_time_uv / 1_000) as u16;
+            data[1..3].copy_from_slice(&residual_dead_time_mv.to_le_bytes());
+            data[3..5].copy_from_slice(&status.pulse_step_d_ticks.to_le_bytes());
+            data[5..7].copy_from_slice(&status.pulse_step_q_ticks.to_le_bytes());
             data[7] = status
                 .last_pulse_di_counts
                 .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8 as u8;
@@ -167,8 +178,10 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             data[7] = (status.tuning_bandwidth_rad_s / 10).min(u16::from(u8::MAX)) as u8;
         }
         11 => {
-            data[1..5].copy_from_slice(&status.flux_linkage_nwb.to_le_bytes());
-            data[5..7].copy_from_slice(&status.flux_measurement_erpm.to_le_bytes());
+            let flux_centi_mwb = (status.flux_linkage_nwb / 10_000) as u16;
+            data[1..3].copy_from_slice(&flux_centi_mwb.to_le_bytes());
+            data[3..5].copy_from_slice(&status.flux_measurement_erpm.to_le_bytes());
+            data[5..7].copy_from_slice(&status.hall_measurement_erpm.to_le_bytes());
             data[7] = status.sync_minimum_percent;
         }
         12 => {
@@ -198,10 +211,6 @@ fn copy_u24(destination: &mut [u8], value: u32) {
 fn copy_i24(destination: &mut [u8], value: i32) {
     let value = value.clamp(-0x0080_0000, 0x007f_ffff);
     destination.copy_from_slice(&value.to_le_bytes()[..3]);
-}
-
-fn saturating_i32_to_i16(value: i32) -> i16 {
-    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 #[cfg(test)]
@@ -272,11 +281,15 @@ mod tests {
                 armed: true,
                 local_ready: true,
                 output_active: true,
+                hall_quiet: true,
+                motor_outputs_disabled: true,
+                can_rx_fifo_overrun: true,
+                can_command_queue_drop: true,
                 ..Status::default()
             },
         );
         assert_eq!(frame.id, STATUS_ID);
-        assert_eq!(frame.data, [0xc0, SCHEMA, 3, 0, 0x34, 0x12, 0x07, 0]);
+        assert_eq!(frame.data, [0xc0, SCHEMA, 3, 0, 0x34, 0x12, 0xf7, 0]);
     }
 
     #[test]
@@ -284,6 +297,10 @@ mod tests {
         let status = Status {
             inductance_d_nwb_per_count: 7_500,
             inductance_q_nwb_per_count: 8_250,
+            residual_dead_time_uv: 25_184,
+            pulse_step_d_ticks: 53,
+            pulse_step_q_ticks: 53,
+            last_pulse_di_counts: 27,
             proportional_d_q16: 21_123,
             proportional_q_q16: -19_876,
             integral_per_cycle_q16: 765,
@@ -304,6 +321,10 @@ mod tests {
             &(-19_876_i32).to_le_bytes()[..3]
         );
         assert_eq!(&status_frame(10, status).data[1..5], &765_i32.to_le_bytes());
+        assert_eq!(
+            status_frame(8, status).data,
+            [0xc8, 25, 0, 53, 0, 53, 0, 27]
+        );
     }
 
     #[test]
@@ -313,6 +334,7 @@ mod tests {
             average_bemf_d_uv: -1_234_567,
             average_bemf_q_uv: 7_654_321,
             flux_measurement_erpm: 6_000,
+            hall_measurement_erpm: 5_960,
             sync_minimum_percent: 84,
             hall_centers_q16: [0, 5_461, 27_307, 16_384, 49_152, 60_075, 38_229, 0],
             hall_valid_mask: 0x7e,
@@ -320,8 +342,8 @@ mod tests {
             ..Status::default()
         };
         assert_eq!(
-            &status_frame(11, status).data[1..5],
-            &13_400_000_u32.to_le_bytes()
+            status_frame(11, status).data,
+            [0xcb, 0x3c, 0x05, 0x70, 0x17, 0x48, 0x17, 84]
         );
         assert_eq!(
             &status_frame(12, status).data[1..5],
@@ -337,7 +359,7 @@ mod tests {
 
     #[test]
     fn telemetry_version_matches_the_crate_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
-        assert_eq!(FIRMWARE_VERSION, [0, 1, 0]);
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        assert_eq!(FIRMWARE_VERSION, [0, 2, 0]);
     }
 }

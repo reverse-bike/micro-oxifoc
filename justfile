@@ -38,6 +38,7 @@ check-f103-calibration:
     cd oxifoc-f103-calibration
     command cargo fmt --check
     command cargo test --target aarch64-apple-darwin
+    command env UV_CACHE_DIR=../scratch/uv-cache uv run ../scripts/test_can_f103_calibration.py
     command cargo clippy --release --features firmware -- -D warnings
     command cargo build --release --features firmware
     host_triple=$(command rustc -vV | command sed -n 's/^host: //p')

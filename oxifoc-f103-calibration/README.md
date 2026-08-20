@@ -66,4 +66,18 @@ command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_f103_calibration.py
 
 A real run requires the explicit `--yes` flag. Flux spins the motor to 6,000
 electrical RPM, and Hall calibration rotates it through six slow electrical
-turns. Elevate the wheel and keep the drivetrain clear.
+turns. Elevate the wheel and keep the drivetrain clear. The host retries `ARMC`
+and the selected `RUN*` command for up to six seconds while waiting for an
+explicit acknowledgment, reports each arm predicate and sticky CAN-loss flag,
+and submits `STOP` if any authorized run exits with an error. The calibration
+image filters unrelated bike traffic in bxCAN hardware; updater and identity
+requests remain accepted.
+
+The schema-3 result reports the voltage-pulse stimulus at both rotor lock
+positions and the Hall-derived electrical speed observed during the flux
+sample. The host accepts the flux result only when Hall speed is within 15% of
+the 6,000 eRPM command. After a successful Hall sweep it validates the raw-state
+cyclic order and 30--90 electrical-degree sector widths, converts the measured
+centers to circular midpoint boundaries, and prints an exact
+`HallGeometry::new(...)` candidate plus boundary deltas from the ride firmware.
+The output is advisory: calibration never edits the ride configuration.

@@ -1,6 +1,6 @@
 [package]
 name = "oxifoc-f103-calibration"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "Synchronous motor-parameter calibration firmware for the S73 STM32F103 controller"

@@ -20,6 +20,7 @@ const MIN_VALID_FLUX_NWB: u32 = 100_000;
 const MAX_VALID_FLUX_NWB: u32 = 1_000_000_000;
 const TAU_MILLIRADIANS: i64 = 6_283;
 const Q16: i64 = 1_i64 << 16;
+const _: () = assert!(SAMPLE_CYCLES == PWM_HZ);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
@@ -51,6 +52,7 @@ pub struct Observation {
     pub applied_d_tick_bits: i32,
     pub applied_q_tick_bits: i32,
     pub bus_voltage_mv: u32,
+    pub hall_sequence: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -59,6 +61,7 @@ pub struct Result {
     pub average_bemf_d_uv: i32,
     pub average_bemf_q_uv: i32,
     pub measurement_erpm: i16,
+    pub hall_measurement_erpm: i16,
     pub sync_minimum_percent: u8,
 }
 
@@ -76,6 +79,8 @@ pub struct FluxLinkageCalibration {
     bemf_d_sum_uv: i64,
     bemf_q_sum_uv: i64,
     sample_count: u32,
+    hall_sequence: u32,
+    hall_transition_count: u16,
     voltage_filtered_ticks: u32,
     voltage_maximum_ticks: u32,
     sync_minimum_percent: u8,
@@ -97,6 +102,8 @@ impl FluxLinkageCalibration {
             bemf_d_sum_uv: 0,
             bemf_q_sum_uv: 0,
             sample_count: 0,
+            hall_sequence: 0,
+            hall_transition_count: 0,
             voltage_filtered_ticks: 0,
             voltage_maximum_ticks: 0,
             sync_minimum_percent: 100,
@@ -105,6 +112,7 @@ impl FluxLinkageCalibration {
                 average_bemf_d_uv: 0,
                 average_bemf_q_uv: 0,
                 measurement_erpm: 0,
+                hall_measurement_erpm: 0,
                 sync_minimum_percent: 0,
             },
         }
@@ -260,6 +268,10 @@ impl FluxLinkageCalibration {
     }
 
     fn observe_sample(&mut self, observation: Observation) {
+        if observation.hall_sequence != self.hall_sequence {
+            self.hall_sequence = observation.hall_sequence;
+            self.hall_transition_count = self.hall_transition_count.saturating_add(1);
+        }
         let omega_milliradians_per_second = i64::from(self.electrical_rpm) * TAU_MILLIRADIANS / 60;
         let vd_uv = tick_bits_to_uv(observation.applied_d_tick_bits, observation.bus_voltage_mv);
         let vq_uv = tick_bits_to_uv(observation.applied_q_tick_bits, observation.bus_voltage_mv);
@@ -337,6 +349,7 @@ impl FluxLinkageCalibration {
             average_bemf_d_uv: saturating_i64_to_i32(average_d),
             average_bemf_q_uv: saturating_i64_to_i32(average_q),
             measurement_erpm: FLUX_TARGET_ERPM as i16,
+            hall_measurement_erpm: hall_erpm_from_transition_count(self.hall_transition_count),
             sync_minimum_percent: self.sync_minimum_percent,
         };
         true
@@ -371,6 +384,13 @@ fn vector_magnitude_ticks(d_bits: i32, q_bits: i32) -> u32 {
             .saturating_add(q.unsigned_abs().saturating_pow(2)),
     )
     .min(u64::from(u32::MAX)) as u32
+}
+
+fn hall_erpm_from_transition_count(transition_count: u16) -> i16 {
+    // Six Hall transitions per electrical revolution over the exact one-second
+    // sample window: eRPM = transitions/s * 60/6. The first observed sequence
+    // establishes the baseline and is not a transition within the window.
+    transition_count.saturating_sub(1).saturating_mul(10) as i16
 }
 
 fn integer_sqrt_u64(mut radicand: u64) -> u64 {
@@ -444,5 +464,11 @@ mod tests {
                 .abs_diff(expected_nwb as u32)
                 < 2_000
         );
+    }
+
+    #[test]
+    fn hall_speed_counts_sector_transitions_during_the_one_second_sample() {
+        assert_eq!(hall_erpm_from_transition_count(601), 6_000);
+        assert_eq!(hall_erpm_from_transition_count(0), 0);
     }
 }

@@ -56,7 +56,8 @@ pub struct Snapshot {
     pub inductance_d_nwb_per_count: u32,
     pub inductance_q_nwb_per_count: u32,
     pub residual_dead_time_uv: u32,
-    pub pulse_step_tick_bits: i32,
+    pub pulse_step_d_ticks: i16,
+    pub pulse_step_q_ticks: i16,
     pub last_pulse_di_counts: i16,
     pub proportional_d_q16: i32,
     pub proportional_q_q16: i32,
@@ -67,6 +68,7 @@ pub struct Snapshot {
     pub average_bemf_d_uv: i32,
     pub average_bemf_q_uv: i32,
     pub flux_measurement_erpm: i16,
+    pub hall_measurement_erpm: i16,
     pub sync_minimum_percent: u8,
     pub hall_centers_q16: [u16; 8],
     pub hall_valid_mask: u8,
@@ -215,7 +217,8 @@ pub fn snapshot() -> Snapshot {
             inductance_d_nwb_per_count: inductance.inductance_d_nwb_per_count,
             inductance_q_nwb_per_count: inductance.inductance_q_nwb_per_count,
             residual_dead_time_uv: inductance.residual_dead_time_uv,
-            pulse_step_tick_bits: inductance.pulse_step_tick_bits,
+            pulse_step_d_ticks: inductance.pulse_step_d_ticks,
+            pulse_step_q_ticks: inductance.pulse_step_q_ticks,
             last_pulse_di_counts: inductance.last_pulse_di_counts,
             proportional_d_q16: inductance.proportional_d_q16,
             proportional_q_q16: inductance.proportional_q_q16,
@@ -226,6 +229,7 @@ pub fn snapshot() -> Snapshot {
             average_bemf_d_uv: flux_linkage.average_bemf_d_uv,
             average_bemf_q_uv: flux_linkage.average_bemf_q_uv,
             flux_measurement_erpm: flux_linkage.measurement_erpm,
+            hall_measurement_erpm: flux_linkage.hall_measurement_erpm,
             sync_minimum_percent: flux_linkage.sync_minimum_percent,
             hall_centers_q16: hall.centers_q16,
             hall_valid_mask: hall.valid_mask,
@@ -552,13 +556,17 @@ fn observe_sequence(
             applied_d_tick_bits,
             bus_voltage_mv,
         }),
-        Routine::FluxLinkage => state.flux_linkage.observe(FluxObservation {
-            measured_d_counts,
-            measured_q_counts,
-            applied_d_tick_bits,
-            applied_q_tick_bits,
-            bus_voltage_mv,
-        }),
+        Routine::FluxLinkage => {
+            let (hall_sequence, _, _) = hardware::hall_edge_snapshot();
+            state.flux_linkage.observe(FluxObservation {
+                measured_d_counts,
+                measured_q_counts,
+                applied_d_tick_bits,
+                applied_q_tick_bits,
+                bus_voltage_mv,
+                hall_sequence,
+            });
+        }
         Routine::Hall => state.hall.observe(hardware::live_hall_state()),
         Routine::None => {}
     }

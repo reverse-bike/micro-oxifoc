@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from can_bootloader_flash import normalized_channel, prepare_gs_usb_backend
 BITRATE = 250_000
 COMMAND_ID = 0x2F2
 STATUS_ID = 0x2F7
-SCHEMA = 2
+SCHEMA = 3
 TRAILER = bytes.fromhex("a55a")
 
 RESISTANCE_STATE_NAMES = {
@@ -108,6 +109,140 @@ class CalibrationError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class HallGeometry:
+    electrical_states: tuple[int, ...]
+    boundaries_q16: tuple[int, ...]
+    positive_angle_direction: int
+
+
+def load_hall_geometry(path: Path) -> HallGeometry:
+    source = path.read_text()
+    match = re.search(
+        r"pub static HALL_GEOMETRY:\s*HallGeometry\s*=\s*HallGeometry::new\("
+        r"\s*\[([^]]+)\],\s*\[([^]]+)\],\s*(-?1)\s*,?\s*\)",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        raise CalibrationError(f"could not read HALL_GEOMETRY from {path}")
+
+    def integers(value: str) -> tuple[int, ...]:
+        return tuple(
+            int(part.strip().replace("_", ""))
+            for part in value.split(",")
+            if part.strip()
+        )
+
+    geometry = HallGeometry(integers(match[1]), integers(match[2]), int(match[3]))
+    if len(geometry.electrical_states) != 6 or len(geometry.boundaries_q16) != 6:
+        raise CalibrationError(f"invalid HALL_GEOMETRY in {path}")
+    return geometry
+
+
+CURRENT_HALL_GEOMETRY = load_hall_geometry(
+    Path(__file__).resolve().parents[1] / "oxifoc-f103" / "src" / "config.rs"
+)
+
+
+def circular_delta_q16(left: int, right: int) -> int:
+    return (left - right + 32_768) % 65_536 - 32_768
+
+
+def cyclically_equal(left: Sequence[int], right: Sequence[int]) -> bool:
+    if len(left) != len(right):
+        return False
+    doubled = tuple(right) * 2
+    return any(tuple(left) == doubled[offset : offset + len(left)] for offset in range(len(left)))
+
+
+def build_hall_geometry(
+    centers_q16: Sequence[int],
+    valid_mask: int,
+    current: HallGeometry = CURRENT_HALL_GEOMETRY,
+) -> HallGeometry:
+    if valid_mask != 0x7E or len(centers_q16) != 8:
+        raise CalibrationError("Hall centers do not contain exactly raw states 1 through 6")
+    ordered_centers = sorted((centers_q16[raw] & 0xFFFF, raw) for raw in range(1, 7))
+    observed_order = tuple(raw for _, raw in ordered_centers)
+    if not cyclically_equal(observed_order, current.electrical_states):
+        raise CalibrationError(
+            "calibrated Hall cyclic order does not match the current hardware geometry: "
+            f"{observed_order}"
+        )
+
+    boundary_by_raw: list[tuple[int, int]] = []
+    for index, (center, raw) in enumerate(ordered_centers):
+        previous = ordered_centers[index - 1][0]
+        spacing = (center - previous) % 65_536
+        if not 5_461 <= spacing <= 16_384:
+            raise CalibrationError(
+                f"Hall center spacing for raw state {raw} is outside 30..90 degrees"
+            )
+        boundary_by_raw.append(((previous + spacing // 2) % 65_536, raw))
+
+    boundary_by_raw.sort()
+    geometry = HallGeometry(
+        electrical_states=tuple(raw for _, raw in boundary_by_raw),
+        boundaries_q16=tuple(boundary for boundary, _ in boundary_by_raw),
+        positive_angle_direction=current.positive_angle_direction,
+    )
+    if not cyclically_equal(geometry.electrical_states, current.electrical_states):
+        raise CalibrationError("Hall boundary conversion changed the calibrated cyclic order")
+
+    maximum_center_error = 0
+    for index, raw in enumerate(geometry.electrical_states):
+        boundary = geometry.boundaries_q16[index]
+        next_boundary = geometry.boundaries_q16[(index + 1) % 6]
+        width = (next_boundary - boundary) % 65_536
+        if not 5_461 <= width <= 16_384:
+            raise CalibrationError(
+                f"Hall sector width for raw state {raw} is outside 30..90 degrees"
+            )
+        reconstructed = (boundary + width // 2) % 65_536
+        maximum_center_error = max(
+            maximum_center_error,
+            abs(circular_delta_q16(reconstructed, centers_q16[raw])),
+        )
+    if maximum_center_error > 2_731:
+        raise CalibrationError("Hall boundary conversion moves a center by more than 15 degrees")
+    return geometry
+
+
+def format_hall_geometry(geometry: HallGeometry) -> str:
+    states = ", ".join(str(value) for value in geometry.electrical_states)
+    boundaries = ", ".join(f"{value:_}" for value in geometry.boundaries_q16)
+    return (
+        "HallGeometry::new(\n"
+        f"    [{states}],\n"
+        f"    [{boundaries}],\n"
+        f"    {geometry.positive_angle_direction},\n"
+        ")"
+    )
+
+
+def hall_geometry_deltas_degrees(
+    candidate: HallGeometry, current: HallGeometry = CURRENT_HALL_GEOMETRY
+) -> list[float]:
+    candidate_by_raw = dict(zip(candidate.electrical_states, candidate.boundaries_q16, strict=True))
+    current_by_raw = dict(zip(current.electrical_states, current.boundaries_q16, strict=True))
+    return [
+        circular_delta_q16(candidate_by_raw[raw], current_by_raw[raw]) * 360 / 65_536
+        for raw in current.electrical_states
+    ]
+
+
+def validate_flux_hall_speed(status: Status) -> None:
+    commanded = abs(status.flux_measurement_erpm)
+    measured = abs(status.hall_measurement_erpm)
+    if commanded == 0 or measured == 0 or abs(measured - commanded) * 100 > commanded * 15:
+        raise CalibrationError(
+            "Hall speed does not confirm the flux-linkage command "
+            f"({status.hall_measurement_erpm} measured vs "
+            f"{status.flux_measurement_erpm} commanded eRPM)"
+        )
+
+
 @dataclass
 class Status:
     schema: int = 0
@@ -139,7 +274,8 @@ class Status:
     inductance_d_nwb_per_count: int = 0
     inductance_q_nwb_per_count: int = 0
     residual_dead_time_uv: int = 0
-    pulse_step_ticks: int = 0
+    pulse_step_d_ticks: int = 0
+    pulse_step_q_ticks: int = 0
     last_pulse_di_counts: int = 0
     proportional_d_q16: int = 0
     proportional_q_q16: int = 0
@@ -150,6 +286,7 @@ class Status:
     average_bemf_d_uv: int = 0
     average_bemf_q_uv: int = 0
     flux_measurement_erpm: int = 0
+    hall_measurement_erpm: int = 0
     sync_minimum_percent: int = 0
     hall_centers_q16: list[int] = field(default_factory=lambda: [0] * 8)
     hall_valid_mask: int = 0
@@ -169,6 +306,27 @@ class Status:
     def output_active(self) -> bool:
         return bool(self.flags & 4)
 
+    @property
+    def hall_quiet(self) -> bool:
+        return bool(self.flags & 0x10)
+
+    @property
+    def motor_outputs_disabled(self) -> bool:
+        return bool(self.flags & 0x20)
+
+    @property
+    def can_rx_fifo_overrun(self) -> bool:
+        return bool(self.flags & 0x40)
+
+    @property
+    def can_command_queue_drop(self) -> bool:
+        return bool(self.flags & 0x80)
+
+    @property
+    def pulse_step_ticks(self) -> int:
+        """Compatibility name for schema-2 logs, whose pulse was the q-axis value."""
+        return self.pulse_step_q_ticks
+
     def update(self, message: can.Message) -> bool:
         data = bytes(message.data)
         if (
@@ -181,6 +339,8 @@ class Status:
         page = data[0] & 0x0F
         if page >= STATUS_PAGE_COUNT:
             return False
+        if page != 0 and self.schema == 0:
+            return True
         self.pages_seen.add(page)
         if page == 0:
             self.page_zero_updates += 1
@@ -220,8 +380,19 @@ class Status:
             self.inductance_d_nwb_per_count = int.from_bytes(data[1:5], "little")
             self.inductance_q_nwb_per_count = int.from_bytes(data[5:8], "little")
         elif page == 8:
-            self.residual_dead_time_uv = int.from_bytes(data[1:5], "little")
-            self.pulse_step_ticks = int.from_bytes(data[5:7], "little", signed=True)
+            if self.schema >= 3:
+                self.residual_dead_time_uv = int.from_bytes(data[1:3], "little") * 1_000
+                self.pulse_step_d_ticks = int.from_bytes(
+                    data[3:5], "little", signed=True
+                )
+                self.pulse_step_q_ticks = int.from_bytes(
+                    data[5:7], "little", signed=True
+                )
+            else:
+                self.residual_dead_time_uv = int.from_bytes(data[1:5], "little")
+                self.pulse_step_q_ticks = int.from_bytes(
+                    data[5:7], "little", signed=True
+                )
             self.last_pulse_di_counts = int.from_bytes(data[7:8], "little", signed=True)
         elif page == 9:
             self.proportional_d_q16 = int.from_bytes(data[1:5], "little", signed=True)
@@ -233,10 +404,19 @@ class Status:
             self.gain_bus_voltage_mv = int.from_bytes(data[5:7], "little")
             self.tuning_bandwidth_rad_s = data[7] * 10
         elif page == 11:
-            self.flux_linkage_nwb = int.from_bytes(data[1:5], "little")
-            self.flux_measurement_erpm = int.from_bytes(
-                data[5:7], "little", signed=True
-            )
+            if self.schema >= 3:
+                self.flux_linkage_nwb = int.from_bytes(data[1:3], "little") * 10_000
+                self.flux_measurement_erpm = int.from_bytes(
+                    data[3:5], "little", signed=True
+                )
+                self.hall_measurement_erpm = int.from_bytes(
+                    data[5:7], "little", signed=True
+                )
+            else:
+                self.flux_linkage_nwb = int.from_bytes(data[1:5], "little")
+                self.flux_measurement_erpm = int.from_bytes(
+                    data[5:7], "little", signed=True
+                )
             self.sync_minimum_percent = data[7]
         elif page == 12:
             self.average_bemf_d_uv = int.from_bytes(data[1:5], "little", signed=True)
@@ -280,6 +460,7 @@ def command_frame(tag: bytes, challenge: int) -> can.Message:
     return can.Message(
         arbitration_id=COMMAND_ID,
         is_extended_id=False,
+        is_rx=False,
         data=tag + challenge.to_bytes(2, "little") + TRAILER,
     )
 
@@ -288,6 +469,7 @@ def stop_frame() -> can.Message:
     return can.Message(
         arbitration_id=COMMAND_ID,
         is_extended_id=False,
+        is_rx=False,
         data=b"STOP",
     )
 
@@ -311,6 +493,10 @@ def print_status(status: Status) -> None:
     print(f"challenge                  0x{status.challenge:04x}")
     print(f"armed                      {status.armed}")
     print(f"local_ready                {status.local_ready}")
+    print(f"hall_quiet                {status.hall_quiet}")
+    print(f"motor_outputs_disabled    {status.motor_outputs_disabled}")
+    print(f"can_rx_fifo_overrun       {status.can_rx_fifo_overrun}")
+    print(f"can_command_queue_drop    {status.can_command_queue_drop}")
     print(f"output_active              {status.output_active}")
     print(f"bus_voltage_mv             {status.bus_voltage_mv}")
     print(f"current_offsets            [{status.offset_a}, {status.offset_b}]")
@@ -331,7 +517,8 @@ def print_status(status: Status) -> None:
     print(f"inductance_d_nwb/count     {status.inductance_d_nwb_per_count}")
     print(f"inductance_q_nwb/count     {status.inductance_q_nwb_per_count}")
     print(f"residual_dead_time_uv      {status.residual_dead_time_uv}")
-    print(f"pulse_step_ticks           {status.pulse_step_ticks}")
+    print(f"pulse_step_d_ticks         {status.pulse_step_d_ticks}")
+    print(f"pulse_step_q_ticks         {status.pulse_step_q_ticks}")
     print(f"last_pulse_di_counts       {status.last_pulse_di_counts}")
     print(f"proportional_d_q16         {status.proportional_d_q16}")
     print(f"proportional_q_q16         {status.proportional_q_q16}")
@@ -344,11 +531,25 @@ def print_status(status: Status) -> None:
         f"{status.average_bemf_q_uv}]"
     )
     print(f"flux_measurement_erpm      {status.flux_measurement_erpm}")
+    print(f"hall_measurement_erpm      {status.hall_measurement_erpm}")
     print(f"sync_minimum_percent       {status.sync_minimum_percent}")
     hall_degrees = [round(value * 360 / 65_536, 2) for value in status.hall_centers_q16]
     print(f"hall_centers_degrees       {hall_degrees}")
     print(f"hall_valid_mask            0x{status.hall_valid_mask:02x}")
     print(f"hall_minimum_samples       {status.hall_minimum_samples}")
+    if status.hall_valid_mask == 0x7E:
+        geometry = build_hall_geometry(
+            status.hall_centers_q16,
+            status.hall_valid_mask,
+            CURRENT_HALL_GEOMETRY,
+        )
+        deltas = hall_geometry_deltas_degrees(geometry, CURRENT_HALL_GEOMETRY)
+        print("hall_geometry_candidate")
+        print(format_hall_geometry(geometry))
+        print(
+            "hall_boundary_delta_deg    "
+            + str([round(delta, 2) for delta in deltas])
+        )
     print(f"control_max_cycles         {status.maximum_control_cycles}")
     print(f"timing_overruns            {status.timing_overruns}")
     print(f"fault_flags                0x{status.fault_flags:08x}")
@@ -370,7 +571,8 @@ class Client:
     ) -> Status:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            message = self.bus.recv(timeout=min(0.25, deadline - time.monotonic()))
+            remaining = max(0.0, deadline - time.monotonic())
+            message = self.bus.recv(timeout=min(0.25, remaining))
             if message is None:
                 continue
             self.logger(message)
@@ -384,6 +586,86 @@ class Client:
         )
 
 
+def arm_with_retry(
+    client: Client,
+    challenge: int,
+    timeout: float,
+    retry_interval: float = 0.1,
+) -> Status:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            status = client.status
+            raise CalibrationError(
+                "timed out waiting for arm acknowledgement "
+                f"(local_ready={status.local_ready}, hall_quiet={status.hall_quiet}, "
+                "motor_outputs_disabled="
+                f"{status.motor_outputs_disabled}, "
+                f"can_rx_fifo_overrun={status.can_rx_fifo_overrun}, "
+                f"can_command_queue_drop={status.can_command_queue_drop}, "
+                f"faults=0x{status.fault_flags:08x})"
+            )
+        client.send(command_frame(b"ARMC", challenge))
+        try:
+            return client.receive_until(
+                lambda status: status.armed, min(retry_interval, remaining)
+            )
+        except CalibrationError:
+            continue
+
+
+def start_routine_with_retry(
+    client: Client,
+    tag: bytes,
+    challenge: int,
+    routine: int,
+    complete_state: int,
+    failed_state: int,
+    timeout: float,
+    retry_interval: float = 0.1,
+) -> Status:
+    page_zero_at_start = client.status.page_zero_updates
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            status = client.status
+            raise CalibrationError(
+                f"timed out waiting for {tag.decode()} acknowledgement "
+                f"(routine={ROUTINE_NAMES.get(status.routine, status.routine)}, "
+                f"state={state_name(status)}, "
+                f"can_rx_fifo_overrun={status.can_rx_fifo_overrun}, "
+                f"can_command_queue_drop={status.can_command_queue_drop})"
+            )
+        client.send(command_frame(tag, challenge))
+        try:
+            status = client.receive_until(
+                lambda current: (
+                    current.page_zero_updates != page_zero_at_start
+                    and current.routine == routine
+                    and current.state != complete_state
+                ),
+                min(retry_interval, remaining),
+            )
+        except CalibrationError:
+            continue
+        if status.state == failed_state:
+            raise CalibrationError(
+                "calibration failed: "
+                f"{FAILURE_NAMES.get(status.failure, status.failure)}"
+            )
+        return status
+
+
+def submit_stop_safely(client: Client) -> bool:
+    try:
+        client.send(stop_frame())
+    except can.CanError:
+        return False
+    return True
+
+
 def run_routine(
     client: Client,
     initial: Status,
@@ -393,10 +675,17 @@ def run_routine(
     failed_state: int,
     timeout: float,
 ) -> Status:
-    client.send(command_frame(b"ARMC", initial.challenge))
-    client.receive_until(lambda status: status.armed, 3.0)
-    client.send(command_frame(tag, initial.challenge))
-    last_update = initial.page_zero_updates
+    arm_with_retry(client, initial.challenge, 6.0)
+    started = start_routine_with_retry(
+        client,
+        tag,
+        initial.challenge,
+        routine,
+        complete_state,
+        failed_state,
+        timeout=6.0,
+    )
+    last_update = started.page_zero_updates
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = client.receive_until(
@@ -414,8 +703,7 @@ def run_routine(
         if status.state == complete_state:
             status.pages_seen.clear()
             return client.receive_all_pages(3.0)
-    client.send(stop_frame())
-    raise CalibrationError("calibration run timed out; STOP sent")
+    raise CalibrationError("calibration run timed out")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -424,6 +712,8 @@ def run(args: argparse.Namespace) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = can.Logger(str(log_path))
     bus: can.BusABC | None = None
+    client: Client | None = None
+    run_authorized = False
     try:
         bus = can.Bus(
             interface=args.interface,
@@ -456,6 +746,7 @@ def run(args: argparse.Namespace) -> int:
                     "firmware interlocks are not ready; check throttle rest, brake, bus, "
                     "faults, and motor motion"
                 )
+            run_authorized = True
             final = initial
             if args.action in ("resistance", "full"):
                 final = run_routine(client, final, b"RUNR", 1, 8, 9, args.run_timeout)
@@ -476,22 +767,23 @@ def run(args: argparse.Namespace) -> int:
                         "inductance results from this boot"
                     )
                 final = run_routine(client, final, b"RUNF", 3, 6, 7, args.run_timeout)
+                validate_flux_hall_speed(final)
             if args.action in ("hall", "full"):
                 final = run_routine(client, final, b"RUNH", 4, 5, 6, args.run_timeout)
             print_status(final)
         print(f"CAN log                    {log_path}")
         return 0
     except (CalibrationError, can.CanError) as error:
+        stopped = run_authorized and client is not None and submit_stop_safely(client)
         print(f"calibration error: {error}", file=sys.stderr)
+        if stopped:
+            print("STOP submitted after calibration error", file=sys.stderr)
         print(f"CAN log: {log_path}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        if bus is not None:
-            try:
-                bus.send(stop_frame(), timeout=0.25)
-            except can.CanError:
-                pass
-        print("interrupted; STOP submitted", file=sys.stderr)
+        stopped = client is not None and submit_stop_safely(client)
+        outcome = "STOP submitted" if stopped else "STOP could not be submitted"
+        print(f"interrupted; {outcome}", file=sys.stderr)
         return 130
     finally:
         if bus is not None:
