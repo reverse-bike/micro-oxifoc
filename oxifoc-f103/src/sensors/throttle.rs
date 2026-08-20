@@ -177,9 +177,9 @@ mod tests {
     #[test]
     fn full_throttle_uses_confirmed_forward_sign_and_current_scale() {
         let demand = Observation::from_raw(FULL_ADC).demand().unwrap();
-        assert_eq!(demand.negative_q_target(838), -838);
+        assert_eq!(demand.negative_q_target(880), -880);
         assert_eq!(demand.negative_q_target(60), -60);
-        assert_eq!(demand.negative_q_target(900), -838);
+        assert_eq!(demand.negative_q_target(900), -880);
     }
 
     #[test]

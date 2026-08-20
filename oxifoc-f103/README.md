@@ -156,18 +156,18 @@ already valid local ride request; every authority decision still comes from
 the directly wired inputs and local protection state.
 
 Forward torque is negative q. Demand increases by four current counts per
-millisecond and reductions apply immediately. The ride ceiling is 838 phase-
-current counts (83.8 A at the loaded-run fit of 100 mA/count), including during
+millisecond and reductions apply immediately. The ride ceiling is 880 phase-
+current counts (88.0 A at the loaded-run fit of 100 mA/count), including during
 the two-second startup window. Startup requires its first Hall edge within 500
 ms and twelve net-forward Hall transitions. While measured startup progress is
 negative, the absolute two-second deadline allows the wheel to decelerate
 through the no-edge interval at zero speed; the ordinary edge deadline resumes
 as soon as progress recovers to the starting position. The software phase-
 current guard trips above 1,344 counts (134.4 A) on A, B, or reconstructed C,
-preserving at least the established 1.6-times margin over commanded phase
+preserving at least a 1.5-times margin over commanded phase
 current. The local 39 V undervoltage debounce and controller/motor thermal
-envelopes can only reduce the 400-count DC-side limit. This is nominally 40 A
-in the phase-derived projection and approximately 41 A at the BMS. The current
+envelopes can only reduce the 392-count DC-side limit. This is nominally 39.2 A
+in the phase-derived projection and approximately 40 A at the BMS. The current
 limiter applies a circular `Id/Iq` command envelope,
 then derives the DC-side clamp from a 2 ms low-pass of q-axis modulation using
 `Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
@@ -310,3 +310,7 @@ recross at an in-run direction reversal as an unknown-speed sector-center hold
 until the next complete same-direction Hall interval. Version 0.1.19 permits
 the existing stable live-Hall recovery to repair a stale estimate before
 energizing even when a new ride lease is already active.
+Version 0.2.0 raises the common phase-current ceiling to 880 counts, calibrates
+the OxiFOC bus-power clamp to 392 counts, and restores OxiFOC's torqueless
+self-recovery policy when the combined phase estimate is temporarily
+unavailable.

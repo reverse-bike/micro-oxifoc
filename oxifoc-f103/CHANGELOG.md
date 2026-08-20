@@ -6,6 +6,43 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.2.0 - 2026-08-20
+
+Changes:
+
+- Raised the single OxiFOC phase-current command ceiling from 838 to 880 ADC
+  counts, nominally 83.8 to 88.0 A. The existing q-modulation-derived bus
+  clamp remains the only speed-dependent reduction; no vehicle-speed current
+  table was added.
+- Calibrated the projected DC-side limit from 400 to 392 counts. Based on the
+  loaded 0.1.18 and 0.1.19 pulls, this should move the BMS reading from
+  approximately 40.6--41.1 A to 39.8--40.3 A while preserving the maximum
+  usable continuous battery envelope. Thermal and undervoltage derating still
+  reduce this same limit.
+- Made an unavailable combined phase estimate coast at zero output and retain
+  its opportunity to recover instead of latching a `PhaseEstimate` safety
+  event. Invalid Hall states, skipped or implausibly fast transitions, capture
+  loss, measured overcurrent, TIM1 break, and every hardware fault remain
+  latching protections.
+- Retained the 1,344-count software phase-current trip, leaving more than 1.5
+  times the new commanded-current ceiling, and updated the compile-time and
+  unit-test envelope checks accordingly.
+
+Reason: the 0.1.19 log recorded one safety event at 92.26 s, at zero vehicle
+speed and battery current, immediately after the output became inactive. It
+had no internal fault, current trip, TIM1 break, BMS disconnect, or reset. A
+review against the `oxifoc-original` tag confirmed that OxiFOC gates q current
+to zero while phase trust is unavailable and resumes when the source recovers;
+the F103 `PhaseEstimate` latch was a port divergence. The same ride's clean
+full-power pulls tracked q current within 42 counts, held loaded |d| to 48
+counts, and reached only 881 phase counts while the static 838-count ceiling
+was active. Above approximately 23--25 km/h the modulation-derived bus limit,
+not phase current or voltage, governed torque and produced 40.6--41.1 A at the
+BMS. The new envelope therefore adds five percent low-speed torque, retains
+OxiFOC's automatic electrical-power crossover, and corrects the projection
+for measured inverter/input losses rather than asking the battery for more
+than approximately 40 A.
+
 ## 0.1.19 - 2026-08-20
 
 Changes:

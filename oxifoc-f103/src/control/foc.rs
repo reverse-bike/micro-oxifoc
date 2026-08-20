@@ -590,11 +590,7 @@ fn control_cycle(started: u32) {
         estimate = state.driver.estimate_for_control(0, CONTROL_PERIOD_NS);
     }
     let Some(estimate) = estimate else {
-        publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, false);
-        stop_control(
-            state,
-            (lease_active || output_was_active).then_some(SafetyLossReason::PhaseEstimate),
-        );
+        stop_control(state, None);
         return;
     };
     state.hall_recovery_cycles = 0;

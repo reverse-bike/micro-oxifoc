@@ -336,7 +336,7 @@ mod tests {
         );
         let command = controller.update(observation(2, FULL_ADC));
         assert!(command.energize);
-        assert_eq!(command.target_q_counts, -838);
+        assert_eq!(command.target_q_counts, -880);
     }
 
     #[test]
