@@ -6,6 +6,30 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.19 - 2026-08-20
+
+Changes:
+
+- Allowed the existing stationary Hall recovery path to restore a missing
+  phase estimate while a ride lease is active, provided the PWM outputs are
+  physically disabled. Recovery still requires five consecutive samples of a
+  valid, unchanged live Hall state before reseeding the calibrated sector
+  center; active PWM, invalid Hall states, transitions, and all existing
+  current and hardware-fault checks remain fail-closed.
+- Added a regression test that keeps phase recovery conditional on both a
+  missing estimate and disabled PWM, independent of ride-command state.
+
+Reason: the 0.1.18 ride log recorded one `PhaseEstimate` safety loss at
+51.92 s while creeping at approximately 3.1 km/h. It had no internal fault,
+current trip, TIM1 break, BMS disconnect, or reset. The nearest control sample
+already reported inactive output while throttle was being reapplied, but the
+recovery guard rejected the safe live-Hall reseed solely because the new ride
+lease was active. That made a stale low-speed estimate latch a safety event
+before PWM could be enabled. Recovery is now governed by the physical output
+state rather than the requested lease, closing that re-entry gap without
+weakening energized-operation protection. Current limits, FOC behavior,
+observer policy, Hall geometry, CAN layout, and telemetry schema are unchanged.
+
 ## 0.1.18 - 2026-08-20
 
 Changes:

@@ -582,10 +582,10 @@ fn control_cycle(started: u32) {
     let mut estimate = state
         .driver
         .estimate_for_control(edge_age_us, CONTROL_PERIOD_NS);
-    if estimate.is_none()
-        && !lease_active
-        && hardware::motor_outputs_disabled()
-        && recover_stationary_hall(state)
+    if super::stationary_phase_recovery_allowed(
+        estimate.is_none(),
+        hardware::motor_outputs_disabled(),
+    ) && recover_stationary_hall(state)
     {
         estimate = state.driver.estimate_for_control(0, CONTROL_PERIOD_NS);
     }

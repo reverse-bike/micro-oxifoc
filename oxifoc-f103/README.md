@@ -307,4 +307,6 @@ seeded Hall sector, before any post-command Hall edge can occur, and permits a
 40-count projected charge-current transient so plugging torque can reverse the
 wheel instead of being clamped to zero. Version 0.1.18 treats the boundary
 recross at an in-run direction reversal as an unknown-speed sector-center hold
-until the next complete same-direction Hall interval.
+until the next complete same-direction Hall interval. Version 0.1.19 permits
+the existing stable live-Hall recovery to repair a stale estimate before
+energizing even when a new ride lease is already active.
