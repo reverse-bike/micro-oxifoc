@@ -322,4 +322,7 @@ the OxiFOC bus-power clamp to 392 counts, and restores OxiFOC's torqueless
 self-recovery policy when the combined phase estimate is temporarily
 unavailable. Version 0.2.1 makes energized observer reseeds preserve causal
 current history while explicitly requested ride-start seeds clear current
-history frozen during stopped output.
+history frozen during stopped output. Version 0.3.0 replaces the stock-derived
+Hall boundaries with the circular consensus from four complete bidirectional
+calibration runs; the motor direction, observer model, crossover, and current
+envelope are unchanged.

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.2
+
+- Deferred flux-linkage result reduction until the bridge is off and split its
+  d-axis average, q-axis average, vector magnitude, and linkage conversion
+  across four control cycles. This preserves the calibration arithmetic and
+  schema while removing the 4,317-cycle finalization pass from the energized
+  ramp-down path.
+
+## 0.3.1
+
+- Deferred resistance result reduction until after ramp-down and distributed
+  its low point, high point, and slope calculations across three safe-off
+  control cycles. This removes the 4,297-cycle one-pass reduction from the
+  energized ISR path without changing its arithmetic.
+- Distributed the twelve Hall directional averages across six safe-off
+  control cycles, one raw Hall state per cycle. This fixes the 5,857-cycle
+  schema-4 completion overrun while preserving the exact centers, sample
+  minima, and hysteresis reported by 0.3.0.
+
+## 0.3.0
+
+- Expanded the discharge-anchored pulse routine to four electrical lock
+  positions and three shared amplitudes: one-half, one, and three-halves of a
+  single calibrated base stimulus. Every grid cell retains its actual angle,
+  pulse ticks, average current rise, and effective inductance so
+  position-dependent and amplitude-dependent behavior can be separated.
+- Increased the Hall sweep current from 50 to 80 counts and retained exact
+  forward and reverse raw-state centers independently. The host reports their
+  signed hysteresis and forms the advisory geometry from their circular
+  midpoints.
+- Advanced telemetry to schema 4 with a cycling pulse-diagnostic page. The
+  host waits for all twelve grid cells before accepting an inductance run while
+  remaining able to decode schema-2 and schema-3 logs.
+- Removed pulse-derived current-loop gain recommendations. The calibrated
+  pulse inductance is useful diagnostically but remains substantially below
+  the loaded motor coefficient, so presenting gains derived from it invited an
+  unsafe configuration change.
+- Optimized the calibration image for minimum size, leaving room for the new
+  diagnostics under the resident bootloader's 26,200-byte limit.
+
 ## 0.2.0
 
 - Restored OxiFOC's voltage-pulse fallback contract by calibrating the probe

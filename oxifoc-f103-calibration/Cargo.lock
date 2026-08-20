@@ -112,7 +112,7 @@ version = "0.1.0"
 
 [[package]]
 name = "oxifoc-f103"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "oxifoc-f103-calibration"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",

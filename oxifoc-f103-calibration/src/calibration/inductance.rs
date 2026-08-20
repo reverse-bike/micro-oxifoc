@@ -7,11 +7,14 @@
 
 use crate::calibration::types::{Actuation, Failure};
 use crate::config::{
-    CURRENT_LOOP_TUNING_BANDWIDTH_RAD_S, INDUCTANCE_HOLD_CURRENT_COUNTS,
-    INDUCTANCE_PULSES_PER_AXIS, INDUCTANCE_TARGET_DI_COUNTS, PWM_HZ, PWM_PERIOD_TICKS,
+    INDUCTANCE_HOLD_CURRENT_COUNTS, INDUCTANCE_PULSES_PER_AXIS, INDUCTANCE_TARGET_DI_COUNTS,
+    PWM_HZ, PWM_PERIOD_TICKS,
 };
 
 const QUARTER_TURN: u32 = 0x4000_0000;
+pub const LOCK_POSITION_COUNT: u8 = 4;
+pub const PULSE_LEVEL_COUNT: u8 = 3;
+pub const PULSE_DIAGNOSTIC_COUNT: u8 = LOCK_POSITION_COUNT * PULSE_LEVEL_COUNT;
 const RAMP_CYCLES: u32 = PWM_HZ / 2;
 const SETTLE_CYCLES: u32 = PWM_HZ / 5;
 const HOLD_SAMPLE_CYCLES: u32 = PWM_HZ / 5;
@@ -64,6 +67,21 @@ pub struct Observation {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PulseDiagnostic {
+    pub pulse_step_ticks: i16,
+    pub average_di_counts: i16,
+    pub inductance_nwb_per_count: u32,
+}
+
+impl PulseDiagnostic {
+    const EMPTY: Self = Self {
+        pulse_step_ticks: 0,
+        average_di_counts: 0,
+        inductance_nwb_per_count: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Result {
     pub inductance_d_nwb_per_count: u32,
     pub inductance_q_nwb_per_count: u32,
@@ -71,11 +89,7 @@ pub struct Result {
     pub pulse_step_d_ticks: i16,
     pub pulse_step_q_ticks: i16,
     pub last_pulse_di_counts: i16,
-    pub gain_bus_voltage_mv: u16,
-    pub proportional_d_q16: i32,
-    pub proportional_q_q16: i32,
-    pub integral_per_cycle_q16: i32,
-    pub bandwidth_rad_s: u16,
+    pub pulse_diagnostics: [PulseDiagnostic; PULSE_DIAGNOSTIC_COUNT as usize],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,7 +98,8 @@ pub struct InductanceCalibration {
     failure: Failure,
     pending_failure: Failure,
     cycle_in_state: u32,
-    axis: u8,
+    position: u8,
+    pulse_level: u8,
     resistance_uv_per_count: u32,
     hold_current_sum: i64,
     hold_voltage_tick_bits_sum: i64,
@@ -94,6 +109,7 @@ pub struct InductanceCalibration {
     hold_voltage_tick_bits: i32,
     pulse_ceiling_tick_bits: i32,
     pulse_step_tick_bits: i32,
+    base_pulse_step_tick_bits: i32,
     probing: bool,
     previous_current_counts: i16,
     best_before_counts: i16,
@@ -103,6 +119,7 @@ pub struct InductanceCalibration {
     pulse_attempts: u8,
     valid_pulses: u8,
     inductance_sum_nwb_per_count: u64,
+    pulse_di_sum_counts: i32,
     result: Result,
 }
 
@@ -113,7 +130,8 @@ impl InductanceCalibration {
             failure: Failure::None,
             pending_failure: Failure::None,
             cycle_in_state: 0,
-            axis: 0,
+            position: 0,
+            pulse_level: 0,
             resistance_uv_per_count: 0,
             hold_current_sum: 0,
             hold_voltage_tick_bits_sum: 0,
@@ -123,6 +141,7 @@ impl InductanceCalibration {
             hold_voltage_tick_bits: 0,
             pulse_ceiling_tick_bits: 0,
             pulse_step_tick_bits: 0,
+            base_pulse_step_tick_bits: 0,
             probing: true,
             previous_current_counts: 0,
             best_before_counts: 0,
@@ -132,6 +151,7 @@ impl InductanceCalibration {
             pulse_attempts: 0,
             valid_pulses: 0,
             inductance_sum_nwb_per_count: 0,
+            pulse_di_sum_counts: 0,
             result: Result {
                 inductance_d_nwb_per_count: 0,
                 inductance_q_nwb_per_count: 0,
@@ -139,11 +159,7 @@ impl InductanceCalibration {
                 pulse_step_d_ticks: 0,
                 pulse_step_q_ticks: 0,
                 last_pulse_di_counts: 0,
-                gain_bus_voltage_mv: 0,
-                proportional_d_q16: 0,
-                proportional_q_q16: 0,
-                integral_per_cycle_q16: 0,
-                bandwidth_rad_s: 0,
+                pulse_diagnostics: [PulseDiagnostic::EMPTY; PULSE_DIAGNOSTIC_COUNT as usize],
             },
         }
     }
@@ -182,11 +198,14 @@ impl InductanceCalibration {
     }
 
     pub const fn pulse_progress(&self) -> u16 {
-        u16::from_le_bytes([self.valid_pulses, self.axis])
+        u16::from_le_bytes([
+            self.valid_pulses,
+            self.position * PULSE_LEVEL_COUNT + self.pulse_level,
+        ])
     }
 
     pub fn actuation(&self) -> Actuation {
-        let angle = u32::from(self.axis) * QUARTER_TURN;
+        let angle = u32::from(self.position) * QUARTER_TURN;
         match self.state {
             State::RampHold => Actuation::Current {
                 angle,
@@ -239,8 +258,8 @@ impl InductanceCalibration {
             State::AxisPause => {
                 self.cycle_in_state = self.cycle_in_state.saturating_add(1);
                 if self.cycle_in_state >= AXIS_PAUSE_CYCLES {
-                    self.axis = 1;
-                    self.reset_axis();
+                    self.position = self.position.saturating_add(1);
+                    self.reset_position();
                     self.state = State::RampHold;
                 }
             }
@@ -287,14 +306,14 @@ impl InductanceCalibration {
             .max(1 << 16);
         if self.probing {
             self.pulse_step_tick_bits = (self.pulse_ceiling_tick_bits / 50).max(1 << 16);
-        } else if self.pulse_step_tick_bits > self.pulse_ceiling_tick_bits {
+        } else if pulse_step_for_level(self.base_pulse_step_tick_bits, PULSE_LEVEL_COUNT - 1)
+            > self.pulse_ceiling_tick_bits
+        {
             self.pending_failure = Failure::PulseResponse;
             self.state = State::RampDown;
             self.cycle_in_state = 0;
             return;
         }
-        self.result.gain_bus_voltage_mv =
-            observation.bus_voltage_mv.min(u32::from(u16::MAX)) as u16;
         self.state = State::Discharge;
         self.cycle_in_state = 0;
     }
@@ -339,18 +358,23 @@ impl InductanceCalibration {
         self.result.last_pulse_di_counts = self.best_di_counts;
         if self.probing {
             if self.best_di_counts >= INDUCTANCE_TARGET_DI_COUNTS {
-                self.pulse_step_tick_bits = scale_pulse_to_target(
+                self.base_pulse_step_tick_bits = scale_pulse_to_target(
                     self.pulse_step_tick_bits,
                     self.best_di_counts,
-                    self.pulse_ceiling_tick_bits,
+                    self.pulse_ceiling_tick_bits * 2 / 3,
                 );
                 self.probing = false;
             } else if self.pulse_step_tick_bits >= self.pulse_ceiling_tick_bits {
+                self.base_pulse_step_tick_bits = self.pulse_ceiling_tick_bits * 2 / 3;
                 self.probing = false;
             } else {
                 self.pulse_step_tick_bits = (i64::from(self.pulse_step_tick_bits) * 3 / 2)
                     .min(i64::from(self.pulse_ceiling_tick_bits))
                     as i32;
+            }
+            if !self.probing {
+                self.pulse_step_tick_bits =
+                    pulse_step_for_level(self.base_pulse_step_tick_bits, self.pulse_level);
             }
             self.state = State::Discharge;
             self.cycle_in_state = 0;
@@ -371,19 +395,15 @@ impl InductanceCalibration {
             self.inductance_sum_nwb_per_count = self
                 .inductance_sum_nwb_per_count
                 .saturating_add(u64::from(inductance));
+            self.pulse_di_sum_counts = self
+                .pulse_di_sum_counts
+                .saturating_add(i32::from(self.best_di_counts));
             self.valid_pulses = self.valid_pulses.saturating_add(1);
         }
         if self.valid_pulses >= INDUCTANCE_PULSES_PER_AXIS {
             let average = (self.inductance_sum_nwb_per_count / u64::from(self.valid_pulses))
                 .min(u64::from(u32::MAX)) as u32;
-            if self.axis == 0 {
-                self.result.inductance_d_nwb_per_count = average;
-                self.result.pulse_step_d_ticks = (self.pulse_step_tick_bits >> 16) as i16;
-            } else {
-                self.result.inductance_q_nwb_per_count = average;
-                self.result.pulse_step_q_ticks = (self.pulse_step_tick_bits >> 16) as i16;
-            }
-            self.state = State::RampDown;
+            self.finish_pulse_level(average);
             self.cycle_in_state = 0;
         } else if self.pulse_attempts >= MAX_PULSE_ATTEMPTS {
             self.pending_failure = Failure::PulseResponse;
@@ -404,7 +424,7 @@ impl InductanceCalibration {
             self.state = State::Failed;
             self.failure = self.pending_failure;
             self.pending_failure = Failure::None;
-        } else if self.axis == 0 {
+        } else if self.position + 1 < LOCK_POSITION_COUNT {
             self.state = State::AxisPause;
         } else if self.finish_result() {
             self.state = State::Complete;
@@ -424,21 +444,40 @@ impl InductanceCalibration {
         {
             return false;
         }
-        let bus_mv = u32::from(self.result.gain_bus_voltage_mv);
-        let volts_per_tick_uv = bus_mv.saturating_mul(1_000) / u32::from(PWM_PERIOD_TICKS);
-        if volts_per_tick_uv == 0 {
-            return false;
-        }
-        self.result.proportional_d_q16 = proportional_gain_q16(ld, volts_per_tick_uv);
-        self.result.proportional_q_q16 = proportional_gain_q16(lq, volts_per_tick_uv);
-        self.result.integral_per_cycle_q16 =
-            integral_gain_q16(self.resistance_uv_per_count, volts_per_tick_uv);
-        self.result.bandwidth_rad_s = CURRENT_LOOP_TUNING_BANDWIDTH_RAD_S as u16;
         true
     }
 
-    fn reset_axis(&mut self) {
+    fn finish_pulse_level(&mut self, average_inductance: u32) {
+        let diagnostic_index = usize::from(self.position * PULSE_LEVEL_COUNT + self.pulse_level);
+        let average_di = self.pulse_di_sum_counts / i32::from(self.valid_pulses);
+        self.result.pulse_diagnostics[diagnostic_index] = PulseDiagnostic {
+            pulse_step_ticks: (self.pulse_step_tick_bits >> 16) as i16,
+            average_di_counts: average_di as i16,
+            inductance_nwb_per_count: average_inductance,
+        };
+        if self.pulse_level == 1 {
+            if self.position == 0 {
+                self.result.inductance_d_nwb_per_count = average_inductance;
+                self.result.pulse_step_d_ticks = (self.pulse_step_tick_bits >> 16) as i16;
+            } else if self.position == 1 {
+                self.result.inductance_q_nwb_per_count = average_inductance;
+                self.result.pulse_step_q_ticks = (self.pulse_step_tick_bits >> 16) as i16;
+            }
+        }
+        if self.pulse_level + 1 < PULSE_LEVEL_COUNT {
+            self.pulse_level += 1;
+            self.pulse_step_tick_bits =
+                pulse_step_for_level(self.base_pulse_step_tick_bits, self.pulse_level);
+            self.reset_pulse_accumulator();
+            self.state = State::Discharge;
+        } else {
+            self.state = State::RampDown;
+        }
+    }
+
+    fn reset_position(&mut self) {
         self.cycle_in_state = 0;
+        self.pulse_level = 0;
         self.hold_current_sum = 0;
         self.hold_voltage_tick_bits_sum = 0;
         self.hold_voltage_tick_mv_q16_sum = 0;
@@ -446,9 +485,16 @@ impl InductanceCalibration {
         self.hold_current_counts = 0;
         self.hold_voltage_tick_bits = 0;
         self.pulse_ceiling_tick_bits = 0;
+        self.pulse_step_tick_bits =
+            pulse_step_for_level(self.base_pulse_step_tick_bits, self.pulse_level);
+        self.reset_pulse_accumulator();
+    }
+
+    fn reset_pulse_accumulator(&mut self) {
         self.pulse_attempts = 0;
         self.valid_pulses = 0;
         self.inductance_sum_nwb_per_count = 0;
+        self.pulse_di_sum_counts = 0;
     }
 
     fn advance_after(&mut self, cycles: u32, next: State) {
@@ -490,25 +536,17 @@ fn pulse_inductance_nwb_per_count(
         .then_some(inductance)
 }
 
-fn proportional_gain_q16(inductance_nwb_per_count: u32, volts_per_tick_uv: u32) -> i32 {
-    let numerator = u64::from(inductance_nwb_per_count)
-        .saturating_mul(u64::from(CURRENT_LOOP_TUNING_BANDWIDTH_RAD_S))
-        .saturating_mul(1 << 16);
-    let denominator = u64::from(volts_per_tick_uv).saturating_mul(1_000);
-    (numerator / denominator).min(i32::MAX as u64) as i32
-}
-
-fn integral_gain_q16(resistance_uv_per_count: u32, volts_per_tick_uv: u32) -> i32 {
-    let numerator = u64::from(resistance_uv_per_count)
-        .saturating_mul(u64::from(CURRENT_LOOP_TUNING_BANDWIDTH_RAD_S))
-        .saturating_mul(1 << 16);
-    let denominator = u64::from(PWM_HZ).saturating_mul(u64::from(volts_per_tick_uv));
-    (numerator / denominator).min(i32::MAX as u64) as i32
-}
-
 fn scale_pulse_to_target(pulse_bits: i32, measured_di: i16, ceiling_bits: i32) -> i32 {
     (i64::from(pulse_bits) * i64::from(INDUCTANCE_TARGET_DI_COUNTS) / i64::from(measured_di))
         .clamp(1_i64 << 16, i64::from(ceiling_bits)) as i32
+}
+
+fn pulse_step_for_level(base_bits: i32, level: u8) -> i32 {
+    match level {
+        0 => (base_bits / 2).max(1 << 16),
+        1 => base_bits,
+        _ => base_bits.saturating_mul(3) / 2,
+    }
 }
 
 fn tick_mv_q16_to_uv(tick_mv_q16: i64, period_ticks: u16) -> i64 {
@@ -570,28 +608,52 @@ mod tests {
     }
 
     #[test]
-    fn pi_gain_conversion_matches_the_fixed_tick_domain() {
-        let volts_per_tick_uv = 52_300 * 1_000 / 2_250;
-        let kp = proportional_gain_q16(7_500, volts_per_tick_uv);
-        let ki = integral_gain_q16(4_300, volts_per_tick_uv);
-        assert!((21_000..=21_300).contains(&kp));
-        assert!((755..=760).contains(&ki));
-    }
-
-    #[test]
     fn pulse_probe_scales_back_to_the_current_target() {
         assert_eq!(scale_pulse_to_target(120 << 16, 30, 500 << 16), 80 << 16);
     }
 
     #[test]
-    fn calibrated_pulse_is_reused_for_the_second_lock_position() {
+    fn calibrated_pulse_builds_the_same_three_level_ladder_at_every_position() {
         let mut calibration = InductanceCalibration::new();
-        calibration.pulse_step_tick_bits = 53 << 16;
+        calibration.base_pulse_step_tick_bits = 40 << 16;
         calibration.probing = false;
 
-        calibration.reset_axis();
+        for position in 0..LOCK_POSITION_COUNT {
+            calibration.position = position;
+            calibration.reset_position();
+            assert_eq!(calibration.pulse_step_tick_bits, 20 << 16);
+            assert_eq!(
+                pulse_step_for_level(calibration.base_pulse_step_tick_bits, 1),
+                40 << 16
+            );
+            assert_eq!(
+                pulse_step_for_level(calibration.base_pulse_step_tick_bits, 2),
+                60 << 16
+            );
+        }
 
-        assert_eq!(calibration.pulse_step_tick_bits, 53 << 16);
         assert!(!calibration.probing);
+    }
+
+    #[test]
+    fn completed_level_retains_angle_step_average_di_and_inductance() {
+        let mut calibration = InductanceCalibration::new();
+        calibration.position = 2;
+        calibration.pulse_level = 1;
+        calibration.base_pulse_step_tick_bits = 40 << 16;
+        calibration.pulse_step_tick_bits = 40 << 16;
+        calibration.valid_pulses = 20;
+        calibration.pulse_di_sum_counts = 360;
+
+        calibration.finish_pulse_level(2_750);
+
+        assert_eq!(
+            calibration.result().pulse_diagnostics[7],
+            PulseDiagnostic {
+                pulse_step_ticks: 40,
+                average_di_counts: 18,
+                inductance_nwb_per_count: 2_750,
+            }
+        );
     }
 }

@@ -38,7 +38,7 @@ pub const HALL_TIMER_HZ: u32 = 1_000_000;
 pub const HALL_TIMER_PRESCALER: u16 = (APB1_TIMER_HZ / HALL_TIMER_HZ - 1) as u16;
 pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
     [5, 1, 3, 2, 6, 4],
-    [5_699, 16_526, 26_499, 37_754, 49_151, 59_124],
+    [5_484, 15_416, 26_478, 38_207, 49_768, 60_875],
     -1,
 );
 
@@ -237,11 +237,11 @@ mod tests {
     }
 
     #[test]
-    fn hall_geometry_matches_the_hardware_validated_stock_table() {
+    fn hall_geometry_matches_the_four_run_bidirectional_calibration() {
         assert_eq!(HALL_GEOMETRY.electrical_states(), &[5, 1, 3, 2, 6, 4]);
         assert_eq!(
             HALL_GEOMETRY.boundaries_q16(),
-            &[5_699, 16_526, 26_499, 37_754, 49_151, 59_124]
+            &[5_484, 15_416, 26_478, 38_207, 49_768, 60_875]
         );
     }
 

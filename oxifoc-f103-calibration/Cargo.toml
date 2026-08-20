@@ -1,6 +1,6 @@
 [package]
 name = "oxifoc-f103-calibration"
-version = "0.2.0"
+version = "0.3.2"
 edition = "2024"
 publish = false
 description = "Synchronous motor-parameter calibration firmware for the S73 STM32F103 controller"
@@ -34,9 +34,15 @@ stm32f1 = { version = "0.15", optional = true, features = ["stm32f103", "rt"] }
 [profile.release]
 codegen-units = 1
 lto = "fat"
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
 strip = true
+
+[profile.release.package.oxifoc-core]
+opt-level = "s"
+
+[profile.release.package.oxifoc-f103]
+opt-level = "s"
 
 [lints.rust]
 unused_qualifications = "warn"

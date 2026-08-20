@@ -11,7 +11,10 @@ use stm32f1::stm32f103::interrupt;
 use crate::calibration::{
     flux_linkage::{FluxLinkageCalibration, Observation as FluxObservation},
     hall_calibration::HallCalibration,
-    inductance::{InductanceCalibration, Observation as InductanceObservation},
+    inductance::{
+        InductanceCalibration, Observation as InductanceObservation, PULSE_DIAGNOSTIC_COUNT,
+        PulseDiagnostic,
+    },
     resistance::{Point, ResistanceCalibration, Sample},
     types::{Actuation, Failure, Routine},
 };
@@ -59,20 +62,17 @@ pub struct Snapshot {
     pub pulse_step_d_ticks: i16,
     pub pulse_step_q_ticks: i16,
     pub last_pulse_di_counts: i16,
-    pub proportional_d_q16: i32,
-    pub proportional_q_q16: i32,
-    pub integral_per_cycle_q16: i32,
-    pub gain_bus_voltage_mv: u16,
-    pub tuning_bandwidth_rad_s: u16,
     pub flux_linkage_nwb: u32,
     pub average_bemf_d_uv: i32,
     pub average_bemf_q_uv: i32,
     pub flux_measurement_erpm: i16,
     pub hall_measurement_erpm: i16,
     pub sync_minimum_percent: u8,
-    pub hall_centers_q16: [u16; 8],
+    pub hall_forward_centers_q16: [u16; 8],
+    pub hall_reverse_centers_q16: [u16; 8],
     pub hall_valid_mask: u8,
-    pub hall_minimum_samples: u8,
+    pub hall_forward_minimum_samples: u8,
+    pub hall_reverse_minimum_samples: u8,
     pub injected_samples: u32,
     pub control_cycles: u32,
     pub maximum_control_cycles: u32,
@@ -220,26 +220,36 @@ pub fn snapshot() -> Snapshot {
             pulse_step_d_ticks: inductance.pulse_step_d_ticks,
             pulse_step_q_ticks: inductance.pulse_step_q_ticks,
             last_pulse_di_counts: inductance.last_pulse_di_counts,
-            proportional_d_q16: inductance.proportional_d_q16,
-            proportional_q_q16: inductance.proportional_q_q16,
-            integral_per_cycle_q16: inductance.integral_per_cycle_q16,
-            gain_bus_voltage_mv: inductance.gain_bus_voltage_mv,
-            tuning_bandwidth_rad_s: inductance.bandwidth_rad_s,
             flux_linkage_nwb: flux_linkage.flux_linkage_nwb,
             average_bemf_d_uv: flux_linkage.average_bemf_d_uv,
             average_bemf_q_uv: flux_linkage.average_bemf_q_uv,
             flux_measurement_erpm: flux_linkage.measurement_erpm,
             hall_measurement_erpm: flux_linkage.hall_measurement_erpm,
             sync_minimum_percent: flux_linkage.sync_minimum_percent,
-            hall_centers_q16: hall.centers_q16,
+            hall_forward_centers_q16: hall.forward_centers_q16,
+            hall_reverse_centers_q16: hall.reverse_centers_q16,
             hall_valid_mask: hall.valid_mask,
-            hall_minimum_samples: hall.minimum_samples,
+            hall_forward_minimum_samples: hall.forward_minimum_samples,
+            hall_reverse_minimum_samples: hall.reverse_minimum_samples,
             injected_samples: state.injected_samples,
             control_cycles: CONTROL_CYCLES.load(Ordering::Relaxed),
             maximum_control_cycles: state.maximum_control_cycles,
             timing_overruns: state.timing_overruns,
             fault_flags: hardware::fault_flags(),
         }
+    })
+}
+
+pub fn pulse_diagnostic(slot: u8) -> PulseDiagnostic {
+    cortex_m::interrupt::free(|_| {
+        if !CONTROL_INITIALIZED.load(Ordering::Acquire) || slot >= PULSE_DIAGNOSTIC_COUNT {
+            return PulseDiagnostic::default();
+        }
+        // SAFETY: initialization is published before foreground access and
+        // the interrupt is masked for this single diagnostic copy.
+        let state_ptr = unsafe { (*CONTROL.0.get()).as_ptr() };
+        // SAFETY: the outer cell remains initialized for the application life.
+        unsafe { (&*state_ptr).inductance.result().pulse_diagnostics[usize::from(slot)] }
     })
 }
 
@@ -525,11 +535,12 @@ fn sequence_progress(state: &ControlState) -> u16 {
 
 fn sequence_actuation(state: &ControlState) -> Actuation {
     match state.routine {
-        Routine::Resistance => Actuation::Current {
+        Routine::Resistance if state.resistance.energizing() => Actuation::Current {
             angle: 0,
             direct_counts: state.resistance.target_counts(),
             quadrature_counts: 0,
         },
+        Routine::Resistance => Actuation::Off,
         Routine::Inductance => state.inductance.actuation(),
         Routine::FluxLinkage => state.flux_linkage.actuation(),
         Routine::Hall => state.hall.actuation(),

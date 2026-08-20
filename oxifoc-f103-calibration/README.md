@@ -10,12 +10,13 @@ The image implements the useful OxiFOC detection sequence in the fixed-point
 units used by this controller:
 
 - a two-point differential phase-resistance sweep at 50 and 250 current counts;
-- discharge-anchored, current-budgeted voltage pulses for effective `Ld` and
-  `Lq`, followed by PI gains at a documented 1,000 rad/s bandwidth;
+- discharge-anchored, current-budgeted voltage pulses at four electrical lock
+  positions and three shared stimulus amplitudes;
 - the driven back-EMF-vector flux measurement
   `e = V - R*i - j*omega*L*i`, which is independent of open-loop load angle;
-- six alternating forward/reverse electrical Hall sweeps and a circular center
-  average indexed by raw Hall state.
+- six alternating forward/reverse electrical Hall sweeps at 80 current counts,
+  retaining both directional centers and their circular midpoint by raw Hall
+  state.
 
 Resistance is reported primarily as effective microvolts per current-ADC
 count, and inductance as `L * current_scale` in nanowebers per count. These are
@@ -73,11 +74,21 @@ and submits `STOP` if any authorized run exits with an error. The calibration
 image filters unrelated bike traffic in bxCAN hardware; updater and identity
 requests remain accepted.
 
-The schema-3 result reports the voltage-pulse stimulus at both rotor lock
-positions and the Hall-derived electrical speed observed during the flux
-sample. The host accepts the flux result only when Hall speed is within 15% of
-the 6,000 eRPM command. After a successful Hall sweep it validates the raw-state
-cyclic order and 30--90 electrical-degree sector widths, converts the measured
-centers to circular midpoint boundaries, and prints an exact
-`HallGeometry::new(...)` candidate plus boundary deltas from the ride firmware.
-The output is advisory: calibration never edits the ride configuration.
+The schema-4 result reports a twelve-cell pulse grid: four lock positions at
+90 electrical-degree intervals, each measured at one-half, one, and
+three-halves of the calibrated base stimulus. Every cell includes the actual
+pulse ticks, average current rise, and effective inductance. The legacy `Ld`
+and `Lq` summary fields remain the base-amplitude results at the first two lock
+positions so the driven flux routine can consume their mean; they are not
+saliency measurements. Pulse-derived PI gains are intentionally not reported
+because the pulse result has not matched the motor's loaded effective
+inductance.
+
+The result also includes Hall-derived electrical speed during the flux sample.
+The host accepts flux only when Hall speed is within 15% of the 6,000 eRPM
+command. After a successful Hall sweep it reports the exact forward and reverse
+centers and their signed hysteresis, forms circular midpoints, validates the
+raw-state cyclic order and 30--90 electrical-degree sector widths, and prints
+an exact `HallGeometry::new(...)` candidate plus boundary deltas from the ride
+firmware. The output is advisory: calibration never edits the ride
+configuration.

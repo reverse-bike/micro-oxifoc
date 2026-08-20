@@ -6,6 +6,26 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.3.0 - 2026-08-20
+
+Changes:
+
+- Replaced the stock-derived Hall boundaries with the circular consensus from
+  four complete bidirectional calibration runs. The raw-state order and motor
+  direction remain `[5, 1, 3, 2, 6, 4]` and `-1`; the calibrated Q0.16
+  boundaries are now `[5484, 15416, 26478, 38207, 49768, 60875]`.
+- Added a regression that pins the ride firmware to the calibrated geometry.
+  Motor-model coefficients, observer crossover, current limits, protection
+  thresholds, and CAN telemetry schema and layout are unchanged.
+
+Reason: the four-run consensus found only a +1.35-degree global phase offset,
+but repeatable sector-shape errors reached 7.54 electrical degrees at a sector
+center and 9.62 degrees at a boundary. The calibrated geometry removes those
+local errors so Hall-only and Hall-to-observer operation use the measured motor
+geometry instead of the stock approximation. The worst raw-state-center spread
+between runs was 5.17 degrees, while the largest corrections were concentrated
+in the repeatable raw-state 6 and 4 sectors.
+
 ## 0.2.1 - 2026-08-20
 
 Changes:

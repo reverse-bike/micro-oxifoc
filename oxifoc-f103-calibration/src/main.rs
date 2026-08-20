@@ -13,7 +13,7 @@ use oxifoc_f103::{
     transport,
 };
 use oxifoc_f103_calibration::{
-    calibration::types::Failure,
+    calibration::{inductance::PULSE_DIAGNOSTIC_COUNT, types::Failure},
     config as calibration_config, control,
     protocol::{self, Command, Status},
 };
@@ -42,6 +42,7 @@ fn main() -> ! {
     let mut armed = false;
     let mut arm_deadline_ms = 0;
     let mut telemetry_page = 0_u8;
+    let mut pulse_diagnostic_slot = 0_u8;
     let mut next_telemetry_ms = 0_u32;
 
     if peripherals::configure_72mhz_clock().is_ok() {
@@ -209,6 +210,11 @@ fn main() -> ! {
 
         if deadline_due(now, next_telemetry_ms) {
             let control = control::snapshot();
+            let pulse_diagnostic = if telemetry_page == 15 {
+                control::pulse_diagnostic(pulse_diagnostic_slot)
+            } else {
+                Default::default()
+            };
             let status = Status {
                 routine: control.routine as u8,
                 state: control.state,
@@ -247,22 +253,24 @@ fn main() -> ! {
                 pulse_step_d_ticks: control.pulse_step_d_ticks,
                 pulse_step_q_ticks: control.pulse_step_q_ticks,
                 last_pulse_di_counts: control.last_pulse_di_counts,
-                proportional_d_q16: control.proportional_d_q16,
-                proportional_q_q16: control.proportional_q_q16,
-                integral_per_cycle_q16: control.integral_per_cycle_q16,
-                gain_bus_voltage_mv: control.gain_bus_voltage_mv,
-                tuning_bandwidth_rad_s: control.tuning_bandwidth_rad_s,
                 flux_linkage_nwb: control.flux_linkage_nwb,
                 average_bemf_d_uv: control.average_bemf_d_uv,
                 average_bemf_q_uv: control.average_bemf_q_uv,
                 flux_measurement_erpm: control.flux_measurement_erpm,
                 hall_measurement_erpm: control.hall_measurement_erpm,
                 sync_minimum_percent: control.sync_minimum_percent,
-                hall_centers_q16: control.hall_centers_q16,
+                hall_forward_centers_q16: control.hall_forward_centers_q16,
+                hall_reverse_centers_q16: control.hall_reverse_centers_q16,
                 hall_valid_mask: control.hall_valid_mask,
-                hall_minimum_samples: control.hall_minimum_samples,
+                hall_forward_minimum_samples: control.hall_forward_minimum_samples,
+                hall_reverse_minimum_samples: control.hall_reverse_minimum_samples,
+                pulse_diagnostic_slot,
+                pulse_diagnostic,
             };
             if transport::can::transmit(protocol::status_frame(telemetry_page, status)) {
+                if telemetry_page == 15 {
+                    pulse_diagnostic_slot = (pulse_diagnostic_slot + 1) % PULSE_DIAGNOSTIC_COUNT;
+                }
                 telemetry_page = (telemetry_page + 1) % protocol::STATUS_PAGE_COUNT;
             }
             next_telemetry_ms = now.wrapping_add(TELEMETRY_PERIOD_MS);

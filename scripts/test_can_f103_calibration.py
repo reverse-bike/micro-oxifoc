@@ -88,6 +88,38 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(status.pulse_step_d_ticks, 53)
         self.assertIn(8, status.pages_seen)
 
+    def test_schema_four_decodes_directional_hall_and_pulse_grid(self) -> None:
+        status = Status()
+        pages = (
+            bytes([0xC0, 4, 0, 0, 0x34, 0x12, 0, 0]),
+            bytes([0xC9, 0xE8, 0xFD, 0x20, 0x4E, 0x30, 0x75, 100]),
+            bytes([0xCA, 0x40, 0x9C, 0x50, 0xC3, 0x60, 0xEA, 0x7E]),
+            bytes([0xCD, 0xE8, 0x03, 0x84, 0x4E, 0x94, 0x75, 90]),
+            bytes([0xCE, 0xA4, 0x9C, 0xB4, 0xC3, 0xC4, 0xEA, 0x7E]),
+            bytes([0xCF, 7, 12, 40, 0, 18, 19, 1]),
+        )
+        for data in pages:
+            self.assertTrue(
+                status.update(
+                    can.Message(
+                        arbitration_id=0x2F7,
+                        is_extended_id=False,
+                        data=data,
+                    )
+                )
+            )
+
+        self.assertEqual(status.hall_centers_q16[1], 232)
+        self.assertEqual(status.hall_forward_minimum_samples, 100)
+        self.assertEqual(status.hall_reverse_minimum_samples, 90)
+        self.assertEqual(status.hall_minimum_samples, 90)
+        self.assertEqual(status.hall_valid_mask, 0x7E)
+        diagnostic = status.pulse_diagnostics[7]
+        self.assertEqual(diagnostic.position_q8, 128)
+        self.assertEqual(diagnostic.pulse_step_ticks, 40)
+        self.assertEqual(diagnostic.average_di_counts, 18)
+        self.assertEqual(diagnostic.inductance_nwb_per_count, 2_750)
+
 
 class HallGeometryTests(unittest.TestCase):
     def test_centers_compile_to_rotation_ordered_boundaries(self) -> None:

@@ -23,7 +23,7 @@ from can_bootloader_flash import normalized_channel, prepare_gs_usb_backend
 BITRATE = 250_000
 COMMAND_ID = 0x2F2
 STATUS_ID = 0x2F7
-SCHEMA = 3
+SCHEMA = 4
 TRAILER = bytes.fromhex("a55a")
 
 RESISTANCE_STATE_NAMES = {
@@ -37,6 +37,9 @@ RESISTANCE_STATE_NAMES = {
     7: "ramp-down",
     8: "complete",
     9: "failed",
+    10: "finalize-low",
+    11: "finalize-high",
+    12: "finalize-slope",
 }
 
 INDUCTANCE_STATE_NAMES = {
@@ -62,6 +65,10 @@ FLUX_STATE_NAMES = {
     5: "ramp-down",
     6: "complete",
     7: "failed",
+    8: "finalize-d",
+    9: "finalize-q",
+    10: "finalize-magnitude",
+    11: "finalize-flux",
 }
 
 HALL_STATE_NAMES = {
@@ -72,6 +79,7 @@ HALL_STATE_NAMES = {
     4: "ramp-down",
     5: "complete",
     6: "failed",
+    7: "finalize",
 }
 
 ROUTINE_NAMES = {
@@ -102,7 +110,7 @@ FAILURE_NAMES = {
     16: "Hall states",
 }
 
-STATUS_PAGE_COUNT = 15
+STATUS_PAGE_COUNT = 16
 
 
 class CalibrationError(RuntimeError):
@@ -243,6 +251,16 @@ def validate_flux_hall_speed(status: Status) -> None:
         )
 
 
+@dataclass(frozen=True)
+class PulseDiagnostic:
+    slot: int
+    total: int
+    position_q8: int
+    pulse_step_ticks: int
+    average_di_counts: int
+    inductance_nwb_per_count: int
+
+
 @dataclass
 class Status:
     schema: int = 0
@@ -289,8 +307,14 @@ class Status:
     hall_measurement_erpm: int = 0
     sync_minimum_percent: int = 0
     hall_centers_q16: list[int] = field(default_factory=lambda: [0] * 8)
+    hall_forward_centers_q16: list[int] = field(default_factory=lambda: [0] * 8)
+    hall_reverse_centers_q16: list[int] = field(default_factory=lambda: [0] * 8)
     hall_valid_mask: int = 0
     hall_minimum_samples: int = 0
+    hall_forward_minimum_samples: int = 0
+    hall_reverse_minimum_samples: int = 0
+    pulse_diagnostic_total: int = 0
+    pulse_diagnostics: dict[int, PulseDiagnostic] = field(default_factory=dict)
     page_zero_updates: int = 0
     pages_seen: set[int] = field(default_factory=set)
 
@@ -326,6 +350,19 @@ class Status:
     def pulse_step_ticks(self) -> int:
         """Compatibility name for schema-2 logs, whose pulse was the q-axis value."""
         return self.pulse_step_q_ticks
+
+    def update_combined_hall_centers(self) -> None:
+        for raw in range(1, 7):
+            forward = self.hall_forward_centers_q16[raw]
+            reverse = self.hall_reverse_centers_q16[raw]
+            if forward == 0 or reverse == 0:
+                continue
+            delta = (forward - reverse + 32_768) % 65_536 - 32_768
+            self.hall_centers_q16[raw] = (reverse + delta // 2) % 65_536
+        self.hall_minimum_samples = min(
+            self.hall_forward_minimum_samples,
+            self.hall_reverse_minimum_samples,
+        )
 
     def update(self, message: can.Message) -> bool:
         data = bytes(message.data)
@@ -395,14 +432,34 @@ class Status:
                 )
             self.last_pulse_di_counts = int.from_bytes(data[7:8], "little", signed=True)
         elif page == 9:
-            self.proportional_d_q16 = int.from_bytes(data[1:5], "little", signed=True)
-            self.proportional_q_q16 = signed_i24(data[5:8])
+            if self.schema >= 4:
+                for raw in range(1, 4):
+                    offset = 1 + (raw - 1) * 2
+                    self.hall_forward_centers_q16[raw] = int.from_bytes(
+                        data[offset : offset + 2], "little"
+                    )
+                self.hall_forward_minimum_samples = data[7]
+                self.update_combined_hall_centers()
+            else:
+                self.proportional_d_q16 = int.from_bytes(
+                    data[1:5], "little", signed=True
+                )
+                self.proportional_q_q16 = signed_i24(data[5:8])
         elif page == 10:
-            self.integral_per_cycle_q16 = int.from_bytes(
-                data[1:5], "little", signed=True
-            )
-            self.gain_bus_voltage_mv = int.from_bytes(data[5:7], "little")
-            self.tuning_bandwidth_rad_s = data[7] * 10
+            if self.schema >= 4:
+                for raw in range(4, 7):
+                    offset = 1 + (raw - 4) * 2
+                    self.hall_forward_centers_q16[raw] = int.from_bytes(
+                        data[offset : offset + 2], "little"
+                    )
+                self.hall_valid_mask = data[7]
+                self.update_combined_hall_centers()
+            else:
+                self.integral_per_cycle_q16 = int.from_bytes(
+                    data[1:5], "little", signed=True
+                )
+                self.gain_bus_voltage_mv = int.from_bytes(data[5:7], "little")
+                self.tuning_bandwidth_rad_s = data[7] * 10
         elif page == 11:
             if self.schema >= 3:
                 self.flux_linkage_nwb = int.from_bytes(data[1:3], "little") * 10_000
@@ -422,19 +479,43 @@ class Status:
             self.average_bemf_d_uv = int.from_bytes(data[1:5], "little", signed=True)
             self.average_bemf_q_uv = signed_i24(data[5:8])
         elif page == 13:
+            target = (
+                self.hall_reverse_centers_q16
+                if self.schema >= 4
+                else self.hall_centers_q16
+            )
             for raw in range(1, 4):
                 offset = 1 + (raw - 1) * 2
-                self.hall_centers_q16[raw] = int.from_bytes(
-                    data[offset : offset + 2], "little"
-                )
-            self.hall_minimum_samples = data[7]
-        else:
+                target[raw] = int.from_bytes(data[offset : offset + 2], "little")
+            if self.schema >= 4:
+                self.hall_reverse_minimum_samples = data[7]
+                self.update_combined_hall_centers()
+            else:
+                self.hall_minimum_samples = data[7]
+        elif page == 14:
+            target = (
+                self.hall_reverse_centers_q16
+                if self.schema >= 4
+                else self.hall_centers_q16
+            )
             for raw in range(4, 7):
                 offset = 1 + (raw - 4) * 2
-                self.hall_centers_q16[raw] = int.from_bytes(
-                    data[offset : offset + 2], "little"
-                )
+                target[raw] = int.from_bytes(data[offset : offset + 2], "little")
             self.hall_valid_mask = data[7]
+            if self.schema >= 4:
+                self.update_combined_hall_centers()
+        else:
+            diagnostic = PulseDiagnostic(
+                slot=data[1],
+                total=data[2],
+                position_q8=(data[1] // 3) * 64,
+                pulse_step_ticks=int.from_bytes(data[3:5], "little", signed=True),
+                average_di_counts=int.from_bytes(data[5:6], "little", signed=True),
+                inductance_nwb_per_count=int.from_bytes(data[6:8], "little") * 10,
+            )
+            self.pulse_diagnostic_total = diagnostic.total
+            if diagnostic.inductance_nwb_per_count != 0:
+                self.pulse_diagnostics[diagnostic.slot] = diagnostic
         return True
 
 
@@ -520,11 +601,25 @@ def print_status(status: Status) -> None:
     print(f"pulse_step_d_ticks         {status.pulse_step_d_ticks}")
     print(f"pulse_step_q_ticks         {status.pulse_step_q_ticks}")
     print(f"last_pulse_di_counts       {status.last_pulse_di_counts}")
-    print(f"proportional_d_q16         {status.proportional_d_q16}")
-    print(f"proportional_q_q16         {status.proportional_q_q16}")
-    print(f"integral_per_cycle_q16     {status.integral_per_cycle_q16}")
-    print(f"gain_bus_voltage_mv        {status.gain_bus_voltage_mv}")
-    print(f"tuning_bandwidth_rad_s     {status.tuning_bandwidth_rad_s}")
+    if status.schema < 4:
+        print(f"proportional_d_q16         {status.proportional_d_q16}")
+        print(f"proportional_q_q16         {status.proportional_q_q16}")
+        print(f"integral_per_cycle_q16     {status.integral_per_cycle_q16}")
+        print(f"gain_bus_voltage_mv        {status.gain_bus_voltage_mv}")
+        print(f"tuning_bandwidth_rad_s     {status.tuning_bandwidth_rad_s}")
+    if status.pulse_diagnostics:
+        print("pulse_grid")
+        print("  slot  angle_deg  step_ticks  average_di  L_nWb/count")
+        for diagnostic in sorted(
+            status.pulse_diagnostics.values(), key=lambda item: item.slot
+        ):
+            print(
+                f"  {diagnostic.slot:4d}  "
+                f"{diagnostic.position_q8 * 360 / 256:9.1f}  "
+                f"{diagnostic.pulse_step_ticks:10d}  "
+                f"{diagnostic.average_di_counts:10d}  "
+                f"{diagnostic.inductance_nwb_per_count:11d}"
+            )
     print(f"flux_linkage_mwb           {status.flux_linkage_nwb / 1_000_000:.4f}")
     print(
         f"average_bemf_uv            [{status.average_bemf_d_uv}, "
@@ -535,6 +630,31 @@ def print_status(status: Status) -> None:
     print(f"sync_minimum_percent       {status.sync_minimum_percent}")
     hall_degrees = [round(value * 360 / 65_536, 2) for value in status.hall_centers_q16]
     print(f"hall_centers_degrees       {hall_degrees}")
+    if status.schema >= 4:
+        forward_degrees = [
+            round(value * 360 / 65_536, 2)
+            for value in status.hall_forward_centers_q16
+        ]
+        reverse_degrees = [
+            round(value * 360 / 65_536, 2)
+            for value in status.hall_reverse_centers_q16
+        ]
+        hysteresis_degrees = [
+            round(((forward - reverse + 32_768) % 65_536 - 32_768) * 360 / 65_536, 2)
+            for forward, reverse in zip(
+                status.hall_forward_centers_q16,
+                status.hall_reverse_centers_q16,
+                strict=True,
+            )
+        ]
+        print(f"hall_forward_degrees       {forward_degrees}")
+        print(f"hall_reverse_degrees       {reverse_degrees}")
+        print(f"hall_hysteresis_degrees    {hysteresis_degrees}")
+        print(
+            "hall_direction_samples     "
+            f"[{status.hall_forward_minimum_samples}, "
+            f"{status.hall_reverse_minimum_samples}]"
+        )
     print(f"hall_valid_mask            0x{status.hall_valid_mask:02x}")
     print(f"hall_minimum_samples       {status.hall_minimum_samples}")
     if status.hall_valid_mask == 0x7E:
@@ -582,7 +702,10 @@ class Client:
 
     def receive_all_pages(self, timeout: float) -> Status:
         return self.receive_until(
-            lambda status: status.pages_seen == set(range(STATUS_PAGE_COUNT)), timeout
+            lambda status: status.schema != 0
+            and status.pages_seen
+            == set(range(STATUS_PAGE_COUNT if status.schema >= 4 else 15)),
+            timeout,
         )
 
 
@@ -675,6 +798,9 @@ def run_routine(
     failed_state: int,
     timeout: float,
 ) -> Status:
+    if routine == 2 and initial.schema >= 4:
+        initial.pulse_diagnostics.clear()
+        initial.pulse_diagnostic_total = 0
     arm_with_retry(client, initial.challenge, 6.0)
     started = start_routine_with_retry(
         client,
@@ -702,7 +828,18 @@ def run_routine(
             )
         if status.state == complete_state:
             status.pages_seen.clear()
-            return client.receive_all_pages(3.0)
+            status = client.receive_all_pages(3.0)
+            if routine == 2 and status.schema >= 4:
+                if status.pulse_diagnostic_total == 0 or len(
+                    status.pulse_diagnostics
+                ) < status.pulse_diagnostic_total:
+                    status = client.receive_until(
+                        lambda current: current.pulse_diagnostic_total > 0
+                        and len(current.pulse_diagnostics)
+                        >= current.pulse_diagnostic_total,
+                        12.0,
+                    )
+            return status
     raise CalibrationError("calibration run timed out")
 
 

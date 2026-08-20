@@ -2,12 +2,14 @@
 
 use oxifoc_f103::protocol::Frame;
 
-pub const SCHEMA: u8 = 3;
-pub const FIRMWARE_VERSION: [u8; 3] = [0, 2, 0];
+use crate::calibration::inductance::{PULSE_DIAGNOSTIC_COUNT, PulseDiagnostic};
+
+pub const SCHEMA: u8 = 4;
+pub const FIRMWARE_VERSION: [u8; 3] = [0, 3, 2];
 pub const ARM_WINDOW_MS: u32 = 10_000;
 pub const COMMAND_ID: u16 = 0x2f2;
 pub const STATUS_ID: u16 = 0x2f7;
-pub const STATUS_PAGE_COUNT: u8 = 15;
+pub const STATUS_PAGE_COUNT: u8 = 16;
 const TRAILER: [u8; 2] = [0xa5, 0x5a];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,20 +85,19 @@ pub struct Status {
     pub pulse_step_d_ticks: i16,
     pub pulse_step_q_ticks: i16,
     pub last_pulse_di_counts: i16,
-    pub proportional_d_q16: i32,
-    pub proportional_q_q16: i32,
-    pub integral_per_cycle_q16: i32,
-    pub gain_bus_voltage_mv: u16,
-    pub tuning_bandwidth_rad_s: u16,
     pub flux_linkage_nwb: u32,
     pub average_bemf_d_uv: i32,
     pub average_bemf_q_uv: i32,
     pub flux_measurement_erpm: i16,
     pub hall_measurement_erpm: i16,
     pub sync_minimum_percent: u8,
-    pub hall_centers_q16: [u16; 8],
+    pub hall_forward_centers_q16: [u16; 8],
+    pub hall_reverse_centers_q16: [u16; 8],
     pub hall_valid_mask: u8,
-    pub hall_minimum_samples: u8,
+    pub hall_forward_minimum_samples: u8,
+    pub hall_reverse_minimum_samples: u8,
+    pub pulse_diagnostic_slot: u8,
+    pub pulse_diagnostic: PulseDiagnostic,
 }
 
 pub fn status_frame(page: u8, status: Status) -> Frame {
@@ -169,13 +170,16 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
                 .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8 as u8;
         }
         9 => {
-            data[1..5].copy_from_slice(&status.proportional_d_q16.to_le_bytes());
-            copy_i24(&mut data[5..8], status.proportional_q_q16);
+            data[1..3].copy_from_slice(&status.hall_forward_centers_q16[1].to_le_bytes());
+            data[3..5].copy_from_slice(&status.hall_forward_centers_q16[2].to_le_bytes());
+            data[5..7].copy_from_slice(&status.hall_forward_centers_q16[3].to_le_bytes());
+            data[7] = status.hall_forward_minimum_samples;
         }
         10 => {
-            data[1..5].copy_from_slice(&status.integral_per_cycle_q16.to_le_bytes());
-            data[5..7].copy_from_slice(&status.gain_bus_voltage_mv.to_le_bytes());
-            data[7] = (status.tuning_bandwidth_rad_s / 10).min(u16::from(u8::MAX)) as u8;
+            data[1..3].copy_from_slice(&status.hall_forward_centers_q16[4].to_le_bytes());
+            data[3..5].copy_from_slice(&status.hall_forward_centers_q16[5].to_le_bytes());
+            data[5..7].copy_from_slice(&status.hall_forward_centers_q16[6].to_le_bytes());
+            data[7] = status.hall_valid_mask;
         }
         11 => {
             let flux_centi_mwb = (status.flux_linkage_nwb / 10_000) as u16;
@@ -189,16 +193,28 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             copy_i24(&mut data[5..8], status.average_bemf_q_uv);
         }
         13 => {
-            data[1..3].copy_from_slice(&status.hall_centers_q16[1].to_le_bytes());
-            data[3..5].copy_from_slice(&status.hall_centers_q16[2].to_le_bytes());
-            data[5..7].copy_from_slice(&status.hall_centers_q16[3].to_le_bytes());
-            data[7] = status.hall_minimum_samples;
+            data[1..3].copy_from_slice(&status.hall_reverse_centers_q16[1].to_le_bytes());
+            data[3..5].copy_from_slice(&status.hall_reverse_centers_q16[2].to_le_bytes());
+            data[5..7].copy_from_slice(&status.hall_reverse_centers_q16[3].to_le_bytes());
+            data[7] = status.hall_reverse_minimum_samples;
+        }
+        14 => {
+            data[1..3].copy_from_slice(&status.hall_reverse_centers_q16[4].to_le_bytes());
+            data[3..5].copy_from_slice(&status.hall_reverse_centers_q16[5].to_le_bytes());
+            data[5..7].copy_from_slice(&status.hall_reverse_centers_q16[6].to_le_bytes());
+            data[7] = status.hall_valid_mask;
         }
         _ => {
-            data[1..3].copy_from_slice(&status.hall_centers_q16[4].to_le_bytes());
-            data[3..5].copy_from_slice(&status.hall_centers_q16[5].to_le_bytes());
-            data[5..7].copy_from_slice(&status.hall_centers_q16[6].to_le_bytes());
-            data[7] = status.hall_valid_mask;
+            data[1] = status.pulse_diagnostic_slot;
+            data[2] = PULSE_DIAGNOSTIC_COUNT;
+            data[3..5].copy_from_slice(&status.pulse_diagnostic.pulse_step_ticks.to_le_bytes());
+            data[5] = status
+                .pulse_diagnostic
+                .average_di_counts
+                .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8 as u8;
+            let inductance_deca_nwb = (status.pulse_diagnostic.inductance_nwb_per_count / 10)
+                .min(u32::from(u16::MAX)) as u16;
+            data[6..8].copy_from_slice(&inductance_deca_nwb.to_le_bytes());
         }
     }
     Frame::new(STATUS_ID, 8, data)
@@ -293,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn inductance_pages_preserve_native_results_and_signed_gains() {
+    fn inductance_pages_preserve_native_results_and_pulse_diagnostics() {
         let status = Status {
             inductance_d_nwb_per_count: 7_500,
             inductance_q_nwb_per_count: 8_250,
@@ -301,11 +317,12 @@ mod tests {
             pulse_step_d_ticks: 53,
             pulse_step_q_ticks: 53,
             last_pulse_di_counts: 27,
-            proportional_d_q16: 21_123,
-            proportional_q_q16: -19_876,
-            integral_per_cycle_q16: 765,
-            gain_bus_voltage_mv: 52_300,
-            tuning_bandwidth_rad_s: 1_000,
+            pulse_diagnostic_slot: 7,
+            pulse_diagnostic: PulseDiagnostic {
+                pulse_step_ticks: 40,
+                average_di_counts: 18,
+                inductance_nwb_per_count: 2_750,
+            },
             ..Status::default()
         };
         assert_eq!(
@@ -317,13 +334,12 @@ mod tests {
             &8_250_u32.to_le_bytes()[..3]
         );
         assert_eq!(
-            &status_frame(9, status).data[5..8],
-            &(-19_876_i32).to_le_bytes()[..3]
-        );
-        assert_eq!(&status_frame(10, status).data[1..5], &765_i32.to_le_bytes());
-        assert_eq!(
             status_frame(8, status).data,
             [0xc8, 25, 0, 53, 0, 53, 0, 27]
+        );
+        assert_eq!(
+            status_frame(15, status).data,
+            [0xcf, 7, 12, 40, 0, 18, 19, 1]
         );
     }
 
@@ -336,9 +352,11 @@ mod tests {
             flux_measurement_erpm: 6_000,
             hall_measurement_erpm: 5_960,
             sync_minimum_percent: 84,
-            hall_centers_q16: [0, 5_461, 27_307, 16_384, 49_152, 60_075, 38_229, 0],
+            hall_forward_centers_q16: [0, 5_461, 27_307, 16_384, 49_152, 60_075, 38_229, 0],
+            hall_reverse_centers_q16: [0, 5_400, 27_200, 16_300, 49_000, 60_000, 38_100, 0],
             hall_valid_mask: 0x7e,
-            hall_minimum_samples: 255,
+            hall_forward_minimum_samples: 180,
+            hall_reverse_minimum_samples: 175,
             ..Status::default()
         };
         assert_eq!(
@@ -349,17 +367,19 @@ mod tests {
             &status_frame(12, status).data[1..5],
             &(-1_234_567_i32).to_le_bytes()
         );
-        assert_eq!(status_frame(13, status).data[1..3], 5_461_u16.to_le_bytes());
+        assert_eq!(status_frame(9, status).data[1..3], 5_461_u16.to_le_bytes());
+        assert_eq!(status_frame(9, status).data[7], 180);
+        assert_eq!(status_frame(13, status).data[1..3], 5_400_u16.to_le_bytes());
         assert_eq!(
             status_frame(14, status).data[5..7],
-            38_229_u16.to_le_bytes()
+            38_100_u16.to_le_bytes()
         );
         assert_eq!(status_frame(14, status).data[7], 0x7e);
     }
 
     #[test]
     fn telemetry_version_matches_the_crate_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
-        assert_eq!(FIRMWARE_VERSION, [0, 2, 0]);
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.2");
+        assert_eq!(FIRMWARE_VERSION, [0, 3, 2]);
     }
 }

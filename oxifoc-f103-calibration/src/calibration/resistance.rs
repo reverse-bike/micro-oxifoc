@@ -34,6 +34,9 @@ pub enum State {
     RampDown = 7,
     Complete = 8,
     Failed = 9,
+    FinalizeLow = 10,
+    FinalizeHigh = 11,
+    FinalizeSlope = 12,
 }
 
 impl State {
@@ -47,6 +50,9 @@ impl State {
                 | Self::SettleHigh
                 | Self::SampleHigh
                 | Self::RampDown
+                | Self::FinalizeLow
+                | Self::FinalizeHigh
+                | Self::FinalizeSlope
         )
     }
 }
@@ -192,6 +198,19 @@ impl ResistanceCalibration {
         self.state.active()
     }
 
+    pub const fn energizing(&self) -> bool {
+        matches!(
+            self.state,
+            State::RampLow
+                | State::SettleLow
+                | State::SampleLow
+                | State::RampHigh
+                | State::SettleHigh
+                | State::SampleHigh
+                | State::RampDown
+        )
+    }
+
     pub const fn result(&self) -> Result {
         self.result
     }
@@ -216,7 +235,12 @@ impl ResistanceCalibration {
             ),
             State::SettleHigh | State::SampleHigh => RESISTANCE_CURRENT_HIGH_COUNTS,
             State::RampDown => ramp(RESISTANCE_CURRENT_HIGH_COUNTS, 0, self.cycle_in_state),
-            State::Idle | State::Complete | State::Failed => 0,
+            State::Idle
+            | State::Complete
+            | State::Failed
+            | State::FinalizeLow
+            | State::FinalizeHigh
+            | State::FinalizeSlope => 0,
         }
     }
 
@@ -236,9 +260,6 @@ impl ResistanceCalibration {
                 self.high_accumulator.record(sample);
                 self.cycle_in_state = self.cycle_in_state.saturating_add(1);
                 if self.cycle_in_state >= SAMPLE_CYCLES {
-                    self.result.low = self.low_accumulator.point();
-                    self.result.high = self.high_accumulator.point();
-                    self.pending_failure = self.calculate_result();
                     self.state = State::RampDown;
                     self.cycle_in_state = 0;
                 }
@@ -246,15 +267,27 @@ impl ResistanceCalibration {
             State::RampDown => {
                 self.cycle_in_state = self.cycle_in_state.saturating_add(1);
                 if self.cycle_in_state >= RAMP_CYCLES {
-                    if self.pending_failure == Failure::None {
-                        self.state = State::Complete;
-                    } else {
-                        self.state = State::Failed;
-                        self.failure = self.pending_failure;
-                    }
-                    self.pending_failure = Failure::None;
+                    self.state = State::FinalizeLow;
                     self.cycle_in_state = 0;
                 }
+            }
+            State::FinalizeLow => {
+                self.result.low = self.low_accumulator.point();
+                self.state = State::FinalizeHigh;
+            }
+            State::FinalizeHigh => {
+                self.result.high = self.high_accumulator.point();
+                self.state = State::FinalizeSlope;
+            }
+            State::FinalizeSlope => {
+                self.pending_failure = self.calculate_result();
+                if self.pending_failure == Failure::None {
+                    self.state = State::Complete;
+                } else {
+                    self.state = State::Failed;
+                    self.failure = self.pending_failure;
+                }
+                self.pending_failure = Failure::None;
             }
         }
     }
@@ -359,6 +392,42 @@ mod tests {
         assert_eq!(calibration.result().nominal_resistance_uohm, 40_000);
         assert_eq!(calibration.result().low.current_counts, 50);
         assert_eq!(calibration.result().high.current_counts, 250);
+    }
+
+    #[test]
+    fn result_reduction_is_deferred_across_three_safe_off_ticks() {
+        let mut calibration = ResistanceCalibration::new();
+        calibration.start();
+        for _ in 0..50_000 {
+            let current = calibration.target_counts();
+            calibration.tick(Sample {
+                measured_d_counts: current,
+                applied_d_tick_bits: (17 + i32::from(current) / 5) << 16,
+                bus_voltage_mv: 45_000,
+            });
+            if calibration.state() == State::RampDown {
+                break;
+            }
+        }
+        calibration.cycle_in_state = RAMP_CYCLES - 1;
+
+        calibration.tick(Sample::default());
+        assert_eq!(calibration.state(), State::FinalizeLow);
+        assert!(!calibration.energizing());
+        assert_eq!(calibration.result().low, Point::default());
+
+        calibration.tick(Sample::default());
+        assert_eq!(calibration.state(), State::FinalizeHigh);
+        assert_ne!(calibration.result().low, Point::default());
+        assert_eq!(calibration.result().high, Point::default());
+
+        calibration.tick(Sample::default());
+        assert_eq!(calibration.state(), State::FinalizeSlope);
+        assert_ne!(calibration.result().high, Point::default());
+
+        calibration.tick(Sample::default());
+        assert_eq!(calibration.state(), State::Complete);
+        assert_eq!(calibration.result().effective_uv_per_count, 4_000);
     }
 
     #[test]

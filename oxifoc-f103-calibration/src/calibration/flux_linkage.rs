@@ -34,13 +34,25 @@ pub enum State {
     RampDown = 5,
     Complete = 6,
     Failed = 7,
+    FinalizeD = 8,
+    FinalizeQ = 9,
+    FinalizeMagnitude = 10,
+    FinalizeFlux = 11,
 }
 
 impl State {
     pub const fn active(self) -> bool {
         matches!(
             self,
-            Self::Capture | Self::SpeedRamp | Self::Settle | Self::Sample | Self::RampDown
+            Self::Capture
+                | Self::SpeedRamp
+                | Self::Settle
+                | Self::Sample
+                | Self::RampDown
+                | Self::FinalizeD
+                | Self::FinalizeQ
+                | Self::FinalizeMagnitude
+                | Self::FinalizeFlux
         )
     }
 }
@@ -79,6 +91,9 @@ pub struct FluxLinkageCalibration {
     bemf_d_sum_uv: i64,
     bemf_q_sum_uv: i64,
     sample_count: u32,
+    average_bemf_d_uv: i64,
+    average_bemf_q_uv: i64,
+    bemf_magnitude_uv: u64,
     hall_sequence: u32,
     hall_transition_count: u16,
     voltage_filtered_ticks: u32,
@@ -102,6 +117,9 @@ impl FluxLinkageCalibration {
             bemf_d_sum_uv: 0,
             bemf_q_sum_uv: 0,
             sample_count: 0,
+            average_bemf_d_uv: 0,
+            average_bemf_q_uv: 0,
+            bemf_magnitude_uv: 0,
             hall_sequence: 0,
             hall_transition_count: 0,
             voltage_filtered_ticks: 0,
@@ -173,7 +191,13 @@ impl FluxLinkageCalibration {
             State::Settle => SETTLE_CYCLES,
             State::Sample => SAMPLE_CYCLES,
             State::RampDown => RAMP_DOWN_CYCLES,
-            State::Idle | State::Complete | State::Failed => 1,
+            State::Idle
+            | State::Complete
+            | State::Failed
+            | State::FinalizeD
+            | State::FinalizeQ
+            | State::FinalizeMagnitude
+            | State::FinalizeFlux => 1,
         };
         ((self.cycle_in_state.min(denominator) * 1_000) / denominator) as u16
     }
@@ -188,7 +212,13 @@ impl FluxLinkageCalibration {
                 self.cycle_in_state,
                 RAMP_DOWN_CYCLES,
             ),
-            State::Idle | State::Complete | State::Failed => return Actuation::Off,
+            State::Idle
+            | State::Complete
+            | State::Failed
+            | State::FinalizeD
+            | State::FinalizeQ
+            | State::FinalizeMagnitude
+            | State::FinalizeFlux => return Actuation::Off,
         };
         Actuation::Current {
             angle: self.angle,
@@ -210,6 +240,10 @@ impl FluxLinkageCalibration {
             State::Settle => self.advance_after(SETTLE_CYCLES, State::Sample),
             State::Sample => self.observe_sample(observation),
             State::RampDown => self.observe_ramp_down(),
+            State::FinalizeD => self.finalize_d(),
+            State::FinalizeQ => self.finalize_q(),
+            State::FinalizeMagnitude => self.finalize_magnitude(),
+            State::FinalizeFlux => self.finalize_flux(),
             State::Idle | State::Complete | State::Failed => {}
         }
     }
@@ -313,46 +347,57 @@ impl FluxLinkageCalibration {
         if self.cycle_in_state < RAMP_DOWN_CYCLES {
             return;
         }
+        self.electrical_rpm = 0;
+        self.cycle_in_state = 0;
         if self.pending_failure != Failure::None {
             self.state = State::Failed;
             self.failure = self.pending_failure;
-        } else if self.finish_result() {
-            self.state = State::Complete;
-        } else {
+        } else if self.sample_count == 0 {
             self.state = State::Failed;
             self.failure = Failure::FluxRange;
+        } else {
+            self.state = State::FinalizeD;
         }
-        self.electrical_rpm = 0;
-        self.cycle_in_state = 0;
     }
 
-    fn finish_result(&mut self) -> bool {
-        if self.sample_count == 0 || self.electrical_rpm != 0 {
-            return false;
-        }
-        let average_d = self.bemf_d_sum_uv / i64::from(self.sample_count);
-        let average_q = self.bemf_q_sum_uv / i64::from(self.sample_count);
-        let magnitude_uv = integer_sqrt_u64(
-            average_d
+    fn finalize_d(&mut self) {
+        self.average_bemf_d_uv = self.bemf_d_sum_uv / i64::from(self.sample_count);
+        self.state = State::FinalizeQ;
+    }
+
+    fn finalize_q(&mut self) {
+        self.average_bemf_q_uv = self.bemf_q_sum_uv / i64::from(self.sample_count);
+        self.state = State::FinalizeMagnitude;
+    }
+
+    fn finalize_magnitude(&mut self) {
+        self.bemf_magnitude_uv = integer_sqrt_u64(
+            self.average_bemf_d_uv
                 .unsigned_abs()
                 .saturating_pow(2)
-                .saturating_add(average_q.unsigned_abs().saturating_pow(2)),
+                .saturating_add(self.average_bemf_q_uv.unsigned_abs().saturating_pow(2)),
         );
+        self.state = State::FinalizeFlux;
+    }
+
+    fn finalize_flux(&mut self) {
         let omega_milliradians_per_second = i64::from(FLUX_TARGET_ERPM) * TAU_MILLIRADIANS / 60;
         let flux_nwb =
-            magnitude_uv.saturating_mul(1_000_000) / omega_milliradians_per_second as u64;
+            self.bemf_magnitude_uv.saturating_mul(1_000_000) / omega_milliradians_per_second as u64;
         if !(u64::from(MIN_VALID_FLUX_NWB)..=u64::from(MAX_VALID_FLUX_NWB)).contains(&flux_nwb) {
-            return false;
+            self.state = State::Failed;
+            self.failure = Failure::FluxRange;
+            return;
         }
         self.result = Result {
             flux_linkage_nwb: flux_nwb as u32,
-            average_bemf_d_uv: saturating_i64_to_i32(average_d),
-            average_bemf_q_uv: saturating_i64_to_i32(average_q),
+            average_bemf_d_uv: saturating_i64_to_i32(self.average_bemf_d_uv),
+            average_bemf_q_uv: saturating_i64_to_i32(self.average_bemf_q_uv),
             measurement_erpm: FLUX_TARGET_ERPM as i16,
             hall_measurement_erpm: hall_erpm_from_transition_count(self.hall_transition_count),
             sync_minimum_percent: self.sync_minimum_percent,
         };
-        true
+        self.state = State::Complete;
     }
 
     fn advance_after(&mut self, cycles: u32, next: State) {
@@ -447,16 +492,39 @@ mod tests {
     }
 
     #[test]
-    fn averaged_vector_result_reports_the_expected_flux() {
+    fn result_reduction_is_deferred_across_four_output_off_ticks() {
         let omega_mrad = i64::from(FLUX_TARGET_ERPM) * TAU_MILLIRADIANS / 60;
         let expected_nwb = 13_400_000_i64;
         let bemf_uv = expected_nwb * omega_mrad / 1_000_000;
         let mut calibration = FluxLinkageCalibration::new();
+        calibration.state = State::RampDown;
+        calibration.cycle_in_state = RAMP_DOWN_CYCLES - 1;
+        calibration.ramp_down_start_erpm = FLUX_TARGET_ERPM;
+        calibration.electrical_rpm = 1;
         calibration.sample_count = 100;
         calibration.bemf_d_sum_uv = bemf_uv * 60;
         calibration.bemf_q_sum_uv = bemf_uv * 80;
-        calibration.electrical_rpm = 0;
-        assert!(calibration.finish_result());
+        calibration.hall_transition_count = 601;
+
+        calibration.observe(Observation::default());
+        assert_eq!(calibration.state(), State::FinalizeD);
+        assert_eq!(calibration.electrical_rpm(), 0);
+        assert_eq!(calibration.result(), Result::default());
+
+        for expected_state in [
+            State::FinalizeQ,
+            State::FinalizeMagnitude,
+            State::FinalizeFlux,
+        ] {
+            assert_eq!(calibration.actuation(), Actuation::Off);
+            calibration.observe(Observation::default());
+            assert_eq!(calibration.state(), expected_state);
+            assert_eq!(calibration.result(), Result::default());
+        }
+
+        assert_eq!(calibration.actuation(), Actuation::Off);
+        calibration.observe(Observation::default());
+        assert_eq!(calibration.state(), State::Complete);
         assert!(
             calibration
                 .result()
@@ -464,6 +532,7 @@ mod tests {
                 .abs_diff(expected_nwb as u32)
                 < 2_000
         );
+        assert_eq!(calibration.result().hall_measurement_erpm, 6_000);
     }
 
     #[test]
