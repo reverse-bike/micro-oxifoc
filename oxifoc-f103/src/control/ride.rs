@@ -203,9 +203,11 @@ impl RideController {
         }
 
         let timed_out = match run.stage {
+            // The seeded Hall sector is sufficient for low-speed commutation.
+            // Waiting for the first edge must cover a rollback that reverses
+            // within that sector, where no transition occurs around zero speed.
             Stage::AwaitingFirstEdge => {
-                deadline_reached(observation.now_ms, run.hall_deadline_ms)
-                    || deadline_reached(observation.now_ms, run.startup_deadline_ms)
+                deadline_reached(observation.now_ms, run.startup_deadline_ms)
             }
             Stage::StartupTracking => {
                 // Reversing a rolling wheel necessarily has a no-edge interval at zero speed.
@@ -402,13 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_and_dynamic_hall_deadlines_fail_closed() {
-        let mut controller = RideController::new(0);
-        arm(&mut controller);
-        assert!(controller.update(observation(1, FULL_ADC)).energize);
-        assert!(controller.update(observation(500, FULL_ADC)).energize);
-        assert_eq!(controller.update(observation(501, FULL_ADC)), Command::OFF);
-
+    fn dynamic_hall_deadlines_fail_closed_after_the_first_edge() {
         let mut controller = RideController::new(0);
         arm(&mut controller);
         controller.update(observation(1, FULL_ADC));
@@ -449,6 +445,47 @@ mod tests {
         first_edge_overdue.hall_sequence = 1;
         first_edge_overdue.hall_progress = 1;
         assert_eq!(controller.update(first_edge_overdue), Command::OFF);
+    }
+
+    #[test]
+    fn rollback_can_reverse_within_the_initial_sector_before_the_first_edge() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+
+        let mut rolling_backward = observation(1, FULL_ADC);
+        rolling_backward.electrical_rpm = -1_000;
+        assert_eq!(
+            controller.update(rolling_backward).stage,
+            Stage::AwaitingFirstEdge
+        );
+
+        let mut turning_around = observation(600, FULL_ADC);
+        turning_around.electrical_rpm = -500;
+        let command = controller.update(turning_around);
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::AwaitingFirstEdge);
+
+        let mut first_forward_edge = observation(900, FULL_ADC);
+        first_forward_edge.hall_sequence = 1;
+        first_forward_edge.hall_progress = 1;
+        first_forward_edge.electrical_rpm = 500;
+        let command = controller.update(first_forward_edge);
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::StartupTracking);
+    }
+
+    #[test]
+    fn awaiting_the_first_edge_still_obeys_the_absolute_startup_deadline() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+
+        let mut rolling_backward = observation(1, FULL_ADC);
+        rolling_backward.electrical_rpm = -1_000;
+        assert!(controller.update(rolling_backward).energize);
+
+        let mut startup_overdue = observation(2_001, FULL_ADC);
+        startup_overdue.electrical_rpm = -100;
+        assert_eq!(controller.update(startup_overdue), Command::OFF);
     }
 
     #[test]

@@ -416,11 +416,15 @@ mod tests {
     }
 
     fn driver(filter_shift: u8) -> FocDriver<TestPhase> {
+        driver_with_limits(filter_shift, limits())
+    }
+
+    fn driver_with_limits(filter_shift: u8, limits: CurrentLimits) -> FocDriver<TestPhase> {
         let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
         FocDriver::new(
             FocController::new(pi, pi, Fixed::from_integer(1_273), 1_103),
             TestPhase,
-            limits(),
+            limits,
             2_250,
             filter_shift,
         )
@@ -472,6 +476,42 @@ mod tests {
         let (target, _) =
             driver.clamp_targets_with_limit(Dq::new(Fixed::ZERO, Fixed::from_integer(100)));
         assert_eq!(target.q, Fixed::ZERO);
+    }
+
+    #[test]
+    fn hill_start_regen_budget_allows_full_torque_at_creep_speed() {
+        let limits = CurrentLimits::new(
+            Fixed::from_integer(838),
+            Fixed::from_integer(1_344),
+            Some(Fixed::from_integer(400)),
+            Some(Fixed::from_integer(40)),
+        );
+        let mut driver = driver_with_limits(0, limits);
+        driver.note_applied_voltage(Dq::new(Fixed::ZERO, Fixed::from_integer(66)));
+
+        let (target, quadrature_limit) =
+            driver.clamp_targets_with_limit(Dq::new(Fixed::ZERO, Fixed::from_integer(-838)));
+
+        assert_eq!(quadrature_limit, Fixed::from_integer(838));
+        assert_eq!(target.q, Fixed::from_integer(-838));
+    }
+
+    #[test]
+    fn hill_start_regen_budget_progressively_limits_faster_rollback() {
+        let limits = CurrentLimits::new(
+            Fixed::from_integer(838),
+            Fixed::from_integer(1_344),
+            Some(Fixed::from_integer(400)),
+            Some(Fixed::from_integer(40)),
+        );
+        let mut driver = driver_with_limits(0, limits);
+        driver.note_applied_voltage(Dq::new(Fixed::ZERO, Fixed::from_integer(88)));
+
+        let (target, quadrature_limit) =
+            driver.clamp_targets_with_limit(Dq::new(Fixed::ZERO, Fixed::from_integer(-838)));
+
+        assert_eq!(quadrature_limit, Fixed::from_integer(681));
+        assert_eq!(target.q, Fixed::from_integer(-681));
     }
 
     #[test]

@@ -630,7 +630,9 @@ fn control_cycle(started: u32) {
         .min(u32::from(u16::MAX)) as u16;
     state.driver.set_bus_limits(
         Some(Fixed::from_integer(i32::from(dc_current_limit))),
-        Some(Fixed::ZERO),
+        Some(Fixed::from_integer(i32::from(
+            crate::config::RIDE_DC_BUS_REGEN_LIMIT_COUNTS,
+        ))),
     );
     let requested_q = state
         .target_ramp
@@ -834,7 +836,9 @@ const fn ride_current_limits() -> CurrentLimits {
         Some(Fixed::from_integer(
             crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS as i32,
         )),
-        Some(Fixed::ZERO),
+        Some(Fixed::from_integer(
+            crate::config::RIDE_DC_BUS_REGEN_LIMIT_COUNTS as i32,
+        )),
     )
 }
 

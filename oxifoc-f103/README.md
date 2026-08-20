@@ -301,4 +301,8 @@ acquisition-gate state for the next loaded validation. Version 0.1.15 restores
 the original low-speed Hall-sector-center and direction-reversal behavior and
 sets the projected DC-side limit to 390 counts. Version 0.1.16 keeps ride
 authority through a measured backward startup while retaining the absolute
-startup deadline, and raises the projected DC-side limit to 400 counts.
+startup deadline, and raises the projected DC-side limit to 400 counts. Version
+0.1.17 also retains authority when rollback reverses inside the initially
+seeded Hall sector, before any post-command Hall edge can occur, and permits a
+40-count projected charge-current transient so plugging torque can reverse the
+wheel instead of being clamped to zero.

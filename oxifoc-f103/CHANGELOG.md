@@ -6,6 +6,42 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.17 - 2026-08-20
+
+Changes:
+
+- Kept ride authority active while awaiting the first Hall edge, using the
+  valid seeded sector-center estimate for commutation. A rollback can now
+  decelerate and reverse inside its initial Hall sector without a transition.
+- Retained the two-second absolute startup deadline before the first edge and
+  every existing dynamic Hall deadline after the first edge. Invalid Hall
+  states, skipped transitions, implausibly fast edges, current limits, and
+  hardware faults remain fail-closed.
+- Added a 40-count projected DC-side charge-current budget, approximately 4 A,
+  so forward torque can pass through the brief regenerative plugging region
+  while reversing a rollback. At 66 filtered q-voltage ticks the budget leaves
+  the complete 838-count phase-current circle available; faster rollback is
+  progressively limited rather than reduced immediately to zero torque.
+
+Reason: 0.1.16 covered the no-edge interval around zero speed only after a
+backward transition had moved the ride policy into startup tracking. A slight
+rollback can instead reverse before crossing a Hall boundary, leaving the
+policy in `AwaitingFirstEdge`; its independent 500 ms deadline then disabled
+otherwise valid OxiFOC Hall commutation and required throttle release to rearm.
+The original Hall path treats its seeded sector center as a usable low-speed
+phase estimate, so the ride policy now preserves that authority until the
+existing absolute startup bound.
+
+The F103 port also configured OxiFOC's battery charge-current limit to zero.
+While rolling backward, the filtered q voltage initially opposes the requested
+forward q current, selecting that zero regen bound and clamping the target to
+zero before the PI controller could establish plugging torque. The zero target
+then preserved the opposing voltage sign, so the clamp self-released only after
+the output reset or the wheel moved forward. A small real charge-current budget
+restores OxiFOC's two-sided bus-current behavior without adding rider-commanded
+regenerative braking. The 400-count discharge limit, phase-current limits,
+observer, Hall geometry, CAN layout, and telemetry schema remain unchanged.
+
 ## 0.1.16 - 2026-08-19
 
 Changes:
