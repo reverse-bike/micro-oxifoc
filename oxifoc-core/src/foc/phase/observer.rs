@@ -193,8 +193,6 @@ impl BackEmfObserver {
         let (sin, cos) = CordicSinCos::sin_cos(phase);
         self.flux_alpha_mwb = self.flux_linkage_mwb * cos;
         self.flux_beta_mwb = self.flux_linkage_mwb * sin;
-        self.current_alpha_last_a = Fixed::ZERO;
-        self.current_beta_last_a = Fixed::ZERO;
         self.phase_raw = phase;
         self.phase_pll = phase;
         self.velocity_step_q32 = erpm_to_step(electrical_rpm, self.control_frequency_hz);
@@ -620,6 +618,31 @@ mod tests {
         }
         assert!(!observer.is_ready());
         assert_eq!(observer.confidence(), Fixed::ZERO);
+    }
+
+    #[test]
+    fn live_seed_preserves_current_history() {
+        let resistance = fixed(0.043);
+        let current = fixed(80.0);
+        let mut observer = BackEmfObserver::new(resistance, fixed(0.075), fixed(13.4), 16_000);
+        let loaded = PhaseInput::new(
+            AlphaBeta {
+                alpha: Fixed::ZERO,
+                beta: resistance * current,
+            },
+            AlphaBeta {
+                alpha: Fixed::ZERO,
+                beta: current,
+            },
+            62_500,
+        );
+
+        observer.update(&loaded);
+        observer.seed(0, 4_500);
+        observer.update(&loaded);
+
+        assert!(turn_error(observer.phase_raw(), 0).abs() < 0.001);
+        assert!((observer.flux_magnitude_mwb().to_bits() - fixed(13.4).to_bits()).abs() < 128);
     }
 
     fn run_loaded_observer(electrical_rpm: i32, final_q_current_a: f32) -> BackEmfObserver {

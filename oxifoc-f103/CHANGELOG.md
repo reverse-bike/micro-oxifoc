@@ -6,6 +6,30 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.2.1 - 2026-08-20
+
+Changes:
+
+- Made a live Hall-to-observer phase reseed preserve the observer's previous
+  alpha/beta current sample, matching OxiFOC's `force_phase` behavior and
+  preventing the next update from interpreting the complete loaded current as
+  a one-cycle current change.
+- Made the explicitly requested Hall seed start a fresh observer epoch by
+  resetting immediately before seeding. This clears current history frozen
+  while PWM output was stopped without changing energized crossover reseeds.
+- Added separate regressions for an 80 A live reseed and an 80 A stopped-
+  current carryover followed by a requested seed.
+
+Reason: the fixed-point observer's `seed` zeroed its previous-current fields,
+unlike OxiFOC's floating-point observer. Its next active-flux update therefore
+injected `-L * i_previous` into a freshly seeded flux vector. With the fitted
+75 uH inductance this artificial term is 3.0 mWb at 40 A and 6.0 mWb at 80 A,
+or approximately 22 and 45 percent of the configured 13.4 mWb rotor flux. A
+direct seed now preserves causal current continuity. Requested ride-start
+seeds remain cold starts because this port does not update the observer while
+PWM is stopped, so their reset-and-seed operation clears any pre-stop sample
+atomically inside the phase manager.
+
 ## 0.2.0 - 2026-08-20
 
 Changes:

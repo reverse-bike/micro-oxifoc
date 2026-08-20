@@ -313,4 +313,6 @@ energizing even when a new ride lease is already active.
 Version 0.2.0 raises the common phase-current ceiling to 880 counts, calibrates
 the OxiFOC bus-power clamp to 392 counts, and restores OxiFOC's torqueless
 self-recovery policy when the combined phase estimate is temporarily
-unavailable.
+unavailable. Version 0.2.1 makes energized observer reseeds preserve causal
+current history while explicitly requested ride-start seeds clear current
+history frozen during stopped output.

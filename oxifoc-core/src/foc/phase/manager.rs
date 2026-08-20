@@ -85,7 +85,10 @@ impl<H> PhaseManager<H> {
         self.last_observer_hall_error_q32 = 0;
     }
 
-    /// Seed the estimator from the next Hall estimate before source blending.
+    /// Start a fresh observer epoch from the next Hall estimate before source
+    /// blending. The reset clears current history that may have been frozen
+    /// while control output was stopped. Live crossover corrections call
+    /// [`BackEmfObserver::seed`] directly and preserve current continuity.
     pub fn request_observer_seed(&mut self) {
         self.observer_seed_requested = true;
     }
@@ -154,6 +157,7 @@ impl<H> PhaseManager<H> {
     ) -> Option<PhaseEstimate<Turns>> {
         if self.observer_seed_requested {
             if let (Some(sensor), Some(observer)) = (hall, &mut self.observer) {
+                observer.reset();
                 observer.seed(sensor.angle, sensor.electrical_rpm);
             }
             self.observer_seed_requested = false;
@@ -352,6 +356,7 @@ fn scale_i32(value: i32, scale: Fixed) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foc::AlphaBeta;
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct TestHall {
@@ -498,5 +503,42 @@ mod tests {
         let _ = manager.estimate_for_control(0, 62_500);
         assert_eq!(manager.observer().unwrap().phase(), hall.angle);
         assert!((manager.observer().unwrap().electrical_rpm() + 5_000).unsigned_abs() < 2);
+    }
+
+    #[test]
+    fn requested_seed_clears_frozen_current_history() {
+        let resistance = Fixed::ratio(884, 10_000);
+        let current = Fixed::from_integer(80);
+        let mut stale_observer = observer();
+        stale_observer.update(&PhaseInput::new(
+            AlphaBeta {
+                alpha: Fixed::ZERO,
+                beta: resistance * current,
+            },
+            AlphaBeta {
+                alpha: Fixed::ZERO,
+                beta: current,
+            },
+            62_500,
+        ));
+
+        let hall = TestHall {
+            angle: 0,
+            electrical_rpm: 4_500,
+            valid: true,
+        };
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(stale_observer);
+        manager.request_observer_seed();
+        let _ = manager.estimate_for_control(0, 62_500);
+        manager.update(&PhaseInput::new(
+            AlphaBeta::default(),
+            AlphaBeta::default(),
+            62_500,
+        ));
+
+        let phase_error =
+            signed_angle_difference(manager.observer().unwrap().phase_raw(), hall.angle);
+        assert!(phase_error.unsigned_abs() < 0x0040_0000);
     }
 }
