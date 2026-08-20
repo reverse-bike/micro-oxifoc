@@ -1,4 +1,7 @@
-# OxiFOC
+# Micro OxiFOC
+
+Note: this is a fork of https://github.com/okhsunrog/oxifoc/ to support the STM32F103 hardware.
+It is a WIP, documentation and code is a mess right now. Do not use.
 
 Field-Oriented Control (FOC) firmware for STM32 motor controllers, written in
 Rust. This fork's active motor target is
