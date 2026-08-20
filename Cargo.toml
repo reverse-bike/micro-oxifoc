@@ -12,6 +12,7 @@ exclude = [
     "oxifoc-g474",    # Reference-only STM32G474 firmware
     "oxifoc-f405",    # Reference-only STM32F405 firmware
     "oxifoc-f103",    # Different toolchain (thumbv7m-none-eabi)
+    "oxifoc-f103-calibration", # Different toolchain (thumbv7m-none-eabi)
     "oxifoc-bridge",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)
     "oxifoc-remote",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)
     "tests/stm32g474", # On-target integration tests

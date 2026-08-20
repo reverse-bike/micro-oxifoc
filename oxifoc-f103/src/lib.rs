@@ -12,7 +12,7 @@ pub mod protocol;
 pub mod safety;
 pub mod sensors;
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub mod hardware;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub mod transport;

@@ -5,6 +5,7 @@
 check:
     @just check-core
     @just check-f103
+    @just check-f103-calibration
 
 # Shared fixed-point controller: formatting, linting, and behavior tests.
 check-core:
@@ -30,19 +31,41 @@ check-f103:
     test "$retained_type" = BSS
     test "$((16#$retained_size))" -le 256
 
+# STM32F103 calibration application: host tests plus optimized Thumb image.
+check-f103-calibration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd oxifoc-f103-calibration
+    command cargo fmt --check
+    command cargo test --target aarch64-apple-darwin
+    command cargo clippy --release --features firmware -- -D warnings
+    command cargo build --release --features firmware
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
+    llvm_objdump="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objdump"
+    read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h target/thumbv7m-none-eabi/release/oxifoc-f103-calibration | command awk '$2 == ".retained" { print $3, $4, $5 }')"
+    test "$retained_address" = 20004f00
+    test "$retained_type" = BSS
+    test "$((16#$retained_size))" -le 256
+
 # Format the active core and F103 application.
 fmt:
     command cargo fmt -p oxifoc-core
     cd oxifoc-f103 && command cargo fmt
+    cd oxifoc-f103-calibration && command cargo fmt
 
 # Run the active fixed-point behavior tests.
 test:
     command cargo test -p oxifoc-core
     cd oxifoc-f103 && command cargo test --target aarch64-apple-darwin
+    cd oxifoc-f103-calibration && command cargo test --target aarch64-apple-darwin
 
 # Build the STM32F103 firmware.
 build-f103:
     cd oxifoc-f103 && command cargo build --release --features firmware
+
+# Build the STM32F103 calibration firmware.
+build-f103-calibration:
+    cd oxifoc-f103-calibration && command cargo build --release --features firmware
 
 # Build the exact 26,200-byte image consumed by the resident CAN bootloader.
 image-f103: build-f103
@@ -56,10 +79,28 @@ image-f103: build-f103
     test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
     echo "$image: 26,200 bytes"
 
+# Build the exact 26,200-byte calibration image consumed by the CAN bootloader.
+image-f103-calibration: build-f103-calibration
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
+    llvm_objcopy="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objcopy"
+    elf=oxifoc-f103-calibration/target/thumbv7m-none-eabi/release/oxifoc-f103-calibration
+    image="$elf.flash-region.bin"
+    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x08009e58 "$elf" "$image"
+    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
+    echo "$image: 26,200 bytes"
+
 # With no arguments this validates only. Pass `--yes` to transmit/install.
 flash-f103 *ARGS: image-f103
     command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py \
         oxifoc-f103/target/thumbv7m-none-eabi/release/oxifoc-f103.flash-region.bin \
+        {{ ARGS }}
+
+# With no arguments this validates only. Pass `--yes` to transmit/install.
+flash-f103-calibration *ARGS: image-f103-calibration
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py \
+        oxifoc-f103-calibration/target/thumbv7m-none-eabi/release/oxifoc-f103-calibration.flash-region.bin \
         {{ ARGS }}
 
 # Build ESP32 bridge firmware.
@@ -112,8 +153,10 @@ size:
             "$label" "$used" "$limit" "$((used * 100 / limit))" "$((limit - used))"
     }
     measure oxifoc-f103 oxifoc-f103 memory.x target --features firmware
+    measure oxifoc-f103-calibration oxifoc-f103-calibration memory.x target --features firmware
 
 # Clean active core and F103 build artifacts.
 clean:
     command cargo clean -p oxifoc-core
     cd oxifoc-f103 && command cargo clean
+    cd oxifoc-f103-calibration && command cargo clean

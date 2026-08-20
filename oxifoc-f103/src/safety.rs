@@ -1,31 +1,31 @@
 //! Last-resort gate shutdown, watchdogs, and reset forensics.
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use core::cell::UnsafeCell;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use core::hint::spin_loop;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use core::mem::MaybeUninit;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use core::ptr::{read_volatile, write_volatile};
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 use cortex_m_rt::{ExceptionFrame, exception};
 
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_PIN: u32 = 1 << 26;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_POWER: u32 = 1 << 27;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_SOFTWARE: u32 = 1 << 28;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_INDEPENDENT_WATCHDOG: u32 = 1 << 29;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_WINDOW_WATCHDOG: u32 = 1 << 30;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RCC_RESET_LOW_POWER: u32 = 1 << 31;
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const RETAINED_MAGIC: u32 = 0x4f58_4652;
 
 pub mod reset_flag {
@@ -146,7 +146,7 @@ impl PwmFailureContext {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 struct RetainedContext {
     magic: u32,
     magic_inverse: u32,
@@ -161,7 +161,7 @@ struct RetainedContext {
     pwm_failure: PwmFailureContext,
 }
 
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 impl RetainedContext {
     const fn active() -> Self {
         Self {
@@ -184,7 +184,7 @@ impl RetainedContext {
     }
 }
 
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 fn compact_reset_flags(raw: u32) -> u8 {
     (u8::from(raw & RCC_RESET_PIN != 0) * reset_flag::PIN)
         | (u8::from(raw & RCC_RESET_POWER != 0) * reset_flag::POWER)
@@ -194,7 +194,7 @@ fn compact_reset_flags(raw: u32) -> u8 {
         | (u8::from(raw & RCC_RESET_LOW_POWER != 0) * reset_flag::LOW_POWER)
 }
 
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 const fn pwm_failure_slot_is_empty(header: u32) -> bool {
     header as u8 == pwm_failure_cause::NONE
 }
@@ -210,7 +210,7 @@ pub const fn watchdog_progressed(
         && (injected_samples != previous_injected_samples || latched_safe_off)
 }
 
-#[cfg(any(feature = "firmware", test))]
+#[cfg(any(feature = "board", test))]
 fn boot_diagnostics(raw_reset_flags: u32, retained: RetainedContext) -> BootDiagnostics {
     let reset_flags = compact_reset_flags(raw_reset_flags);
     let watchdog_reset =
@@ -237,111 +237,111 @@ fn boot_diagnostics(raw_reset_flags: u32, retained: RetainedContext) -> BootDiag
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const RCC_APB1ENR_WWDGEN: u32 = 1 << 11;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const RCC_CSR: *mut u32 = 0x4002_1024 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const RCC_CLEAR_RESET_FLAGS: u32 = 1 << 24;
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_CR: *mut u32 = 0x4000_2c00 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_CFR: *mut u32 = 0x4000_2c04 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_ENABLE: u32 = 1 << 7;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_PRESCALER_DIVIDE_8: u32 = 3 << 7;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_COUNTER_MAXIMUM: u32 = 0x7f;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const WWDG_RESET_THRESHOLD: u32 = 0x40;
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_KR: *mut u32 = 0x4000_3000 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_PR: *mut u32 = 0x4000_3004 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_RLR: *mut u32 = 0x4000_3008 as *mut u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_SR: *const u32 = 0x4000_300c as *const u32;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_KEY_START: u32 = 0xcccc;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_KEY_UNLOCK: u32 = 0x5555;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_KEY_FEED: u32 = 0xaaaa;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_PRESCALER_DIVIDE_16: u32 = 2;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_RELOAD_100MS_NOMINAL: u32 = 249;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const IWDG_PRESCALER_AND_RELOAD_UPDATING: u32 = 0x3;
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const TIMER_UPDATES_PER_WINDOW_FEED: u32 = 256;
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 const SYNCHRONIZATION_WAIT_ITERATIONS: u32 = 100_000;
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static TIMER_UPDATES_SINCE_FEED: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_RESET_FLAGS: AtomicU8 = AtomicU8::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_CONTEXT_VALID: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_FATAL_REASON: AtomicU8 = AtomicU8::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_CHECKPOINT: AtomicU8 = AtomicU8::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_DETAIL: AtomicI32 = AtomicI32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_CONTROL_CYCLE: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_LAST_CONTROL_CYCLES: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_MAXIMUM_CONTROL_CYCLES: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_PROGRAM_COUNTER: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_LINK_REGISTER: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_PWM_FAILURE_0: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_PWM_FAILURE_1: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_PWM_FAILURE_2: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static BOOT_PWM_FAILURE_3: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 struct PwmFailureCell(UnsafeCell<PwmFailureContext>);
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 // SAFETY: writes occur before interrupts start or in the non-nesting TIM1
 // handlers; foreground reads mask interrupts around the complete copy.
 unsafe impl Sync for PwmFailureCell {}
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 static LATEST_PWM_FAILURE: PwmFailureCell =
     PwmFailureCell(UnsafeCell::new(PwmFailureContext::EMPTY));
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 #[unsafe(link_section = ".retained.reset_forensics")]
 // `memory.x` keeps this above the bootloader and application stack ranges.
 static mut RETAINED_CONTEXT: MaybeUninit<RetainedContext> = MaybeUninit::uninit();
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 fn retained_context_ptr() -> *mut RetainedContext {
     core::ptr::addr_of_mut!(RETAINED_CONTEXT).cast::<RetainedContext>()
 }
 
 /// Captures and clears RCC reset flags before peripheral initialization, then
 /// starts a fresh bootloader-safe retained record for the current boot.
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn capture_boot_diagnostics() {
     // SAFETY: RCC_CSR is the F103 reset-status register. The retained section
     // contains only integer fields, so every previous SRAM bit pattern is a
@@ -372,13 +372,13 @@ pub fn capture_boot_diagnostics() {
     store_latest_pwm_failure(pwm_failure);
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 fn store_latest_pwm_failure(words: [u32; 4]) {
     // SAFETY: callers satisfy PwmFailureCell's writer exclusion contract.
     unsafe { *LATEST_PWM_FAILURE.0.get() = PwmFailureContext { words } }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn boot_diagnostics_snapshot() -> BootDiagnostics {
     BootDiagnostics {
         reset_flags: BOOT_RESET_FLAGS.load(Ordering::Relaxed),
@@ -404,7 +404,7 @@ pub fn boot_diagnostics_snapshot() -> BootDiagnostics {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn latest_pwm_failure_snapshot() -> PwmFailureContext {
     cortex_m::interrupt::free(|_| {
         // SAFETY: interrupts remain masked for the complete copy.
@@ -412,7 +412,7 @@ pub fn latest_pwm_failure_snapshot() -> PwmFailureContext {
     })
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn record_control_cycle(control_cycle: u32) {
     // SAFETY: these aligned u32 fields have one writer, TIM1_UP.
     unsafe {
@@ -427,7 +427,7 @@ pub fn record_control_cycle(control_cycle: u32) {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn record_control_checkpoint(value: u8) {
     // SAFETY: this aligned u32 field has one writer, TIM1_UP.
     unsafe {
@@ -438,7 +438,7 @@ pub fn record_control_checkpoint(value: u8) {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn record_control_timing(last: u32, maximum: u32) {
     // SAFETY: these aligned u32 fields have one writer, TIM1_UP.
     unsafe {
@@ -457,7 +457,7 @@ pub fn record_control_timing(last: u32, maximum: u32) {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn record_safety_loss(reason: u8) {
     // When no exception supersedes it, detail describes the final control
     // safety-loss reason from the existing page-12 enumeration.
@@ -469,7 +469,7 @@ pub fn record_safety_loss(reason: u8) {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn record_pwm_failure(context: PwmFailureContext) {
     // SAFETY: TIM1_UP and TIM1_BRK run at the same priority and cannot preempt
     // one another. The cause word is written last and commits the complete
@@ -489,7 +489,7 @@ pub fn record_pwm_failure(context: PwmFailureContext) {
     store_latest_pwm_failure(words);
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub(crate) fn clear_current_pwm_failure() {
     // SAFETY: the hardware fault acknowledgement calls this with interrupts
     // masked while every motor channel is disabled.
@@ -503,7 +503,7 @@ pub(crate) fn clear_current_pwm_failure() {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 fn record_fatal(reason: u8, detail: i16, program_counter: u32, link_register: u32) {
     cortex_m::interrupt::disable();
     // SAFETY: interrupts are disabled for this bounded set of aligned
@@ -532,7 +532,7 @@ fn record_fatal(reason: u8, detail: i16, program_counter: u32, link_register: u3
 /// LSI-clocked independent watchdog. The former is refreshed only by TIM1;
 /// the latter is refreshed by foreground code only after observing both TIM1
 /// and injected-current progress.
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn start() {
     // SAFETY: called once after clock and control-loop initialization. Both
     // watchdog register blocks and the RCC enable register are fixed by RM0008.
@@ -558,7 +558,7 @@ pub fn start() {
 }
 
 /// Records a real TIM1 update-handler entry and periodically refreshes WWDG.
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn timer_update_entered() {
     if !STARTED.load(Ordering::Acquire) {
         return;
@@ -574,7 +574,7 @@ pub fn timer_update_entered() {
 
 /// Refreshes IWDG after the caller has independently verified foreground,
 /// TIM1-update, and injected-ADC progress.
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 pub fn feed_main_loop() {
     if STARTED.load(Ordering::Acquire) {
         // SAFETY: the key register accepts this value at any time after start.
@@ -582,7 +582,7 @@ pub fn feed_main_loop() {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 fn feed_window() {
     // SAFETY: read/write access to the enabled WWDG register block. Refreshing
     // outside its legal counter range is deliberately skipped.
@@ -594,41 +594,41 @@ fn feed_window() {
     }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 unsafe fn feed_independent() {
     // SAFETY: caller has established the IWDG register block.
     unsafe { write_volatile(IWDG_KR, IWDG_KEY_FEED) }
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     record_fatal(fatal_reason::PANIC, 0, 0, 0);
     fatal_shutdown()
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 #[exception]
 unsafe fn HardFault(frame: &ExceptionFrame) -> ! {
     record_fatal(fatal_reason::HARD_FAULT, 0, frame.pc(), frame.lr());
     fatal_shutdown()
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 #[exception]
 unsafe fn NonMaskableInt() -> ! {
     record_fatal(fatal_reason::NON_MASKABLE_INTERRUPT, 0, 0, 0);
     fatal_shutdown()
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 #[exception]
 unsafe fn DefaultHandler(irqn: i16) {
     record_fatal(fatal_reason::DEFAULT_HANDLER, irqn, 0, 0);
     fatal_shutdown()
 }
 
-#[cfg(feature = "firmware")]
+#[cfg(feature = "board")]
 fn fatal_shutdown() -> ! {
     cortex_m::interrupt::disable();
     crate::hardware::peripherals::emergency_shutdown();

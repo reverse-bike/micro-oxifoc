@@ -1,0 +1,65 @@
+[package]
+name = "oxifoc-f103-calibration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Synchronous motor-parameter calibration firmware for the S73 STM32F103 controller"
+
+[lib]
+test = true
+
+[[bin]]
+name = "oxifoc-f103-calibration"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["firmware"]
+
+[features]
+default = []
+firmware = [
+    "dep:cortex-m",
+    "dep:cortex-m-rt",
+    "dep:stm32f1",
+    "oxifoc-f103/calibration-image",
+]
+
+[dependencies]
+oxifoc-core = { path = "../oxifoc-core", default-features = false, features = ["fixed-point"] }
+oxifoc-f103 = { path = "../oxifoc-f103", default-features = false }
+cortex-m = { version = "=0.7.8", optional = true, features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7.6", optional = true }
+stm32f1 = { version = "0.15", optional = true, features = ["stm32f103", "rt"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[lints.clippy]
+use_self = "warn"
+uninlined_format_args = "warn"
+cast_lossless = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_closure_for_method_calls = "warn"
+dbg_macro = "warn"
+string_slice = "warn"
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+invalid_upcast_comparisons = "warn"
+large_futures = "warn"
+unused_result_ok = "warn"
+iter_not_returning_iterator = "warn"
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+lossy_float_literal = "warn"
+unused_async = "warn"

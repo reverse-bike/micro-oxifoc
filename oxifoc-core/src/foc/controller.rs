@@ -253,6 +253,50 @@ where
         )
     }
 
+    /// Apply a dq voltage command directly while retaining the controller's
+    /// transforms, circular voltage limit, dead-time compensation, and SVPWM.
+    /// Detection sequences use this after a PI-regulated rotor lock to create
+    /// precisely timed voltage pulses without advancing either PI integrator.
+    pub fn step_direct_voltage(
+        &mut self,
+        phase_a: N,
+        phase_b: N,
+        electrical_angle: T::Angle,
+        voltage: Dq<N>,
+        pwm_neutral: u16,
+    ) -> (Dq<N>, PwmDuty) {
+        let (sin, cos) = T::sin_cos(electrical_angle);
+        let (alpha, beta) = clarke(phase_a, phase_b);
+        self.measured_stationary = AlphaBeta { alpha, beta };
+        let (measured_d, measured_q) = park(alpha, beta, sin, cos);
+        let measured = Dq::new(measured_d, measured_q);
+        self.requested_voltage = voltage;
+        self.feedforward_voltage = Dq::new(N::ZERO, N::ZERO);
+        let (applied_d, applied_q, voltage_scale) =
+            N::limit_vector(voltage.d, voltage.q, self.vector_limit_ticks);
+        let applied = Dq::new(applied_d, applied_q);
+        self.applied_voltage = applied;
+        self.voltage_limited = voltage_scale != N::ONE;
+        let (voltage_alpha, voltage_beta) = inverse_park(applied.d, applied.q, sin, cos);
+        let (voltage_alpha, voltage_beta) =
+            self.apply_actuation_advance(voltage_alpha, voltage_beta);
+        self.applied_stationary = AlphaBeta {
+            alpha: voltage_alpha,
+            beta: voltage_beta,
+        };
+        let (modulated_alpha, modulated_beta) =
+            self.apply_dead_time_comp(voltage_alpha, voltage_beta, phase_a, phase_b);
+        let duties = M::to_duties(
+            AlphaBeta {
+                alpha: modulated_alpha,
+                beta: modulated_beta,
+            },
+            pwm_neutral,
+            self.phase_limit_ticks,
+        );
+        (measured, duties)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn step_with_velocity_and_injection(
         &mut self,
@@ -415,6 +459,24 @@ mod tests {
             controller.applied_voltage(),
             Dq::new(Fixed::ZERO, Fixed::ZERO)
         );
+    }
+
+    #[test]
+    fn direct_voltage_uses_the_shared_limit_and_modulator_without_pi_output() {
+        let mut controller = fixed_controller();
+        let (measured, duties) = controller.step_direct_voltage(
+            Fixed::from_integer(12),
+            Fixed::from_integer(-4),
+            0,
+            Dq::new(Fixed::from_integer(2_000), Fixed::ZERO),
+            1_125,
+        );
+
+        assert!((11..=12).contains(&measured.d.integer()));
+        assert!(controller.voltage_limited());
+        assert!((1_249..=1_250).contains(&controller.applied_voltage().d.integer()));
+        assert_eq!(controller.feedforward_voltage(), Dq::default());
+        assert!(duties.as_array().into_iter().all(|duty| duty <= 2_210));
     }
 
     #[test]

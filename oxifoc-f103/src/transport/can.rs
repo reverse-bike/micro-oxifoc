@@ -1,10 +1,16 @@
 //! Poll-free bxCAN transport for the required stock-bike interface.
 
+#[cfg(feature = "calibration-image")]
+use core::cell::UnsafeCell;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "firmware")]
+use core::sync::atomic::{AtomicU8, AtomicU32};
 
 use crate::protocol::{self, Frame};
-use crate::{config, control::foc, hardware::peripherals, safety, sensors};
+use crate::{config, hardware::peripherals};
+#[cfg(feature = "firmware")]
+use crate::{control::foc, safety, sensors};
 use stm32f1::stm32f103::interrupt;
 
 const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
@@ -39,12 +45,31 @@ const CAN_FIFO_RELEASE: u32 = 1 << 5;
 const CAN_FIFO_OVERRUN: u32 = 1 << 4;
 const CAN_STANDARD_DATA_FILTER_MASK: u32 = (1 << 2) | (1 << 1);
 
+#[cfg(feature = "firmware")]
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TRANSMIT_LOCKED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "firmware")]
 static TELEMETRY_SLOT: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "firmware")]
 static STOCK_FAULT_PAGE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "firmware")]
 static PROJECT_TELEMETRY_PAGE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "firmware")]
 static NEXT_TELEMETRY_MS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "calibration-image")]
+struct ReceivedFrameCell(UnsafeCell<Frame>);
+
+#[cfg(feature = "calibration-image")]
+// SAFETY: the CAN receive interrupt is the only writer. Foreground copies the
+// frame with interrupts masked after observing RX_PENDING.
+unsafe impl Sync for ReceivedFrameCell {}
+
+#[cfg(feature = "calibration-image")]
+static RECEIVED_FRAME: ReceivedFrameCell =
+    ReceivedFrameCell(UnsafeCell::new(Frame::new(0, 0, [0; 8])));
+#[cfg(feature = "calibration-image")]
+static RX_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub fn initialize() -> bool {
     // SAFETY: one-time peripheral setup before CAN IRQ is unmasked.
@@ -90,6 +115,7 @@ pub fn initialize() -> bool {
     true
 }
 
+#[cfg(feature = "firmware")]
 pub fn service(
     now_ms: u32,
     vehicle_speed_tenths_kph: u16,
@@ -283,8 +309,35 @@ pub fn service(
     }
 }
 
+#[cfg(feature = "firmware")]
 pub fn take_reset_request() -> bool {
     RESET_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(feature = "calibration-image")]
+pub fn take_received_frame() -> Option<Frame> {
+    cortex_m::interrupt::free(|_| {
+        if !RX_PENDING.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        // SAFETY: the CAN interrupt cannot preempt this critical section, and
+        // RX_PENDING prevents it from replacing an unread frame.
+        Some(unsafe { *RECEIVED_FRAME.0.get() })
+    })
+}
+
+#[cfg(feature = "calibration-image")]
+fn retain_received_frame(frame: Frame) {
+    let stop = frame.len >= 4
+        && u32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]])
+            == u32::from_le_bytes(*b"STOP");
+    if RX_PENDING.load(Ordering::Acquire) && !stop {
+        return;
+    }
+    // SAFETY: this function runs only in the CAN receive interrupt. The
+    // release store publishes the complete copy to foreground.
+    unsafe { *RECEIVED_FRAME.0.get() = frame };
+    RX_PENDING.store(true, Ordering::Release);
 }
 
 pub fn transmit(frame: Frame) -> bool {
@@ -356,7 +409,22 @@ fn USB_LP_CAN_RX0() {
                         let _ = transmit(response);
                     }
                 } else if protocol::is_updater_reset(frame) {
+                    #[cfg(feature = "calibration-image")]
+                    {
+                        // The calibration image is experimental recovery code:
+                        // an exact updater request must work from every routine
+                        // state. Remove all gate-drive paths before resetting,
+                        // including when foreground or control state is stuck.
+                        peripherals::emergency_shutdown();
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
+                    #[cfg(feature = "firmware")]
                     RESET_REQUESTED.store(true, Ordering::Release);
+                } else {
+                    #[cfg(feature = "calibration-image")]
+                    if frame.id == config::CAN_STOP_CALIBRATION_ID {
+                        retain_received_frame(frame);
+                    }
                 }
             }
             write_volatile(CAN_RF0R, CAN_FIFO_RELEASE);

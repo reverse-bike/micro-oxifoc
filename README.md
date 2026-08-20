@@ -4,6 +4,9 @@ Field-Oriented Control (FOC) firmware for STM32 motor controllers, written in
 Rust. This fork's active motor target is
 [`oxifoc-f103`](oxifoc-f103/README.md): a core-backed, Hall-only STM32F103
 application with a fixed-point 16 kHz control loop and stock-bike CAN. The
+separate [`oxifoc-f103-calibration`](oxifoc-f103-calibration/README.md) image
+reuses the same board and safety layer for explicitly armed motor-parameter
+measurement without consuming ride-firmware flash. The
 STM32G474/F405 applications remain as source references and are excluded from
 the validation build.
 
@@ -169,6 +172,7 @@ just build-f103           # Build STM32F103 firmware
 just image-f103           # Build the 26,200-byte CAN bootloader image
 just flash-f103           # Validate the image without transmitting
 just flash-f103 --yes     # Flash over gs_usb CAN channel 0 at 250 kbit/s
+just image-f103-calibration # Build the separate 26,200-byte calibration image
 just gui                  # Run Slint GUI
 just cli -- list          # Run CLI
 ```

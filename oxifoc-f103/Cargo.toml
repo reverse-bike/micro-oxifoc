@@ -17,11 +17,13 @@ required-features = ["firmware"]
 
 [features]
 default = []
-firmware = ["dep:cortex-m", "dep:cortex-m-rt", "dep:stm32f1"]
+board = ["dep:cortex-m", "dep:cortex-m-rt", "dep:stm32f1"]
+firmware = ["board"]
+calibration-image = ["board"]
 
 [dependencies]
 oxifoc-core = { path = "../oxifoc-core", default-features = false, features = ["fixed-point"] }
-cortex-m = { version = "0.7.8", optional = true, features = ["critical-section-single-core"] }
+cortex-m = { version = "=0.7.8", optional = true, features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7.6", optional = true }
 stm32f1 = { version = "0.15", optional = true, features = ["stm32f103", "rt"] }
 

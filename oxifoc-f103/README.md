@@ -26,6 +26,13 @@ image:
   scheduling, board-specific gains and limits, ride safety, local inputs, and
   stock-bike CAN.
 
+The package exposes that device layer through its additive `board` feature.
+The sibling [`oxifoc-f103-calibration`](../oxifoc-f103-calibration/README.md)
+links it with `calibration-image`, retaining the identical ADC, TIM1, BKIN,
+watchdog, reset-forensics, and updater implementations while supplying its own
+calibration control ISR. The production ride build still selects only
+`firmware`; its linked size is unchanged.
+
 The device crate follows OxiFOC's device/core boundary while remaining
 synchronous:
 
