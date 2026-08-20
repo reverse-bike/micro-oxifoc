@@ -6,6 +6,33 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.1.18 - 2026-08-20
+
+Changes:
+
+- Made an adjacent in-run Hall direction reversal retain its valid raw state
+  and new direction while discarding the edge-to-edge speed interval. The
+  commutation estimate holds the new calibrated sector center with zero speed
+  until the next same-direction edge supplies a complete sector interval.
+- Preserved the center-to-boundary interval reconstruction for the first edge
+  after ride entry. Invalid and skipped Hall transitions remain fail-closed,
+  and a reversal edge below the existing 100 us minimum is still rejected.
+
+Reason: the 0.1.17 rollback log recorded three `PhaseEstimate` safety losses
+without an internal fault, current trip, or TIM1 break. Immediately before the
+first loss, the 40-count regen budget left the full 838-count phase limit and
+measured q current tracked its -807-count target at -806 counts, confirming
+that plugging authority was restored. The retained reversal event instead
+changed Hall direction while its interval collapsed from 30,303 us to 759 us,
+activated angle rate limiting with a 43.6-degree correction, and captured
+d=-743/q=-655 counts. Those two edges recrossed the same boundary around the
+turnaround; treating their time as a full-sector traversal fabricated a high
+speed and expired the eight-sector Hall stale window within milliseconds while
+the observer was unavailable. Discarding only that non-physical interval keeps
+the low-speed Hall estimate valid through the turnaround without weakening the
+transition or edge-rate checks. Bus-current limits, FOC gains, observer,
+Hall geometry, CAN layout, and telemetry schema remain unchanged.
+
 ## 0.1.17 - 2026-08-20
 
 Changes:

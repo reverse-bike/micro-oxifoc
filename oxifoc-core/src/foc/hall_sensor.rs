@@ -274,7 +274,9 @@ impl HallSensor {
         self.sector_boundary_q16 = entered_sector.boundary_q16;
         self.measured_width_q16 = measured_width_q16;
         self.entered_width_q16 = entered_sector.width_q16;
-        if previous_direction == 0 && !interval_since_run_start {
+        // A turnaround recrosses one boundary; its edge-to-edge time is not
+        // the traversal time of the sector that was only partly entered.
+        if previous_direction != direction && !interval_since_run_start {
             self.entered_duration_us = 0;
             self.measured_interval_us = 0;
         } else {
@@ -742,6 +744,40 @@ mod tests {
 
         assert_eq!(hall.angle_direction(), 1);
         assert!((9_900..=10_100).contains(&hall.sector_interval_us()));
+    }
+
+    #[test]
+    fn in_run_reversal_discards_the_boundary_recross_interval() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(1, 30_303).unwrap();
+        hall.update_edge(3, 30_303).unwrap();
+        assert_eq!(hall.angle_direction(), 1);
+        assert_eq!(hall.sector_interval_us(), 30_303);
+
+        hall.update_edge(1, 759).unwrap();
+
+        let center = u32::from(TEST_GEOMETRY.calibrated_center(1)) << 16;
+        assert_eq!(hall.angle_direction(), -1);
+        assert_eq!(hall.sector_interval_us(), 0);
+        assert_eq!(hall.electrical_rpm(), 0);
+        assert_eq!(hall.angle(100_000), Some(center));
+
+        hall.update_edge(5, 30_303).unwrap();
+        assert_eq!(hall.angle_direction(), -1);
+        assert_eq!(hall.sector_interval_us(), 30_303);
+        assert_ne!(hall.electrical_rpm(), 0);
+    }
+
+    #[test]
+    fn in_run_reversal_keeps_the_minimum_edge_interval_check() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(1, 30_303).unwrap();
+        hall.update_edge(3, 30_303).unwrap();
+
+        assert_eq!(hall.update_edge(1, 99), Err(HallError::EdgeTooFast));
+        assert!(!hall.is_valid());
     }
 
     #[test]

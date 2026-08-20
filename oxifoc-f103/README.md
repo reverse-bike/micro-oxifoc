@@ -305,4 +305,6 @@ startup deadline, and raises the projected DC-side limit to 400 counts. Version
 0.1.17 also retains authority when rollback reverses inside the initially
 seeded Hall sector, before any post-command Hall edge can occur, and permits a
 40-count projected charge-current transient so plugging torque can reverse the
-wheel instead of being clamped to zero.
+wheel instead of being clamped to zero. Version 0.1.18 treats the boundary
+recross at an in-run direction reversal as an unknown-speed sector-center hold
+until the next complete same-direction Hall interval.
