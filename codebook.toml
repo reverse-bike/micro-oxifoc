@@ -1,9 +1,15 @@
 words = [
     "ISR",
+    "TXRQ",
     "bemf",
     "centi",
+    "crh",
+    "derating",
     "feedforward",
     "foc",
+    "msr",
     "mwb",
+    "nonblocking",
     "pwm",
+    "undervoltage",
 ]

@@ -1,7 +1,12 @@
 {
   "rust-analyzer.linkedProjects": [
-    "Cargo.toml",
     "oxifoc-f103/Cargo.toml",
     "oxifoc-f103-calibration/Cargo.toml"
-  ]
+  ],
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.cargo.features": ["firmware"],
+  "rust-analyzer.cargo.target": "thumbv7m-none-eabi",
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.check.features": ["firmware"],
+  "rust-analyzer.check.targets": "thumbv7m-none-eabi"
 }
