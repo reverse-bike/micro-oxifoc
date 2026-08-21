@@ -25,7 +25,7 @@ firmware = [
 ]
 
 [dependencies]
-oxifoc-core = { path = "../oxifoc-core", default-features = false, features = ["fixed-point"] }
+oxifoc-core = { path = "../oxifoc-core" }
 oxifoc-f103 = { path = "../oxifoc-f103", default-features = false }
 cortex-m = { version = "=0.7.8", optional = true, features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7.6", optional = true }

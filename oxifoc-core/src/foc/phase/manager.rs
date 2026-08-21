@@ -122,17 +122,6 @@ impl<H> PhaseManager<H> {
                     Err(PhaseSourceError::ObserverNotConfigured)
                 }
             }
-            PhaseSource::Encoder | PhaseSource::EncoderToObserver { .. } => {
-                Err(PhaseSourceError::EncoderNotAvailable)
-            }
-            PhaseSource::Hfi
-            | PhaseSource::HfiToObserver { .. }
-            | PhaseSource::HfiToObserverVolts { .. }
-            | PhaseSource::HfiToHall { .. }
-            | PhaseSource::HfiToEncoder { .. } => Err(PhaseSourceError::HfiNotConfigured),
-            PhaseSource::Manual | PhaseSource::OpenLoop => {
-                Err(PhaseSourceError::ManualSourceNotConfigured)
-            }
         };
         if result.is_ok() {
             self.source = source;
@@ -217,7 +206,6 @@ impl<H> PhaseManager<H> {
                 }
                 _ => None,
             },
-            _ => hall,
         };
         self.last_observer_blend = blend;
         self.last_observer_hall_error_q32 = hall_error_q32;
@@ -267,7 +255,6 @@ where
                 (None, Some(observer)) if observer.trustworthy => Some(observer),
                 _ => None,
             },
-            _ => hall,
         }
     }
 

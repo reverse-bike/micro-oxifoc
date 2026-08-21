@@ -1,8 +1,8 @@
-//! Scalar backends used by the shared FOC algorithms.
+//! Fixed-point scalar support used by the shared FOC algorithms.
 //!
-//! The control code is generic over [`Scalar`]. `f32` is the reference and
-//! experimentation backend; [`Fixed`] is a signed Q16.16 representation for
-//! processors without an FPU.
+//! The control code remains generic over [`Scalar`] so its numeric contract
+//! is explicit. [`Fixed`] is the sole implementation for this controller
+//! family.
 
 use core::fmt::Debug;
 use core::ops::{Add, Mul, Neg, Sub};
@@ -13,8 +13,7 @@ const SCALE: i64 = 1_i64 << FRACTION_BITS;
 /// Arithmetic required by the Clarke/Park, PI, limiting, and SVPWM paths.
 ///
 /// Implementations define their overflow and quantization behavior. The fixed
-/// backend saturates arithmetic and truncates actuator commands toward zero;
-/// the floating-point backend keeps its fractional output.
+/// backend saturates arithmetic and truncates actuator commands toward zero.
 pub trait Scalar:
     Copy
     + Debug
@@ -242,79 +241,6 @@ impl Scalar for Fixed {
         .min(Self::ONE.0 as u32) as i32;
         let scale = Self(scale_bits);
         (direct * scale, quadrature * scale, scale)
-    }
-}
-
-#[cfg(feature = "algorithms")]
-impl Scalar for f32 {
-    const ZERO: Self = 0.0;
-    const ONE: Self = 1.0;
-    const HALF: Self = 0.5;
-    const THREE_HALVES: Self = 1.5;
-    const TWO_THIRDS: Self = 2.0 / 3.0;
-    const INV_SQRT_3: Self = 0.577_350_26;
-    const TWO_INV_SQRT_3: Self = 1.154_700_5;
-    const SQRT_3: Self = 1.732_050_8;
-
-    #[inline]
-    fn from_i32(value: i32) -> Self {
-        value as Self
-    }
-
-    #[inline]
-    fn from_ratio(numerator: i32, denominator: i32) -> Self {
-        numerator as Self / denominator as Self
-    }
-
-    #[inline]
-    fn trunc_to_i32(self) -> i32 {
-        self as i32
-    }
-
-    #[inline]
-    fn trunc(self) -> Self {
-        self
-    }
-
-    #[inline]
-    fn sqrt(self) -> Self {
-        libm::sqrtf(self.max(0.0))
-    }
-
-    #[inline]
-    fn abs(self) -> Self {
-        Self::abs(self)
-    }
-
-    #[inline]
-    fn abs_ceil_u32(self) -> u32 {
-        libm::ceilf(Self::abs(self)).max(0.0) as u32
-    }
-
-    #[inline]
-    fn circular_remaining(limit: Self, direct: Self) -> Self {
-        libm::sqrtf((limit * limit - direct * direct).max(0.0))
-    }
-
-    #[inline]
-    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool {
-        let limit = limit.max(0.0);
-        direct * direct + quadrature * quadrature > limit * limit
-    }
-
-    #[inline]
-    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self) {
-        let limit = limit.max(0.0);
-        let magnitude_squared = direct * direct + quadrature * quadrature;
-        if magnitude_squared <= limit * limit {
-            (direct, quadrature, 1.0)
-        } else if magnitude_squared == 0.0 || limit == 0.0 {
-            (0.0, 0.0, 0.0)
-        } else {
-            let magnitude = libm::sqrtf(magnitude_squared);
-            let scale = limit / magnitude;
-            (direct * scale, quadrature * scale, scale)
-        }
     }
 }
 

@@ -1,31 +1,12 @@
-//! Sector-based space-vector PWM shared by every numeric backend.
+//! Sector-based space-vector PWM in timer-tick voltage units.
 
 use super::control_types::{AlphaBeta, PwmDuty};
 use super::numeric::Scalar;
 
-/// Convert normalized αβ modulation into timer compares.
-///
-/// This preserves the original OxiFOC/VESC contract: a modulation value `m`
-/// represents a phase voltage of `(2 / 3) * m * vbus`.
-pub fn space_vector_pwm<N: Scalar>(alpha: N, beta: N, max_duty: u16) -> [u16; 3] {
-    let tick_scale = N::from_i32(i32::from(max_duty)) * N::TWO_THIRDS;
-    let neutral = max_duty / 2;
-    space_vector_pwm_ticks(
-        AlphaBeta {
-            alpha: alpha * tick_scale,
-            beta: beta * tick_scale,
-        },
-        neutral,
-        max_duty.saturating_sub(neutral),
-    )
-    .as_array()
-}
-
 /// Convert αβ phase-voltage values expressed in timer ticks into compares.
 ///
-/// The sector and active-vector timing equations are identical to
-/// [`space_vector_pwm`]; only the input scaling has already been performed by
-/// the caller. `phase_limit_ticks` reserves the required bootstrap, dead-time,
+/// The caller supplies the conversion from physical voltage to timer ticks.
+/// `phase_limit_ticks` reserves the required bootstrap, dead-time,
 /// and ADC sampling margin around `neutral`.
 pub fn space_vector_pwm_ticks<N: Scalar>(
     voltage: AlphaBeta<N>,
@@ -181,61 +162,5 @@ mod tests {
                 c: NEUTRAL,
             }
         );
-    }
-
-    #[cfg(feature = "algorithms")]
-    #[test]
-    fn fixed_and_float_use_the_same_sector_timing() {
-        for (alpha, beta) in [
-            (1_000, 100),
-            (100, 1_000),
-            (-900, 400),
-            (-1_000, -100),
-            (-100, -1_000),
-            (700, -700),
-        ] {
-            let floating = space_vector_pwm_ticks(
-                AlphaBeta {
-                    alpha: alpha as f32,
-                    beta: beta as f32,
-                },
-                NEUTRAL,
-                PHASE_LIMIT,
-            );
-            let fixed = space_vector_pwm_ticks(
-                AlphaBeta {
-                    alpha: Fixed::from_integer(alpha),
-                    beta: Fixed::from_integer(beta),
-                },
-                NEUTRAL,
-                PHASE_LIMIT,
-            );
-            for (float_compare, fixed_compare) in
-                floating.as_array().into_iter().zip(fixed.as_array())
-            {
-                assert!(float_compare.abs_diff(fixed_compare) <= 2);
-            }
-        }
-    }
-
-    #[cfg(feature = "algorithms")]
-    #[test]
-    fn normalized_float_contract_is_preserved() {
-        assert_eq!(space_vector_pwm(0.0_f32, 0.0, 1_000), [500; 3]);
-        for (alpha, beta, sector) in [
-            (0.5, 0.1, 1),
-            (0.1, 0.5, 2),
-            (-0.4, 0.4, 3),
-            (-0.5, -0.1, 4),
-            (-0.1, -0.5, 5),
-            (0.4, -0.4, 6),
-        ] {
-            assert_eq!(get_sector(alpha, beta), sector);
-            assert!(
-                space_vector_pwm(alpha, beta, 1_000)
-                    .into_iter()
-                    .all(|compare| compare <= 1_000)
-            );
-        }
     }
 }

@@ -4,18 +4,15 @@
 controller. It is linked at `0x08003800` for the resident CAN bootloader and is
 hard-limited to a 26,200-byte application image and 4 KiB of linked RAM.
 
-The firmware has no async executor, allocator, floating-point operations,
-formatting stack, USB/UART/RTT transport, persistent storage, HFI, or
-motor-detection path. The 16 kHz loop uses ADC-count and PWM-tick units,
-Q16.16 control values, Q0.32 electrical angle, and integer CORDIC
+The firmware has no async executor, allocator, floating-point operations, or
+non-CAN communication stack. The 16 kHz loop uses ADC-count and PWM-tick
+units, Q16.16 control values, Q0.32 electrical angle, and integer CORDIC
 trigonometry.
 
 ## Architecture
 
-The application uses `oxifoc-core` with default features disabled and only the
-`fixed-point` feature enabled. The split keeps reusable control logic out of
-the device crate without pulling the floating-point or async stack into the
-image:
+The application uses the dependency-free `oxifoc-core` crate directly. The
+split keeps reusable synchronous control logic out of the device crate:
 
 - `oxifoc-core::foc` owns current-offset tracking, Clarke/Park,
   `PIController`, `FocController`, layered current limiting, voltage limiting,
@@ -95,9 +92,9 @@ confidence, PLL-lock, minimum-speed, and physical back-EMF validity gates pass
 (or a trusted Hall seed grants initial validity), the manager blends to
 observer angle through 6,000 eRPM. A
 greater-than-90-degree disagreement while Hall still has authority reseeds the
-observer instead of blending through a half-turn ambiguity. Encoder, HFI,
-manual, and open-loop source identities remain available for later experiments
-but are rejected until their providers are installed.
+observer instead of blending through a half-turn ambiguity. Hall, observer,
+and Hall-to-observer crossover are the only runtime phase strategies retained
+for this controller family.
 
 ## Runtime
 

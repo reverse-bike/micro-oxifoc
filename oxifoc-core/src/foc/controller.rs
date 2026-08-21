@@ -673,36 +673,4 @@ mod tests {
         assert_eq!(controller.requested_voltage(), Dq::default());
         assert_eq!(controller.feedforward_voltage(), Dq::default());
     }
-
-    #[cfg(feature = "algorithms")]
-    #[test]
-    fn fixed_and_float_execute_the_same_complete_control_path() {
-        use crate::foc::trig::LibmSinCos;
-
-        let mut fixed = fixed_controller();
-        let float_pi = PIController::new(0.5_f32, 605.0 / 16_384.0);
-        let mut floating =
-            FocController::<f32, LibmSinCos>::new(float_pi, float_pi, 1_250.0, 1_085);
-        let (fixed_current, fixed_duty) = fixed.step(
-            Fixed::from_integer(240),
-            Fixed::from_integer(-173),
-            0x2000_0000,
-            Dq::new(Fixed::ZERO, Fixed::from_integer(-320)),
-            1_125,
-        );
-        let (float_current, float_duty) = floating.step(
-            240.0,
-            -173.0,
-            core::f32::consts::FRAC_PI_4,
-            Dq::new(0.0, -320.0),
-            1_125,
-        );
-        assert!((fixed_current.d.integer() as f32 - float_current.d).abs() <= 2.0);
-        assert!((fixed_current.q.integer() as f32 - float_current.q).abs() <= 2.0);
-        for (fixed_compare, float_compare) in
-            fixed_duty.as_array().into_iter().zip(float_duty.as_array())
-        {
-            assert!(fixed_compare.abs_diff(float_compare) <= 3);
-        }
-    }
 }

@@ -25,21 +25,6 @@ impl SinCos<Fixed> for CordicSinCos {
     }
 }
 
-/// Software floating-point sine/cosine for radian angles.
-#[cfg(feature = "algorithms")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LibmSinCos;
-
-#[cfg(feature = "algorithms")]
-impl SinCos<f32> for LibmSinCos {
-    type Angle = f32;
-
-    #[inline]
-    fn sin_cos(angle: Self::Angle) -> (f32, f32) {
-        (libm::sinf(angle), libm::cosf(angle))
-    }
-}
-
 const CORDIC_GAIN_INV_Q30: i32 = 652_032_874;
 const CORDIC_ATAN_TURNS: [i32; 16] = [
     536_870_912,
@@ -108,21 +93,6 @@ mod tests {
             let (sin, cos) = sin_cos_q31(angle);
             assert!((sin - expected_sin).unsigned_abs() < 100_000);
             assert!((cos - expected_cos).unsigned_abs() < 100_000);
-        }
-    }
-
-    #[cfg(feature = "algorithms")]
-    #[test]
-    fn fixed_and_float_backends_agree_around_a_turn() {
-        for eighth in 0..8_u32 {
-            let turns = eighth << 29;
-            let radians = eighth as f32 * core::f32::consts::FRAC_PI_4;
-            let (fixed_sin, fixed_cos) = CordicSinCos::sin_cos(turns);
-            let (float_sin, float_cos) = LibmSinCos::sin_cos(radians);
-            let fixed_sin = fixed_sin.to_bits() as f32 / 65_536.0;
-            let fixed_cos = fixed_cos.to_bits() as f32 / 65_536.0;
-            assert!((fixed_sin - float_sin).abs() < 0.000_2);
-            assert!((fixed_cos - float_cos).abs() < 0.000_2);
         }
     }
 }

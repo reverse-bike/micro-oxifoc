@@ -77,21 +77,4 @@ mod tests {
         pi.apply_back_calculation(update, Fixed::from_integer(-100));
         assert_eq!(pi.integral().integer(), -91);
     }
-
-    #[cfg(feature = "algorithms")]
-    #[test]
-    fn fixed_and_float_run_the_same_pi_law() {
-        let mut fixed = fixed_pi();
-        let mut floating = PIController::new(0.5_f32, 605.0 / 16_384.0);
-        for measurement in [0, 12, 75, 230, 479] {
-            let fixed_update =
-                fixed.prepare_update(Fixed::from_integer(480), Fixed::from_integer(measurement));
-            let float_update = floating.prepare_update(480.0, measurement as f32);
-            assert!(
-                (fixed_update.raw_output.integer() as f32 - float_update.raw_output).abs() <= 2.0
-            );
-            fixed.apply_back_calculation(fixed_update, Fixed::ZERO);
-            floating.apply_back_calculation(float_update, 0.0);
-        }
-    }
 }

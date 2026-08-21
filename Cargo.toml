@@ -1,28 +1,12 @@
 [workspace]
 resolver = "2"
-members = [
-    "oxifoc-core",
-    "oxifoc-host-lib",
-    "oxifoc-host-cli",
-    "slint-wgpu-plot",
-    "oxifoc-host-slint",
-    "oxifoc-virtual",
-]
+members = ["oxifoc-core"]
 exclude = [
-    "oxifoc-g474",    # Reference-only STM32G474 firmware
-    "oxifoc-f405",    # Reference-only STM32F405 firmware
-    "oxifoc-f103",    # Different toolchain (thumbv7m-none-eabi)
-    "oxifoc-f103-calibration", # Different toolchain (thumbv7m-none-eabi)
-    "oxifoc-bridge",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)
-    "oxifoc-remote",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)
-    "tests/stm32g474", # On-target integration tests
-    "tests/stm32f405", # On-target integration tests
+    "oxifoc-f103",
+    "oxifoc-f103-calibration",
 ]
 
-# Curated strict lints; members opt in via `[lints] workspace = true`.
-# The excluded device crates (reference boards, oxifoc-f103, bridge, remote,
-# tests/*)
-# carry a verbatim copy of these tables — keep them in sync when editing.
+# Curated strict lints; members opt in through their lints table.
 [workspace.lints.rust]
 unused_qualifications = "warn"
 
@@ -33,22 +17,18 @@ cast_lossless = "warn"
 manual_let_else = "warn"
 semicolon_if_nothing_returned = "warn"
 redundant_closure_for_method_calls = "warn"
-# Failure-class guardrails (all zero-hit when introduced; cheap insurance):
 dbg_macro = "warn"
 string_slice = "warn"
-rc_mutex = "warn"
 debug_assert_with_mut_call = "warn"
 expl_impl_clone_on_copy = "warn"
 infallible_try_from = "warn"
 invalid_upcast_comparisons = "warn"
-large_futures = "warn"
 unused_result_ok = "warn"
 iter_not_returning_iterator = "warn"
 mem_forget = "warn"
 undocumented_unsafe_blocks = "warn"
 multiple_unsafe_ops_per_block = "warn"
 lossy_float_literal = "warn"
-unused_async = "warn"
 
 [profile.dev]
 incremental = true
@@ -59,32 +39,3 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
-
-[workspace.dependencies]
-oxifoc-core = { path = "oxifoc-core" }
-# Git deps are pinned to revs for reproducible builds (CI runs with --locked).
-# To bump: update the rev here AND in the excluded device crates' Cargo.toml,
-# then refresh all Cargo.lock files.
-# ergot rev = upstream main HEAD 2026-08-12 (edge_link_local ctor +
-# revert-to-link-local liveness policy + the #217 soundness batch)
-ergot = { git = "https://github.com/okhsunrog/ergot", rev = "e93b03b" }
-tokio = { version = "1.53", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-anyhow = "1.0"
-crossbeam-channel = "0.5.16"
-clap = { version = "4.6", features = ["derive"] }
-toml = "1.1"
-# Slint upstream calls its default branch `master`; pin its current HEAD for
-# reproducible access to the wgpu 30 integration.
-slint = { git = "https://github.com/slint-ui/slint.git", rev = "64ee54de49999a97d97ffe004e30904e8e9118a3", version = "1.18.0", default-features = false, features = ["std", "unstable-wgpu-30", "compat-1-2"] }
-wgpu = { version = "30", default-features = false, features = ["wgsl", "vulkan"] }
-slint-build = { git = "https://github.com/slint-ui/slint.git", rev = "64ee54de49999a97d97ffe004e30904e8e9118a3", version = "1.18.0" }
-bytemuck = { version = "1", features = ["derive"] }
-bbqueue = "0.7"
-
-# Keep ergot's Embassy time dependency on the same main-branch revision as the
-# optional STM32 HAL slice in oxifoc-core.
-[patch.crates-io]
-embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }

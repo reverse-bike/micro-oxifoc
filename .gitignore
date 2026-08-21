@@ -15,13 +15,5 @@ target/
 .DS_Store
 Thumbs.db
 
-# Tauri frontend
-oxifoc-host-tauri/node_modules/
-oxifoc-host-tauri/dist/
-oxifoc-host-tauri/src-tauri/target/
-
-# Local telemetry capture artifacts
-/captures/
-
-# Disposable local experiments
+# Disposable local experiments and captures
 /scratch/

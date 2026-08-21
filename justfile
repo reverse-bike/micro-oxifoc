@@ -1,13 +1,10 @@
-# oxifoc — FOC motor controller monorepo
-
-# Validate the active fixed-point core and STM32F103 firmware only. The host,
-# G474, F405, bridge, and remote crates remain source references in this fork.
+# Validate the shared core and both STM32F103 applications.
 check:
     @just check-core
     @just check-f103
     @just check-f103-calibration
+    @just check-can
 
-# Shared fixed-point controller: formatting, linting, and behavior tests.
 check-core:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -15,58 +12,64 @@ check-core:
     command cargo clippy -p oxifoc-core --all-targets -- -D warnings
     command cargo test -p oxifoc-core
 
-# STM32F103 application: host tests plus the optimized Thumb image.
 check-f103:
     #!/usr/bin/env bash
     set -euo pipefail
     cd oxifoc-f103
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     command cargo fmt --check
-    command cargo test --target aarch64-apple-darwin
+    command cargo test --target "$host_triple"
     command cargo clippy --release --features firmware -- -D warnings
     command cargo build --release --features firmware
-    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     llvm_objdump="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objdump"
     read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h target/thumbv7m-none-eabi/release/oxifoc-f103 | command awk '$2 == ".retained" { print $3, $4, $5 }')"
     test "$retained_address" = 20004f00
     test "$retained_type" = BSS
     test "$((16#$retained_size))" -le 256
 
-# STM32F103 calibration application: host tests plus optimized Thumb image.
 check-f103-calibration:
     #!/usr/bin/env bash
     set -euo pipefail
     cd oxifoc-f103-calibration
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     command cargo fmt --check
-    command cargo test --target aarch64-apple-darwin
-    command env UV_CACHE_DIR=../scratch/uv-cache uv run ../scripts/test_can_f103_calibration.py
+    command cargo test --target "$host_triple"
     command cargo clippy --release --features firmware -- -D warnings
     command cargo build --release --features firmware
-    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     llvm_objdump="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objdump"
     read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h target/thumbv7m-none-eabi/release/oxifoc-f103-calibration | command awk '$2 == ".retained" { print $3, $4, $5 }')"
     test "$retained_address" = 20004f00
     test "$retained_type" = BSS
     test "$((16#$retained_size))" -le 256
 
-# Format the active core and F103 application.
+check-can:
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/test_can_bootloader_flash.py
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/test_can_f103_calibration.py
+
 fmt:
     command cargo fmt -p oxifoc-core
-    cd oxifoc-f103 && command cargo fmt
-    cd oxifoc-f103-calibration && command cargo fmt
+    command cargo fmt --manifest-path oxifoc-f103/Cargo.toml
+    command cargo fmt --manifest-path oxifoc-f103-calibration/Cargo.toml
 
-# Run the active fixed-point behavior tests.
 test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     command cargo test -p oxifoc-core
-    cd oxifoc-f103 && command cargo test --target aarch64-apple-darwin
-    cd oxifoc-f103-calibration && command cargo test --target aarch64-apple-darwin
+    command cargo test --manifest-path oxifoc-f103/Cargo.toml --target "$host_triple"
+    command cargo test --manifest-path oxifoc-f103-calibration/Cargo.toml --target "$host_triple"
 
-# Build the STM32F103 firmware.
 build-f103:
-    cd oxifoc-f103 && command cargo build --release --features firmware
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd oxifoc-f103
+    command cargo build --release --features firmware
 
-# Build the STM32F103 calibration firmware.
 build-f103-calibration:
-    cd oxifoc-f103-calibration && command cargo build --release --features firmware
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd oxifoc-f103-calibration
+    command cargo build --release --features firmware
 
 # Build the exact 26,200-byte image consumed by the resident CAN bootloader.
 image-f103: build-f103
@@ -92,72 +95,40 @@ image-f103-calibration: build-f103-calibration
     test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
     echo "$image: 26,200 bytes"
 
-# With no arguments this validates only. Pass `--yes` to transmit/install.
+# With no arguments this validates only. Pass --yes to transmit and install.
 flash-f103 *ARGS: image-f103
-    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py \
-        oxifoc-f103/target/thumbv7m-none-eabi/release/oxifoc-f103.flash-region.bin \
-        {{ ARGS }}
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py oxifoc-f103/target/thumbv7m-none-eabi/release/oxifoc-f103.flash-region.bin {{ ARGS }}
 
-# With no arguments this validates only. Pass `--yes` to transmit/install.
+# With no arguments this validates only. Pass --yes to transmit and install.
 flash-f103-calibration *ARGS: image-f103-calibration
-    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py \
-        oxifoc-f103-calibration/target/thumbv7m-none-eabi/release/oxifoc-f103-calibration.flash-region.bin \
-        {{ ARGS }}
+    command env UV_CACHE_DIR=scratch/uv-cache uv run scripts/can_bootloader_flash.py oxifoc-f103-calibration/target/thumbv7m-none-eabi/release/oxifoc-f103-calibration.flash-region.bin {{ ARGS }}
 
-# Build ESP32 bridge firmware.
-build-bridge:
-    cd oxifoc-bridge && cargo build --release
-
-# Build and flash ESP32 bridge firmware.
-flash-bridge:
-    cd oxifoc-bridge && cargo run --release
-
-# Build ESP32 remote firmware.
-build-remote:
-    cd oxifoc-remote && cargo build --release
-
-# Build and flash ESP32 remote firmware.
-flash-remote:
-    cd oxifoc-remote && cargo run --release
-
-# Run host CLI with arguments
-cli *ARGS:
-    cargo run -p oxifoc-host-cli -- {{ ARGS }}
-
-# Run host GUI
-gui:
-    cargo run -p oxifoc-host-slint
-
-# Run the virtual device as a TCP Router on :2025 (extra args after `virtual`)
-virtual *ARGS:
-    cargo run -p oxifoc-virtual -- --transport tcp --port 2025 {{ ARGS }}
-
-# End-to-end test: spawns the virtual Router and drives it via host-lib over
-# both TCP and UDP (HardwareInfo handshake, at_least_once Motor,
-# effectively_once Detect).
-e2e:
-    cargo test -p oxifoc-virtual --test e2e
-
-# Flash usage of the STM32F103 firmware.
 size:
     #!/usr/bin/env bash
     set -euo pipefail
     host_triple=$(command rustc -vV | command sed -n 's/^host: //p')
     llvm_size="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-size"
-    measure() { # crate label limit_file target_dir extra_flags...
-        local crate="$1" label="$2" memx="$3" target_dir="$4"; shift 4
-        (cd "$crate" && cargo build --release --quiet --target-dir "$target_dir" "$@" 2>/dev/null) || { echo "$label: build failed"; exit 1; }
+    measure() {
+        local crate="$1" label="$2" memx="$3" target_dir="$4"
+        shift 4
+        (
+            cd "$crate"
+            command cargo build --release --quiet --target-dir "$target_dir" "$@"
+        ) || {
+            echo "$label: build failed"
+            exit 1
+        }
         local elf="$crate/$target_dir/thumbv7m-none-eabi/release/$crate"
-        local limit=$(awk '/FLASH/ { for (i = 1; i <= NF; i++) if ($i == "LENGTH") { v = $(i + 2); if (v ~ /K$/) { sub(/K$/, "", v); print v * 1024 } else print v; exit } }' "$crate/$memx")
-        local used=$(command "$llvm_size" "$elf" | tail -1 | awk '{print $1+$2}')
-        printf "%-24s %7d / %7d bytes (%2d%%), headroom %d\n" \
-            "$label" "$used" "$limit" "$((used * 100 / limit))" "$((limit - used))"
+        local limit
+        local used
+        limit=$(command awk '/FLASH/ { for (i = 1; i <= NF; i++) if ($i == "LENGTH") { v = $(i + 2); if (v ~ /K$/) { sub(/K$/, "", v); print v * 1024 } else print v; exit } }' "$crate/$memx")
+        used=$(command "$llvm_size" "$elf" | command tail -1 | command awk '{print $1+$2}')
+        printf "%-24s %7d / %7d bytes (%2d%%), headroom %d\n" "$label" "$used" "$limit" "$((used * 100 / limit))" "$((limit - used))"
     }
     measure oxifoc-f103 oxifoc-f103 memory.x target --features firmware
     measure oxifoc-f103-calibration oxifoc-f103-calibration memory.x target --features firmware
 
-# Clean active core and F103 build artifacts.
 clean:
     command cargo clean -p oxifoc-core
-    cd oxifoc-f103 && command cargo clean
-    cd oxifoc-f103-calibration && command cargo clean
+    command cargo clean --manifest-path oxifoc-f103/Cargo.toml
+    command cargo clean --manifest-path oxifoc-f103-calibration/Cargo.toml
