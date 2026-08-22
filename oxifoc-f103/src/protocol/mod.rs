@@ -32,11 +32,20 @@ pub const fn is_updater_reset(frame: Frame) -> bool {
         && frame.data[4] == 0x2a
 }
 
+pub const fn headlight_command(frame: Frame) -> Option<bool> {
+    if frame.id == 0x300 {
+        Some(frame.data[2] != 0)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StockTelemetry {
     pub vehicle_speed_tenths_kph: u16,
     pub distance_counter: u32,
-    pub brake_active: bool,
+    /// `0x201.b4` input bits: headlight in bit 1 and brake in bit 2.
+    pub digital_input_flags: u8,
     pub controller_temperature_deci_c: Option<i16>,
     pub motor_temperature_deci_c: Option<i16>,
     pub fault_page: u8,
@@ -46,7 +55,7 @@ pub struct StockTelemetry {
 }
 
 pub fn telemetry_slot(slot: u8, snapshot: StockTelemetry) -> [Option<Frame>; 3] {
-    let motion_flags = 0x60 | (u8::from(snapshot.brake_active) << 2);
+    let motion_flags = 0x60 | snapshot.digital_input_flags;
     let speed = snapshot
         .vehicle_speed_tenths_kph
         .saturating_mul(10)
@@ -60,8 +69,8 @@ pub fn telemetry_slot(slot: u8, snapshot: StockTelemetry) -> [Option<Frame>; 3] 
             0x41,
             0x63,
             0,
-            if snapshot.brake_active { 0x40 } else { 0 },
-            0,
+            ((snapshot.digital_input_flags & 4) << 4) | ((snapshot.digital_input_flags & 2) << 2),
+            (snapshot.digital_input_flags & 2) << 4,
             0,
             0,
         ],
@@ -762,6 +771,22 @@ mod tests {
     }
 
     #[test]
+    fn display_headlight_command_requires_the_stock_byte() {
+        let enabled = Frame::new(0x300, 8, [3, 0x5a, 1, 0x5a, 0, 0, 100, 0]);
+        let disabled = Frame::new(0x300, 8, [3, 0x5a, 0, 0x5a, 0, 0, 100, 0]);
+        assert_eq!(headlight_command(enabled), Some(true));
+        assert_eq!(headlight_command(disabled), Some(false));
+        assert_eq!(
+            headlight_command(Frame {
+                id: 0x301,
+                ..enabled
+            }),
+            None
+        );
+        assert_eq!(headlight_command(Frame { len: 2, ..enabled }), Some(true));
+    }
+
+    #[test]
     fn telemetry_schedule_contains_required_ids() {
         let mut found = [false; 8];
         let ids = [0x200, 0x201, 0x202, 0x203, 0x204, 0x265, 0x266, 0x64a];
@@ -807,7 +832,7 @@ mod tests {
         let snapshot = StockTelemetry {
             vehicle_speed_tenths_kph: 14,
             distance_counter: 0x1234_5678,
-            brake_active: true,
+            digital_input_flags: 4,
             controller_temperature_deci_c: Some(410),
             motor_temperature_deci_c: Some(270),
             fault_page: 0,
@@ -826,6 +851,17 @@ mod tests {
             [0x22, 67, 0x78, 0x56, 0x78, 0x56, 0x34, 0x12]
         );
         assert_eq!(telemetry_slot(3, snapshot)[1].unwrap().data[0], 81);
+    }
+
+    #[test]
+    fn headlight_state_reaches_both_stock_status_frames() {
+        let snapshot = StockTelemetry {
+            digital_input_flags: 6,
+            ..StockTelemetry::default()
+        };
+        assert_eq!(telemetry_slot(0, snapshot)[0].unwrap().data[4], 0x66);
+        assert_eq!(telemetry_slot(0, snapshot)[1].unwrap().data[4], 0x48);
+        assert_eq!(telemetry_slot(0, snapshot)[1].unwrap().data[5], 0x20);
     }
 
     #[test]
@@ -1016,7 +1052,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 10, b'0', b'.', b'3', b'.', b'0', 0]
+            [18, 10, b'0', b'.', b'4', b'.', b'0', 0]
         );
     }
 

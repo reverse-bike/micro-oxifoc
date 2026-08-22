@@ -6,6 +6,30 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.4.0 - 2026-08-22
+
+Changes:
+
+- Restored the stock headlight command path. Display frame `0x300.b2` now
+  controls a runtime boolean light state; zero disables it and any nonzero
+  value enables it.
+- Mirrored that state into `0x201.b4` bit 1 and the `0x64A` digital-profile
+  bits 3 and 13. Local brake status continues to occupy its independent stock
+  bits, and neither display traffic nor light state participates in ride
+  authorization.
+- Kept the complete foreground CAN telemetry service out of the application
+  loop's inline body and size-optimized that 20 Hz path. The 16 kHz current
+  loop and interrupt handlers retain their existing optimization policy.
+- Added protocol regressions for command decoding and both stock status
+  mirrors.
+
+Reason: the installed electronics actuate the headlight from the controller's
+stock CAN status mirror; there is no controller lamp GPIO to drive. The port
+already produced both status frames but ignored `0x300`, leaving their
+headlight bits permanently clear. Isolating the non-real-time CAN service
+recovers enough flash for the feature without altering FOC timing or the
+project telemetry schema.
+
 ## 0.3.0 - 2026-08-20
 
 Changes:

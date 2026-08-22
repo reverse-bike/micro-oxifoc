@@ -54,6 +54,8 @@ const CALIBRATION_FILTER_BANKS: u32 = 0b11;
 
 #[cfg(feature = "firmware")]
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "firmware")]
+static HEADLIGHT_COMMAND: AtomicBool = AtomicBool::new(false);
 static TRANSMIT_LOCKED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "firmware")]
 static TELEMETRY_SLOT: AtomicU8 = AtomicU8::new(0);
@@ -155,6 +157,8 @@ pub fn initialize() -> bool {
 }
 
 #[cfg(feature = "firmware")]
+#[inline(never)]
+#[optimize(size)]
 pub fn service(
     now_ms: u32,
     vehicle_speed_tenths_kph: u16,
@@ -184,7 +188,8 @@ pub fn service(
     let stock = protocol::StockTelemetry {
         vehicle_speed_tenths_kph,
         distance_counter,
-        brake_active: inputs.brake_active,
+        digital_input_flags: (u8::from(HEADLIGHT_COMMAND.load(Ordering::Relaxed)) << 1)
+            | (u8::from(inputs.brake_active) << 2),
         controller_temperature_deci_c: controller_temperature,
         motor_temperature_deci_c: motor_temperature,
         fault_page,
@@ -473,6 +478,10 @@ fn USB_LP_CAN_RX0() {
                     #[cfg(feature = "firmware")]
                     RESET_REQUESTED.store(true, Ordering::Release);
                 } else {
+                    #[cfg(feature = "firmware")]
+                    if let Some(enabled) = protocol::headlight_command(frame) {
+                        HEADLIGHT_COMMAND.store(enabled, Ordering::Relaxed);
+                    }
                     #[cfg(feature = "calibration-image")]
                     if frame.id == config::CAN_STOP_CALIBRATION_ID {
                         retain_received_frame(frame);

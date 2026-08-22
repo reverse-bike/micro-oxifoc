@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(feature = "firmware", feature(optimize_attribute))]
 
 //! Synchronous STM32F103 firmware built around the fixed-point OxiFOC core.
 //!

@@ -105,9 +105,8 @@ for this controller family.
   reconstructed as `-(A+B)`, and current offsets are calibrated with the
   motor PWM outputs disabled.
 - TIM2 captures both polarities of the remapped XOR Hall input at 1 MHz. Ride
-  control uses the hardware-validated stock boundary table
-  `[5699, 16526, 26499, 37754, 49151, 59124]`. The later occupancy-derived
-  candidate was rejected by hardware testing and is not used. Below 500 eRPM,
+  control uses the four-run bidirectional calibration consensus
+  `[5484, 15416, 26478, 38207, 49768, 60875]`. Below 500 eRPM,
   commutation snaps to the calibrated center of the live Hall sector; above
   that threshold, boundary corrections are rate-limited to 1.5 times the
   measured per-cycle angle travel rather than being applied as a single
@@ -191,6 +190,8 @@ on PA13. The application provides:
 - zero-length identity queries `0x210`--`0x212`;
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
   including local brake, wheel speed/distance, temperatures, and fault pages;
+- stock headlight control from `0x300.b2`, mirrored into `0x201.b4` bit 1 and
+  `0x64A` bits 3 and 13 without granting or revoking ride authority;
 - updater reset on `0x67F#AA552A002A...`;
 - commissioning pages 6 and 8--25 on `0x2F7`.
 
