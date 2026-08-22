@@ -1,6 +1,9 @@
 //! Local voltage and temperature conversion plus the ride-current envelope.
 
-use crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS;
+use crate::config::{
+    PWM_ARR, RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_DURATION_MS,
+    RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR,
+};
 
 pub const UPDATE_PERIOD_MS: u32 = 50;
 pub const DC_BUS_UNDERVOLTAGE_MV: u32 = 39_000;
@@ -9,10 +12,18 @@ const CONTROLLER_DERATE_START_DECI_C: i16 = 700;
 const CONTROLLER_STOP_DECI_C: i16 = 800;
 const MOTOR_DERATE_START_DECI_C: i16 = 1_000;
 const MOTOR_STOP_DECI_C: i16 = 1_300;
+const TRANSIENT_BUDGET_SAMPLES: u16 = (RIDE_DC_BUS_TRANSIENT_DURATION_MS / UPDATE_PERIOD_MS) as u16;
+const TRANSIENT_BUDGET_CAPACITY: u16 = (RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
+    - RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
+    * TRANSIENT_BUDGET_SAMPLES;
+
+const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS.is_multiple_of(UPDATE_PERIOD_MS));
+const _: () = assert!(TRANSIENT_BUDGET_CAPACITY > 0);
 
 pub mod reason {
     pub const CONTROLLER_TEMPERATURE: u8 = 1;
     pub const MOTOR_TEMPERATURE: u8 = 1 << 1;
+    pub const DC_BUS_TRANSIENT_RECOVERY: u8 = 1 << 2;
     pub const DC_BUS_UNDERVOLTAGE: u8 = 1 << 5;
     pub const LOCAL_DATA_MISSING: u8 = 1 << 6;
 }
@@ -32,6 +43,8 @@ pub struct EnvironmentMonitor {
     last_update_ms: u32,
     latest_limit: Option<u16>,
     derating_reasons: u8,
+    transient_budget: u16,
+    transient_recovery_active: bool,
 }
 
 impl EnvironmentMonitor {
@@ -42,10 +55,19 @@ impl EnvironmentMonitor {
             last_update_ms: now_ms.wrapping_sub(UPDATE_PERIOD_MS),
             latest_limit: None,
             derating_reasons: reason::LOCAL_DATA_MISSING,
+            transient_budget: TRANSIENT_BUDGET_CAPACITY,
+            transient_recovery_active: false,
         }
     }
 
-    pub fn update(&mut self, now_ms: u32, sensors: RawLocalSensors) -> Option<u16> {
+    #[inline(never)]
+    #[cfg_attr(feature = "firmware", optimize(size))]
+    pub fn update(
+        &mut self,
+        now_ms: u32,
+        sensors: RawLocalSensors,
+        projected_dc_current_counts: u16,
+    ) -> Option<u16> {
         if now_ms.wrapping_sub(self.last_update_ms) < UPDATE_PERIOD_MS {
             return self.latest_limit;
         }
@@ -73,12 +95,16 @@ impl EnvironmentMonitor {
         if motor_temperature > MOTOR_DERATE_START_DECI_C {
             reasons |= reason::MOTOR_TEMPERATURE;
         }
-        let mut limit = thermal_limit_counts(
+        let transient_limit = self.update_transient_limit(projected_dc_current_counts);
+        if self.transient_recovery_active {
+            reasons |= reason::DC_BUS_TRANSIENT_RECOVERY;
+        }
+        let mut limit = transient_limit.min(thermal_limit_counts(
             controller_temperature,
             CONTROLLER_DERATE_START_DECI_C,
             CONTROLLER_STOP_DECI_C,
-        )
-        .min(thermal_limit_counts(
+        ));
+        limit = limit.min(thermal_limit_counts(
             motor_temperature,
             MOTOR_DERATE_START_DECI_C,
             MOTOR_STOP_DECI_C,
@@ -98,6 +124,33 @@ impl EnvironmentMonitor {
 
     pub const fn derating_reasons(&self) -> u8 {
         self.derating_reasons
+    }
+
+    fn update_transient_limit(&mut self, current: u16) -> u16 {
+        if current > RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS {
+            if !self.transient_recovery_active {
+                self.transient_budget = self
+                    .transient_budget
+                    .saturating_sub(current.saturating_sub(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS));
+                self.transient_recovery_active = self.transient_budget == 0;
+            }
+        } else {
+            let headroom = RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS - current;
+            let recovery = headroom.div_ceil(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR);
+            self.transient_budget = self
+                .transient_budget
+                .saturating_add(recovery)
+                .min(TRANSIENT_BUDGET_CAPACITY);
+            if self.transient_budget == TRANSIENT_BUDGET_CAPACITY {
+                self.transient_recovery_active = false;
+            }
+        }
+
+        if self.transient_recovery_active {
+            RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS
+        } else {
+            RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
+        }
     }
 
     fn update_undervoltage(&mut self, voltage_mv: u32) {
@@ -125,6 +178,28 @@ impl Default for EnvironmentMonitor {
 
 pub fn bus_voltage_mv(raw: u16) -> u32 {
     u32::from(raw).saturating_mul(18_975) >> 10
+}
+
+/// Project motor-terminal input current from a coherent foreground copy of
+/// measured dq current and applied dq voltage. Negative terminal power is
+/// battery charging during rollback and does not consume the discharge budget.
+pub fn projected_dc_current_counts(
+    measured_d_counts: i16,
+    measured_q_counts: i16,
+    applied_d_ticks: i16,
+    applied_q_ticks: i16,
+) -> u16 {
+    let terminal_power = i32::from(measured_d_counts)
+        .saturating_mul(i32::from(applied_d_ticks))
+        .saturating_add(i32::from(measured_q_counts).saturating_mul(i32::from(applied_q_ticks)));
+    if terminal_power <= 0 {
+        return 0;
+    }
+    terminal_power
+        .unsigned_abs()
+        .saturating_mul(3)
+        .div_ceil(u32::from(PWM_ARR).saturating_mul(2))
+        .min(u32::from(u16::MAX)) as u16
 }
 
 pub fn controller_temperature_deci_c(raw: u16) -> i16 {
@@ -163,14 +238,14 @@ fn thermistor_segment(intercept: i32, slope: i32, millivolts: i32) -> i32 {
 
 fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u16 {
     if temperature <= start {
-        return RIDE_DC_BUS_CURRENT_LIMIT_COUNTS;
+        return RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS;
     }
     if temperature >= stop {
         return 0;
     }
     let remaining = u32::from(stop.saturating_sub(temperature) as u16);
     let span = u32::from(stop.saturating_sub(start) as u16);
-    u32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS)
+    u32::from(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
         .saturating_mul(remaining)
         .checked_div(span)
         .unwrap_or_default() as u16
@@ -202,21 +277,21 @@ mod tests {
     #[test]
     fn missing_local_sensor_data_removes_drive_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
-        assert_eq!(monitor.update(0, RawLocalSensors::default()), None);
-        assert_eq!(monitor.update(50, nominal()), Some(392));
+        assert_eq!(monitor.update(0, RawLocalSensors::default(), 0), None);
+        assert_eq!(monitor.update(50, nominal(), 0), Some(640));
     }
 
     #[test]
     fn local_temperatures_derate_to_zero() {
-        assert_eq!(thermal_limit_counts(700, 700, 800), 392);
-        assert_eq!(thermal_limit_counts(750, 700, 800), 196);
+        assert_eq!(thermal_limit_counts(700, 700, 800), 640);
+        assert_eq!(thermal_limit_counts(750, 700, 800), 320);
         assert_eq!(thermal_limit_counts(800, 700, 800), 0);
-        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 196);
+        assert_eq!(thermal_limit_counts(1_150, 1_000, 1_300), 320);
 
         let mut monitor = EnvironmentMonitor::new(0);
         let mut hot = nominal();
         hot.controller_temperature_adc = 1_162;
-        assert!(monitor.update(0, hot).is_some());
+        assert!(monitor.update(0, hot, 0).is_some());
         assert_ne!(
             monitor.derating_reasons() & reason::CONTROLLER_TEMPERATURE,
             0
@@ -229,20 +304,86 @@ mod tests {
         let mut low = nominal();
         low.bus_voltage_adc = 2_000;
         for sample in 0..19 {
-            assert_ne!(monitor.update(sample * 50, low), Some(0));
+            assert_ne!(monitor.update(sample * 50, low, 0), Some(0));
         }
-        assert_eq!(monitor.update(19 * 50, low), Some(0));
+        assert_eq!(monitor.update(19 * 50, low, 0), Some(0));
         for sample in 20..40 {
-            assert_eq!(monitor.update(sample * 50, nominal()), Some(0));
+            assert_eq!(monitor.update(sample * 50, nominal(), 0), Some(0));
         }
-        assert_eq!(monitor.update(40 * 50, nominal()), Some(392));
+        assert_eq!(monitor.update(40 * 50, nominal(), 0), Some(640));
         assert_eq!(monitor.derating_reasons(), 0);
     }
 
     #[test]
     fn missing_local_data_is_reported_with_zero_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
-        assert_eq!(monitor.update(0, RawLocalSensors::default()), None);
+        assert_eq!(monitor.update(0, RawLocalSensors::default(), 0), None);
         assert_eq!(monitor.derating_reasons(), reason::LOCAL_DATA_MISSING);
+    }
+
+    #[test]
+    fn projected_dc_current_uses_measured_terminal_power() {
+        assert_eq!(projected_dc_current_counts(10, -880, -20, -1_100), 646);
+        assert_eq!(projected_dc_current_counts(0, -880, 0, 1_100), 0);
+        assert_eq!(projected_dc_current_counts(100, 0, 1_000, 0), 67);
+        assert_eq!(projected_dc_current_counts(0, 0, 0, -1_100), 0);
+    }
+
+    #[test]
+    fn full_transient_current_expires_after_seven_seconds() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        for sample in 0..139 {
+            assert_eq!(
+                monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 640),
+                Some(640)
+            );
+        }
+        assert_eq!(
+            monitor.update(139 * UPDATE_PERIOD_MS, nominal(), 640),
+            Some(431)
+        );
+        assert_ne!(
+            monitor.derating_reasons() & reason::DC_BUS_TRANSIENT_RECOVERY,
+            0
+        );
+    }
+
+    #[test]
+    fn excess_current_and_continuous_headroom_change_the_budget_proportionally() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        assert_eq!(
+            monitor.update(0, nominal(), RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS + 10),
+            Some(640)
+        );
+        assert_eq!(monitor.transient_budget, TRANSIENT_BUDGET_CAPACITY - 10);
+        assert_eq!(
+            monitor.update(
+                UPDATE_PERIOD_MS,
+                nominal(),
+                RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS - 40
+            ),
+            Some(640)
+        );
+        assert_eq!(monitor.transient_budget, TRANSIENT_BUDGET_CAPACITY);
+    }
+
+    #[test]
+    fn exhausted_transient_budget_stays_continuous_until_fully_recovered() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        for sample in 0..140 {
+            let _ = monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 640);
+        }
+
+        let mut sample = 140;
+        assert_eq!(
+            monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 0),
+            Some(431)
+        );
+        while monitor.transient_recovery_active {
+            sample += 1;
+            let _ = monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 0);
+            assert!(sample < 500);
+        }
+        assert_eq!(monitor.latest_limit, Some(640));
     }
 }

@@ -86,6 +86,7 @@ fn main() -> ! {
             && let (Some(environment), Some(ride)) = (environment.as_mut(), ride.as_mut())
         {
             let local = sensors::latest();
+            let control = foc::snapshot();
             foc::set_bus_voltage_mv(if local.analog_valid {
                 sensors::bus_voltage_mv(local.bus_voltage_adc)
             } else {
@@ -99,11 +100,16 @@ fn main() -> ! {
                     motor_temperature_adc: local.motor_temperature_adc,
                     controller_temperature_adc: local.controller_temperature_adc,
                 },
+                environment::projected_dc_current_counts(
+                    control.measured_d_counts,
+                    control.measured_q_counts,
+                    control.applied_d_ticks,
+                    control.applied_q_ticks,
+                ),
             );
             dc_bus_undervoltage = environment.undervoltage_active();
             effective_current_limit = environment_limit.unwrap_or(0);
             derating_reasons = environment.derating_reasons();
-            let control = foc::snapshot();
             let command = ride.update(ride::Observation {
                 now_ms: now,
                 throttle: local.throttle,

@@ -269,7 +269,7 @@ pub fn authorize_ride_target(
         Ordering::Relaxed,
     );
     DC_CURRENT_LIMIT_COUNTS.store(
-        u32::from(dc_current_limit_counts.min(crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS)),
+        u32::from(dc_current_limit_counts.min(crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)),
         Ordering::Relaxed,
     );
     COMMAND_SAFETY_EPOCH.store(safety_epoch, Ordering::Relaxed);
@@ -830,7 +830,7 @@ const fn ride_current_limits() -> CurrentLimits {
         Fixed::from_integer(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS as i32),
         Fixed::from_integer(crate::config::PHASE_CURRENT_TRIP_COUNTS as i32),
         Some(Fixed::from_integer(
-            crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS as i32,
+            crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS as i32,
         )),
         Some(Fixed::from_integer(
             crate::config::RIDE_DC_BUS_REGEN_LIMIT_COUNTS as i32,

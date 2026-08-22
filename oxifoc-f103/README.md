@@ -169,10 +169,16 @@ as soon as progress recovers to the starting position. The software phase-
 current guard trips above 1,344 counts (134.4 A) on A, B, or reconstructed C,
 preserving at least a 1.5-times margin over commanded phase
 current. The local 39 V undervoltage debounce and controller/motor thermal
-envelopes can only reduce the 392-count DC-side limit. This is nominally 39.2 A
-in the phase-derived projection and approximately 40 A at the BMS. The current
-limiter applies a circular `Id/Iq` command envelope,
-then derives the DC-side clamp from a 2 ms low-pass of q-axis modulation using
+envelopes can only reduce the battery-current envelope. Its continuous limit
+is 431 projected counts, approximately 44 A at the BMS, while a full transient
+budget permits 640 projected counts, approximately 65 A. Current above the
+continuous limit consumes a budget equivalent to seven seconds at the full
+transient limit. Operation below the continuous limit restores that budget at
+one-quarter rate; after exhaustion, the continuous limit remains active until
+recovery is complete. Budget accounting uses locally measured terminal power
+`Vd * Id + Vq * Iq`; it does not require BMS communication. The current limiter
+applies a circular `Id/Iq` command envelope, then derives the instantaneous
+DC-side clamp from a 2 ms low-pass of q-axis modulation using
 `Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
 and each reconstructed physical phase have independent overcurrent checks. The
 1,273-tick voltage-vector ceiling preserves the requested dq direction, and
@@ -211,7 +217,7 @@ Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 10 and the crate version. Page 21 reports retained pre-driver phase-path
+schema 11 and the crate version. Page 21 reports retained pre-driver phase-path
 and driver-step timing maxima, signed Hall speed at 4 eRPM/count, and observer
 acquisition flags. Bit 0 is set while the filtered internal PLL error is at or
 above the unchanged 0.2-radian acquisition threshold; the remaining bits are
@@ -234,7 +240,10 @@ application's conservative 4 KiB runtime RAM region.
 
 On page 9, byte 1 remains a saturated one-byte current-limit value for older
 tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
-recover the full effective DC limit (400 when it is not being derated).
+recover effective DC limits through 510 counts. The 640-count transient state
+therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
+distinguishes the exhausted continuous-recovery state, whose 431-count limit
+remains exact. Firmware-version page 18 reports telemetry schema 11.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -323,4 +332,8 @@ current history while explicitly requested ride-start seeds clear current
 history frozen during stopped output. Version 0.3.0 replaces the stock-derived
 Hall boundaries with the circular consensus from four complete bidirectional
 calibration runs; the motor direction, observer model, crossover, and current
-envelope are unchanged.
+envelope are unchanged. Version 0.4.0 restores the stock headlight status
+mirror. Version 0.5.0 adds the 65 A transient/44 A continuous battery envelope
+through OxiFOC's existing modulation-derived bus-current clamp. Version 0.5.1
+makes its accumulated budget use measured dq terminal power instead of current
+that the voltage-limited motor was unable to reach.

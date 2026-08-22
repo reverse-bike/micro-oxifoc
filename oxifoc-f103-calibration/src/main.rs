@@ -102,6 +102,7 @@ fn main() -> ! {
                 motor_temperature_adc: local.motor_temperature_adc,
                 controller_temperature_adc: local.controller_temperature_adc,
             },
+            0,
         );
         let environment_reasons = environment_monitor.derating_reasons();
         control::set_bus_voltage_mv(bus_voltage_mv);

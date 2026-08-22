@@ -6,6 +6,63 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.5.1 - 2026-08-22
+
+Changes:
+
+- Changed only the transient-budget measurement from final target q current
+  times applied q voltage to measured motor-terminal power
+  `Vd * Id + Vq * Iq`. The foreground converts that complete dq dot product to
+  projected DC-current counts with the existing `3 / (2 * PWM_PERIOD)` scale.
+- Kept OxiFOC's target-based, filtered-q-modulation bus clamp unchanged. It
+  remains the conservative instantaneous command bound, while the slower
+  battery budget now accounts for energy the motor actually received.
+- Kept negative terminal power outside the discharge budget, preserving
+  rollback-plugging behavior, and added regressions for q-axis motoring,
+  d-axis power, charging, and zero-current cases.
+
+Reason: the first 0.5.0 ride matched the BMS while the current loop tracked:
+63.4 A median local transient projection versus 64.2 A from the BMS, and the
+continuous state held 44.0--44.7 A. At the voltage ceiling, however, target q
+remained around 760--790 counts while measured q fell toward 350--600 counts.
+The target-based budget therefore continued accounting roughly 64 A while the
+BMS current fell through approximately 51--40 A. It exhausted three times;
+the same envelope replayed from BMS current did not exhaust. The measured dq
+terminal-power projection independently fit the ride at 0.099 A/count median
+against the configured 0.100 A/count, so it is the correct local,
+BMS-independent quantity for accumulated battery use.
+
+## 0.5.0 - 2026-08-22
+
+Changes:
+
+- Replaced the single 392-count projected DC-current ceiling with OxiFOC's
+  existing runtime bus-limit path driven by a stateful battery envelope. The
+  continuous limit is 431 counts, calibrated to approximately 44 A at the BMS,
+  and the transient limit is 640 counts, calibrated to approximately 65 A.
+- Added an excess-current budget equivalent to seven seconds at the full
+  transient limit. Current above the continuous limit consumes the budget in
+  proportion to its excess; headroom below the continuous limit restores it at
+  one-quarter rate.
+- Made an exhausted budget hold the continuous limit until it is fully
+  recovered. This prevents a one-sample recovery from alternating the bus
+  limit between continuous and transient values.
+- Derived budget consumption from the final q-current target and applied
+  q-voltage using the same `Ibus = Iq * modq` projection as OxiFOC's bus clamp.
+  Rollback plugging has the opposite voltage/current sign and therefore does
+  not consume the discharge budget.
+- Added page-9 derating bit `0x04` for the continuous-recovery state and bumped
+  project telemetry schema to 11. Existing thermal, undervoltage, phase-circle,
+  measured-current, software-trip, and TIM1 break protections are unchanged.
+
+Reason: a stock-bike ride reached 65.7 A briefly but only began reducing drive
+after battery current remained above 43.5 A for roughly seven seconds. That
+behavior indicates a battery with separate peak and continuous capability, not
+the single approximately 40 A ceiling previously imposed by this port. The new
+policy uses those observations as constants while preserving OxiFOC's original
+modulation-derived bus-current enforcement instead of adding a speed table or
+a second clamp inside the current loop.
+
 ## 0.4.0 - 2026-08-22
 
 Changes:

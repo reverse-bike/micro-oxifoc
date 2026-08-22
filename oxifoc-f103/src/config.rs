@@ -61,12 +61,21 @@ pub const OBSERVER_BLEND_LOW_ERPM: i32 = 3_000;
 pub const OBSERVER_BLEND_HIGH_ERPM: i32 = 6_000;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 880;
-pub const RIDE_DC_BUS_CURRENT_LIMIT_COUNTS: u16 = 392;
+// The q-modulation projection reads approximately three percent below the BMS
+// current. These limits therefore target about 44 A continuous and 65 A peak
+// at the battery instead of treating the nominal 100 mA/count phase scale as
+// an exact DC-current conversion.
+pub const RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS: u16 = 431;
+pub const RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS: u16 = 640;
+pub const RIDE_DC_BUS_TRANSIENT_DURATION_MS: u32 = 7_000;
+pub const RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR: u16 = 4;
 pub const RIDE_DC_BUS_REGEN_LIMIT_COUNTS: u16 = 40;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
-const _: () = assert!(RIDE_DC_BUS_REGEN_LIMIT_COUNTS < RIDE_DC_BUS_CURRENT_LIMIT_COUNTS);
+const _: () = assert!(RIDE_DC_BUS_REGEN_LIMIT_COUNTS < RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS);
+const _: () = assert!(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS < RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS);
+const _: () = assert!(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR > 0);
 const _: () =
     assert!((PHASE_CURRENT_TRIP_COUNTS as u32) * 2 >= (RIDE_PHASE_CURRENT_LIMIT_COUNTS as u32) * 3);
 const _: () = assert!(FOC_PHASE_LIMIT_TICKS <= FOC_HARD_PHASE_LIMIT_TICKS);
@@ -255,7 +264,10 @@ mod tests {
     #[test]
     fn ride_current_envelope_matches_the_pack_safe_configuration() {
         assert_eq!(RIDE_PHASE_CURRENT_LIMIT_COUNTS, 880);
-        assert_eq!(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS, 392);
+        assert_eq!(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS, 431);
+        assert_eq!(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS, 640);
+        assert_eq!(RIDE_DC_BUS_TRANSIENT_DURATION_MS, 7_000);
+        assert_eq!(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR, 4);
         assert_eq!(RIDE_DC_BUS_REGEN_LIMIT_COUNTS, 40);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
@@ -263,8 +275,12 @@ mod tests {
             88_000
         );
         assert_eq!(
-            i32::from(RIDE_DC_BUS_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
-            39_200
+            i32::from(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
+            43_100
+        );
+        assert_eq!(
+            i32::from(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
+            64_000
         );
         assert_eq!(
             i32::from(RIDE_DC_BUS_REGEN_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,

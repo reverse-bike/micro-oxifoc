@@ -307,7 +307,7 @@ mod tests {
             now_ms,
             throttle: ThrottleObservation::from_raw(throttle_raw),
             brake_active: false,
-            environment_dc_limit_counts: Some(crate::config::RIDE_DC_BUS_CURRENT_LIMIT_COUNTS),
+            environment_dc_limit_counts: Some(crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS),
             hall_valid: true,
             current_valid: true,
             fault_flags: 0,

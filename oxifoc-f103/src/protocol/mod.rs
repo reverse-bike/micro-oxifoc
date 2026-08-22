@@ -126,7 +126,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 18 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 10;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 11;
 pub const OBSERVER_ACQUIRE_BLOCK_PLL_ERROR: u8 = 1 << 0;
 pub const OBSERVER_ACQUIRE_MAX_PLL_ERROR_Q16: u16 = 2_086;
 
@@ -918,6 +918,15 @@ mod tests {
             passive_input_telemetry(1, snapshot).data[..4],
             [9, 255, 0, 225]
         );
+
+        let snapshot = PassiveInputTelemetry {
+            effective_current_limit: 640,
+            ..PassiveInputTelemetry::default()
+        };
+        assert_eq!(
+            passive_input_telemetry(1, snapshot).data[..4],
+            [9, 255, 0, 255]
+        );
     }
 
     #[test]
@@ -1052,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 10, b'0', b'.', b'4', b'.', b'0', 0]
+            [18, 11, b'0', b'.', b'5', b'.', b'1', 0]
         );
     }
 
