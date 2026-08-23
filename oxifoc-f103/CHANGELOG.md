@@ -6,6 +6,73 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.6.1 - 2026-08-22
+
+Changes:
+
+- Replaced the Q16.16 64-bit restoring square root in the d-priority current
+  circle with a conservative scaled-u32 calculation. At the configured
+  880-count circle its quantization is 1/32 count, and exhaustive fixed-domain
+  tests verify that the returned q limit never crosses the requested circle.
+- Removed a duplicate current-circle calculation from the driver's combined
+  current and bus-limit path. A nonzero d target now computes the q-axis circle
+  limit once and reuses it for the terminal-power clamp.
+- Restored the previous q-only bus-limit fast path whenever target d current is
+  zero. The complete `Vd * Id + Vq * Iq` projection remains active whenever a
+  requested or field-weakening d target is nonzero.
+- Changed the field-weakening voltage-headroom comparison to conservative
+  whole-PWM-tick squared arithmetic and skip that comparison entirely below
+  the entry speed. The 6,000-eRPM entry, 95-percent voltage threshold,
+  200-count ceiling, and ramp rates are unchanged.
+
+Reason: the first 0.6.0 ride recorded four `ControlTiming` safety events and no
+hardware-break, phase-overcurrent, or battery-disconnect event. Whole-handler
+time reached 4,620 cycles against the 4,500-cycle 16 kHz deadline, versus a
+4,144-cycle maximum in the preceding firmware. The expensive current-circle
+path had been dormant while the requested d current was zero; field weakening
+made it execute twice per control pass. This patch keeps the same circular
+current and full-dq battery envelopes while removing that real-time regression.
+
+## 0.6.0 - 2026-08-22
+
+Changes:
+
+- Added OxiFOC's documented MESC-V2 field-weakening path to the synchronous
+  motor driver. Above 6,000 eRPM, motoring voltage demand beyond 95 percent of
+  the 1,273-tick circle ramps the d-current target negative; restored voltage
+  headroom ramps it back toward zero. The first hardware envelope is limited
+  to 200 current counts, reaching that limit in 50 ms and releasing over 200
+  ms.
+- Kept field weakening inside the existing d-priority 880-count current
+  circle. At the 200-count weakening ceiling, at least 856 counts of q-current
+  authority remain. The existing radial voltage limiter and `NoDecoupling`
+  specialization are unchanged so the first ride isolates saturation feedback
+  from voltage-allocation and feedforward changes.
+- Extended the 16 kHz bus-current clamp from `Vq * Iq` to the complete target
+  terminal-power projection `Vd * Id + Vq * Iq`. The clamp still uses the 2 ms
+  filtered applied voltage and the selected discharge/regen bound, while the
+  slower transient budget continues using measured dq terminal power.
+- Made an ordinary high-speed brake request enter the existing energized,
+  zero-q coasting state. This lets negative d current unwind only as voltage
+  headroom returns instead of disabling the bridge above the unweakened base
+  speed. Faults, invalid sensors, expired authority, and environmental loss
+  still stop immediately.
+- Replaced the four-page maximum-|d| event capture with page 14 field-
+  weakening telemetry: active/at-limit/voltage-limit flags, target d current,
+  and requested dq voltage. Removed page 21's temporary split-ISR timing and
+  observer-acquisition diagnostics; page 6 retains whole-handler timing and
+  pages 12--13 and 22--25 retain fault evidence. Project telemetry schema is
+  now 12.
+
+Reason: loaded rides reach the voltage circle at high speed while retaining
+phase-current and battery-current capacity. Saturation feedback spends a
+bounded amount of that phase-current envelope on negative d current only when
+the controller has no voltage headroom, avoiding a model-derived speed table.
+The 20 A initial ceiling reduces the calibrated effective flux by an estimated
+11 percent and leaves nearly all low-speed q authority, while the full-dq bus
+projection prevents its copper power from bypassing the 44 A continuous/65 A
+transient battery envelope.
+
 ## 0.5.1 - 2026-08-22
 
 Changes:

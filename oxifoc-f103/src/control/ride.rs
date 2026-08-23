@@ -112,7 +112,11 @@ impl RideController {
             && observation.hall_valid
             && observation.current_valid
             && environment_limit != 0;
-        if observation.brake_active || !observation.throttle.is_valid() || !safety_ready {
+        if !observation.throttle.is_valid() || !safety_ready {
+            self.state = State::Disarmed;
+            return Command::OFF;
+        }
+        if observation.brake_active && !matches!(self.state, State::Active(_)) {
             self.state = State::Disarmed;
             return Command::OFF;
         }
@@ -173,7 +177,11 @@ impl RideController {
         observation: Observation,
         environment_limit: u16,
     ) -> Command {
-        let demand = observation.throttle.demand();
+        let demand = if observation.brake_active {
+            None
+        } else {
+            observation.throttle.demand()
+        };
         if matches!(run.stage, Stage::AwaitingFirstEdge | Stage::StartupTracking)
             && demand.is_none()
         {
@@ -566,6 +574,47 @@ mod tests {
         stopped.now_ms = 22;
         stopped.electrical_rpm = 2_500;
         assert_eq!(controller.update(stopped), Command::OFF);
+    }
+
+    #[test]
+    fn high_speed_brake_uses_energized_zero_current_coast() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        controller.update(observation(1, FULL_ADC));
+        let mut tracking = observation(20, FULL_ADC);
+        tracking.hall_sequence = 12;
+        tracking.hall_progress = 12;
+        tracking.electrical_rpm = 10_000;
+        assert_eq!(controller.update(tracking).stage, Stage::Tracking);
+
+        let mut braking = tracking;
+        braking.now_ms = 21;
+        braking.brake_active = true;
+        let command = controller.update(braking);
+        assert!(command.energize);
+        assert_eq!(command.target_q_counts, 0);
+        assert_eq!(command.stage, Stage::Coasting);
+
+        braking.now_ms = 22;
+        braking.electrical_rpm = HALL_ENTRY_MAXIMUM_ERPM as i32;
+        assert_eq!(controller.update(braking), Command::OFF);
+    }
+
+    #[test]
+    fn high_speed_safety_loss_still_disarms_immediately() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        controller.update(observation(1, FULL_ADC));
+        let mut tracking = observation(20, FULL_ADC);
+        tracking.hall_sequence = 12;
+        tracking.hall_progress = 12;
+        tracking.electrical_rpm = 10_000;
+        assert_eq!(controller.update(tracking).stage, Stage::Tracking);
+
+        tracking.now_ms = 21;
+        tracking.brake_active = true;
+        tracking.safety_events = 1;
+        assert_eq!(controller.update(tracking), Command::OFF);
     }
 
     #[test]

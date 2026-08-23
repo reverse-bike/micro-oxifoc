@@ -12,14 +12,13 @@ use oxifoc_core::foc::{
     phase::{BackEmfObserver, ObserverDiagnostics, PhaseEstimate, PhaseManager, PhaseSource},
     ramp::QuadratureTargetRamp,
 };
-use oxifoc_core::motor::foc_driver::{CurrentLimits, FocDriver, StepError};
+use oxifoc_core::motor::foc_driver::{CurrentLimits, FieldWeakening, FocDriver, StepError};
 use stm32f1::stm32f103::interrupt;
 
 const CONTROL_HALL_VALID: u32 = 1;
 const CONTROL_CURRENT_VALID: u32 = 1 << 1;
 const CONTROL_OUTPUT_ACTIVE: u32 = 1 << 2;
 const CONTROL_VOLTAGE_LIMITED: u32 = 1 << 3;
-const CONTROL_DIRECT_EVENT_PENDING: u32 = 1 << 4;
 const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_WARNING_CYCLES: u32 = 3_900;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
@@ -72,39 +71,15 @@ pub enum SafetyLossReason {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DirectCurrentPeakEvent {
-    pub generation: u8,
-    pub measured_d_counts: i16,
-    pub measured_q_counts: i16,
-    pub target_q_counts: i16,
-    pub hall_raw: u8,
-    pub hall_angle_direction: i8,
-    pub edge_age_us: u16,
-    pub hall_interval_us: u16,
-    pub angle_error_q8: i8,
-    pub requested_d_ticks: i16,
-    pub requested_q_ticks: i16,
-    pub feedforward_d_ticks: i16,
-    pub feedforward_q_ticks: i16,
-    pub applied_d_ticks: i16,
-    pub applied_q_ticks: i16,
-    pub voltage_limited: bool,
-    pub angle_rate_limited: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TimingMaxima {
-    pre_driver_cycles: u16,
-    driver_step_cycles: u16,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
     pub hall_valid: bool,
     pub current_valid: bool,
     pub output_active: bool,
     pub voltage_limited: bool,
     pub target_q_counts: i16,
+    pub target_d_counts: i16,
+    pub requested_d_ticks: i16,
+    pub requested_q_ticks: i16,
     pub phase_current_limit_counts: u16,
     pub measured_d_counts: i16,
     pub measured_q_counts: i16,
@@ -115,7 +90,6 @@ pub struct Snapshot {
     pub maximum_direct_current_abs: u16,
     pub maximum_quadrature_error_abs: u16,
     pub maximum_pwm_span_ticks: u16,
-    pub maximum_direct_event: DirectCurrentPeakEvent,
     pub safety_events: u32,
     pub last_safety_loss_reason: u8,
     pub phase_current_trips: u32,
@@ -134,8 +108,6 @@ pub struct Snapshot {
     pub observer_flux_centi_mwb: u16,
     pub observer_bemf_q_mv: i16,
     pub observer_phase_error_q16: u16,
-    pub maximum_pre_driver_cycles: u16,
-    pub maximum_driver_step_cycles: u16,
     pub fault_flags: u32,
     pub control_cycles: u32,
     pub injected_samples: u32,
@@ -148,6 +120,9 @@ pub struct Snapshot {
 struct ControlDiagnostics {
     flags: u32,
     target_q_counts: i16,
+    target_d_counts: i16,
+    requested_d_ticks: i16,
+    requested_q_ticks: i16,
     phase_current_limit_counts: u16,
     measured_d_counts: i16,
     measured_q_counts: i16,
@@ -158,9 +133,6 @@ struct ControlDiagnostics {
     maximum_direct_current_abs: u32,
     maximum_quadrature_error_abs: u32,
     maximum_pwm_span_ticks: u32,
-    maximum_direct_event: DirectCurrentPeakEvent,
-    fault_direct_event: DirectCurrentPeakEvent,
-    fault_direct_event_valid: bool,
     safety_events: u32,
     last_safety_loss_reason: u8,
     phase_current_trips: u32,
@@ -179,7 +151,6 @@ struct ControlDiagnostics {
     observer_flux_centi_mwb: u16,
     observer_bemf_q_mv: i16,
     observer_phase_error_q16: u16,
-    timing_maxima: TimingMaxima,
     injected_samples: u32,
     control_max_cycles: u32,
     control_budget_warnings: u32,
@@ -294,14 +265,7 @@ pub fn begin_fault_diagnostic_episode() {
             // SAFETY: CONTROL was initialized before its flag was published,
             // and TIM1_UP remains masked by this critical section.
             let state = unsafe { &mut *(*CONTROL.0.get()).as_mut_ptr() };
-            let generation = state.diagnostics.maximum_direct_event.generation;
             state.diagnostics.maximum_direct_current_abs = 0;
-            state.diagnostics.maximum_direct_event = DirectCurrentPeakEvent {
-                generation,
-                ..DirectCurrentPeakEvent::default()
-            };
-            state.diagnostics.fault_direct_event_valid = false;
-            state.diagnostics.flags |= CONTROL_DIRECT_EVENT_PENDING;
         }
     });
 }
@@ -324,6 +288,9 @@ pub fn snapshot() -> Snapshot {
         output_active: flags & CONTROL_OUTPUT_ACTIVE != 0,
         voltage_limited: flags & CONTROL_VOLTAGE_LIMITED != 0,
         target_q_counts: diagnostics.target_q_counts,
+        target_d_counts: diagnostics.target_d_counts,
+        requested_d_ticks: diagnostics.requested_d_ticks,
+        requested_q_ticks: diagnostics.requested_q_ticks,
         phase_current_limit_counts: diagnostics.phase_current_limit_counts,
         measured_d_counts: diagnostics.measured_d_counts,
         measured_q_counts: diagnostics.measured_q_counts,
@@ -336,11 +303,6 @@ pub fn snapshot() -> Snapshot {
             diagnostics.maximum_quadrature_error_abs,
         ),
         maximum_pwm_span_ticks: saturating_u32_to_u16(diagnostics.maximum_pwm_span_ticks),
-        maximum_direct_event: if diagnostics.fault_direct_event_valid {
-            diagnostics.fault_direct_event
-        } else {
-            diagnostics.maximum_direct_event
-        },
         safety_events: diagnostics.safety_events,
         last_safety_loss_reason: diagnostics.last_safety_loss_reason,
         phase_current_trips: diagnostics.phase_current_trips,
@@ -359,8 +321,6 @@ pub fn snapshot() -> Snapshot {
         observer_flux_centi_mwb: diagnostics.observer_flux_centi_mwb,
         observer_bemf_q_mv: diagnostics.observer_bemf_q_mv,
         observer_phase_error_q16: diagnostics.observer_phase_error_q16,
-        maximum_pre_driver_cycles: diagnostics.timing_maxima.pre_driver_cycles,
-        maximum_driver_step_cycles: diagnostics.timing_maxima.driver_step_cycles,
         fault_flags: hardware::fault_flags(),
         control_cycles: CONTROL_CYCLE.load(Ordering::Relaxed),
         injected_samples: diagnostics.injected_samples,
@@ -396,6 +356,9 @@ fn note_safety_loss(diagnostics: &mut ControlDiagnostics, reason: SafetyLossReas
 fn publish_stopped_output(diagnostics: &mut ControlDiagnostics) {
     diagnostics.flags &= !(CONTROL_OUTPUT_ACTIVE | CONTROL_VOLTAGE_LIMITED);
     diagnostics.target_q_counts = 0;
+    diagnostics.target_d_counts = 0;
+    diagnostics.requested_d_ticks = 0;
+    diagnostics.requested_q_ticks = 0;
     diagnostics.phase_current_limit_counts = 0;
     diagnostics.measured_d_counts = 0;
     diagnostics.measured_q_counts = 0;
@@ -410,10 +373,6 @@ const fn lease_is_active(now: u32, deadline: u32) -> bool {
 }
 
 fn stop_control(state: &mut ControlState, safety_loss: Option<SafetyLossReason>) {
-    if hardware::fault_flags() != 0 {
-        state.diagnostics.fault_direct_event = state.diagnostics.maximum_direct_event;
-        state.diagnostics.fault_direct_event_valid = true;
-    }
     hardware::disable_motor_outputs();
     hardware::write_pwm_neutral();
     publish_stopped_output(&mut state.diagnostics);
@@ -433,7 +392,7 @@ fn TIM1_UP() {
     if !crate::config::sample_injected_on_timer_update(hardware::tim1_counting_down()) {
         return;
     }
-    control_cycle(started);
+    control_cycle();
     let elapsed = hardware::cycle_count().wrapping_sub(started);
     if CONTROL_INITIALIZED.load(Ordering::Acquire) {
         // SAFETY: CONTROL is initialized before TIM1_UP is unmasked and this
@@ -449,8 +408,6 @@ fn TIM1_UP() {
                 state.diagnostics.control_budget_overruns.wrapping_add(1);
             if hardware::fault_flags() & hardware::FAULT_CONTROL_TIMING == 0 {
                 hardware::latch_control_timing_fault();
-                state.diagnostics.fault_direct_event = state.diagnostics.maximum_direct_event;
-                state.diagnostics.fault_direct_event_valid = true;
                 publish_stopped_output(&mut state.diagnostics);
                 note_safety_loss(&mut state.diagnostics, SafetyLossReason::ControlTiming);
             }
@@ -459,7 +416,7 @@ fn TIM1_UP() {
     }
 }
 
-fn control_cycle(started: u32) {
+fn control_cycle() {
     let control_cycle = CONTROL_CYCLE.load(Ordering::Relaxed).wrapping_add(1);
     CONTROL_CYCLE.store(control_cycle, Ordering::Relaxed);
     crate::safety::record_control_cycle(control_cycle);
@@ -594,7 +551,6 @@ fn control_cycle(started: u32) {
         return;
     };
     state.hall_recovery_cycles = 0;
-    let angle = estimate.angle;
     publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, true);
     crate::safety::record_control_checkpoint(crate::safety::checkpoint::PHASE_ESTIMATED);
 
@@ -645,11 +601,6 @@ fn control_cycle(started: u32) {
     state.driver.set_volts_per_pwm_tick(Fixed::from_bits(
         OBSERVER_VOLTS_PER_PWM_TICK_BITS.load(Ordering::Relaxed),
     ));
-    note_timing_maximum(
-        &mut state.diagnostics.timing_maxima.pre_driver_cycles,
-        started,
-    );
-    let driver_step_started = hardware::cycle_count();
     let output = match state.driver.step_current_control(
         Fixed::from_integer(i32::from(current.phase_a)),
         Fixed::from_integer(i32::from(current.phase_b)),
@@ -660,26 +611,19 @@ fn control_cycle(started: u32) {
     ) {
         Ok(output) => output,
         Err(StepError::Overcurrent) => {
-            note_timing_maximum(
-                &mut state.diagnostics.timing_maxima.driver_step_cycles,
-                driver_step_started,
-            );
             state.diagnostics.phase_current_trips =
                 state.diagnostics.phase_current_trips.wrapping_add(1);
             stop_control(state, Some(SafetyLossReason::PhaseOvercurrent));
             return;
         }
     };
-    note_timing_maximum(
-        &mut state.diagnostics.timing_maxima.driver_step_cycles,
-        driver_step_started,
-    );
     crate::safety::record_control_checkpoint(crate::safety::checkpoint::DRIVER_COMPLETE);
     let phase_limit = output
         .quadrature_limit
         .abs_ceil_u32()
         .min(u32::from(u16::MAX)) as u16;
     let target_q = output.target.q.integer();
+    let target_d = output.target.d.integer();
     let measured_current = output.measured_current;
     let duty = output.duties;
     let measured_d_counts = fixed_to_i16(measured_current.d);
@@ -689,6 +633,9 @@ fn control_cycle(started: u32) {
     let applied_q_ticks = fixed_to_i16(applied_voltage.q);
     let pwm_span_ticks = pwm_span(duty);
     state.diagnostics.target_q_counts = target_q as i16;
+    state.diagnostics.target_d_counts = target_d as i16;
+    state.diagnostics.requested_d_ticks = fixed_to_i16(output.requested_voltage.d);
+    state.diagnostics.requested_q_ticks = fixed_to_i16(output.requested_voltage.q);
     state.diagnostics.phase_current_limit_counts = phase_limit;
     state.diagnostics.measured_d_counts = measured_d_counts;
     state.diagnostics.measured_q_counts = measured_q_counts;
@@ -700,41 +647,10 @@ fn control_cycle(started: u32) {
         CONTROL_VOLTAGE_LIMITED,
         output.voltage_limited,
     );
-    let direct_is_max = update_max(
+    let _ = update_max(
         &mut state.diagnostics.maximum_direct_current_abs,
         u32::from(measured_d_counts.unsigned_abs()),
     );
-    if direct_is_max || state.diagnostics.flags & CONTROL_DIRECT_EVENT_PENDING != 0 {
-        state.diagnostics.flags &= !CONTROL_DIRECT_EVENT_PENDING;
-        let unlimited_angle = state.driver.phase().hall().unlimited_angle();
-        let measurement_angle_q16 = (angle >> 16) as u16;
-        let unlimited_angle_q16 = (unlimited_angle >> 16) as u16;
-        capture_direct_current_peak(
-            &mut state.diagnostics,
-            DirectCurrentPeakEvent {
-                measured_d_counts,
-                measured_q_counts,
-                target_q_counts: target_q as i16,
-                hall_raw: state.driver.phase().hall().raw_state(),
-                hall_angle_direction: state.driver.phase().hall().angle_direction(),
-                edge_age_us: saturating_u32_to_u16(edge_age_us),
-                hall_interval_us: saturating_u32_to_u16(
-                    state.driver.phase().hall().sector_interval_us(),
-                ),
-                angle_error_q8: (unlimited_angle_q16.wrapping_sub(measurement_angle_q16) as i16
-                    >> 8) as i8,
-                requested_d_ticks: fixed_to_i16(output.requested_voltage.d),
-                requested_q_ticks: fixed_to_i16(output.requested_voltage.q),
-                feedforward_d_ticks: fixed_to_i16(output.feedforward_voltage.d),
-                feedforward_q_ticks: fixed_to_i16(output.feedforward_voltage.q),
-                applied_d_ticks,
-                applied_q_ticks,
-                voltage_limited: output.voltage_limited,
-                angle_rate_limited: angle != unlimited_angle,
-                ..DirectCurrentPeakEvent::default()
-            },
-        );
-    }
     let _ = update_max(
         &mut state.diagnostics.maximum_quadrature_error_abs,
         target_q
@@ -772,12 +688,6 @@ fn publish_observer_diagnostics(
     published.observer_bemf_q_mv = bemf_q_mv;
     published.observer_phase_error_q16 =
         (diagnostics.phase_error_filtered_q32 >> 16).min(u32::from(u16::MAX)) as u16;
-}
-
-#[inline(never)]
-fn note_timing_maximum(maximum: &mut u16, started: u32) {
-    let elapsed = hardware::cycle_count().wrapping_sub(started);
-    *maximum = (*maximum).max(saturating_u32_to_u16(elapsed));
 }
 
 fn fixed_unit_to_u8(value: Fixed) -> u8 {
@@ -823,6 +733,13 @@ const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> RideFocDriver {
         BUS_MODULATION_FILTER_SHIFT,
     )
     .with_observer_scales(Fixed::ZERO, crate::config::PHASE_CURRENT_AMPS_PER_ADC_COUNT)
+    .with_field_weakening(FieldWeakening::new(
+        Fixed::from_integer(crate::config::FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS as i32),
+        crate::config::FIELD_WEAKENING_MINIMUM_ERPM,
+        crate::config::FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS,
+        crate::config::FIELD_WEAKENING_RAMP_IN_PER_CYCLE,
+        crate::config::FIELD_WEAKENING_RAMP_OUT_PER_CYCLE,
+    ))
 }
 
 const fn ride_current_limits() -> CurrentLimits {
@@ -845,18 +762,6 @@ fn update_max(target: &mut u32, value: u32) -> bool {
     } else {
         false
     }
-}
-
-fn capture_direct_current_peak(
-    diagnostics: &mut ControlDiagnostics,
-    mut event: DirectCurrentPeakEvent,
-) {
-    event.generation = diagnostics
-        .maximum_direct_event
-        .generation
-        .wrapping_add(1)
-        .max(1);
-    diagnostics.maximum_direct_event = event;
 }
 
 const fn saturating_u32_to_u16(value: u32) -> u16 {

@@ -262,32 +262,16 @@ pub fn service(
                 maximum_quadrature_error_abs: control.maximum_quadrature_error_abs,
                 maximum_pwm_span_ticks: control.maximum_pwm_span_ticks,
             }),
-            7..=10 => {
-                let event = control.maximum_direct_event;
-                protocol::control_peak_event_telemetry(
-                    page - 7,
-                    protocol::ControlPeakEventTelemetry {
-                        generation: event.generation,
-                        measured_d_counts: event.measured_d_counts,
-                        measured_q_counts: event.measured_q_counts,
-                        target_q_counts: event.target_q_counts,
-                        hall_raw: event.hall_raw,
-                        hall_angle_direction: event.hall_angle_direction,
-                        edge_age_us: event.edge_age_us,
-                        hall_interval_us: event.hall_interval_us,
-                        angle_error_q8: event.angle_error_q8,
-                        requested_d_ticks: event.requested_d_ticks,
-                        requested_q_ticks: event.requested_q_ticks,
-                        feedforward_d_ticks: event.feedforward_d_ticks,
-                        feedforward_q_ticks: event.feedforward_q_ticks,
-                        applied_d_ticks: event.applied_d_ticks,
-                        applied_q_ticks: event.applied_q_ticks,
-                        voltage_limited: event.voltage_limited,
-                        angle_rate_limited: event.angle_rate_limited,
-                    },
-                )
-            }
-            11 => protocol::observer_status_telemetry(protocol::ObserverStatusTelemetry {
+            7 => protocol::field_weakening_telemetry(protocol::FieldWeakeningTelemetry {
+                active: control.target_d_counts < 0,
+                at_current_limit: control.target_d_counts
+                    <= -(config::FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS as i16),
+                voltage_limited: control.voltage_limited,
+                target_d_counts: control.target_d_counts,
+                requested_d_ticks: control.requested_d_ticks,
+                requested_q_ticks: control.requested_q_ticks,
+            }),
+            8 => protocol::observer_status_telemetry(protocol::ObserverStatusTelemetry {
                 configured: control.observer_configured,
                 ready: control.observer_ready,
                 active: control.observer_active,
@@ -296,27 +280,15 @@ pub fn service(
                 electrical_rpm: control.observer_electrical_rpm,
                 hall_error_q16: control.observer_hall_error_q16,
             }),
-            12 => protocol::observer_model_telemetry(protocol::ObserverModelTelemetry {
+            9 => protocol::observer_model_telemetry(protocol::ObserverModelTelemetry {
                 flux_centi_mwb: control.observer_flux_centi_mwb,
                 bemf_q_mv: control.observer_bemf_q_mv,
                 phase_error_q16: control.observer_phase_error_q16,
                 validity_progress: control.observer_validity_progress,
             }),
-            13 => protocol::control_timing_breakdown_telemetry(
-                protocol::ControlTimingBreakdownTelemetry {
-                    maximum_pre_driver_cycles: control.maximum_pre_driver_cycles,
-                    maximum_driver_step_cycles: control.maximum_driver_step_cycles,
-                    // Valid Hall intervals are at least 100 us, so quarter-eRPM
-                    // resolution covers the complete accepted speed range.
-                    hall_electrical_rpm_div4: (control.electrical_rpm >> 2) as i16,
-                    observer_acquisition_flags: protocol::observer_acquisition_flags(
-                        control.observer_phase_error_q16,
-                    ),
-                },
-            ),
-            14 | 15 => {
+            10 | 11 => {
                 let reset = safety::boot_diagnostics_snapshot();
-                if page == 14 {
+                if page == 10 {
                     protocol::reset_summary_telemetry(protocol::ResetSummaryTelemetry {
                         reset_flags: reset.reset_flags,
                         retained_context_valid: reset.retained_context_valid,
@@ -338,9 +310,9 @@ pub fn service(
                     })
                 }
             }
-            16 | 17 => {
+            12 | 13 => {
                 let failure = safety::latest_pwm_failure_snapshot();
-                protocol::pwm_failure_telemetry(page + 8, failure.words())
+                protocol::pwm_failure_telemetry(page + 12, failure.words())
             }
             _ => protocol::firmware_version_telemetry(),
         };

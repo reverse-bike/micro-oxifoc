@@ -79,12 +79,12 @@ decoupling and permanent-magnet back-EMF feedforward strategy. Its fixed model
 uses one nominal 100 mA/current-count conversion throughout the F103 firmware
 and the loaded terminal fit of 43 mOhm effective phase resistance, 75 uH
 effective phase inductance, and 13.4 mWb flux linkage. The STM32F103 ride
-specialization currently selects `NoDecoupling`: reference-current feedforward
-is not valid once its request exceeds the voltage circle, and this firmware
-does not yet implement field weakening or another voltage-feasibility policy.
-Retained peak-|d| telemetry keeps the pre-limit request, feedforward
-contribution, and applied voltage separate for a future minor-version
-experiment.
+specialization keeps `NoDecoupling` for the first field-weakening experiment.
+`FocDriver` now follows OxiFOC's documented MESC-V2 path: motoring voltage
+demand above 95 percent of the voltage circle ramps in negative d current, and
+restored headroom ramps it back out. The first envelope begins above 6,000
+eRPM and is capped at 200 current counts. Reference-current decoupling remains
+a separate follow-up after the voltage-feasibility behavior is validated.
 
 `PhaseManager` owns both the installed Hall sensor and fixed-point back-EMF
 observer. Hall remains authoritative below 3,000 eRPM. Once OxiFOC's observer
@@ -115,11 +115,7 @@ for this controller family.
   feed stock CAN telemetry; its independent quiet state is required for an
   updater reset.
 - DWT measures every 16 kHz control pass. Page 6 of `0x2F7` reports the maximum
-  and warning count; a pass over 4,500 cycles latches output off. Page 21
-  retains separate maxima for TIM1 entry through phase selection and the FOC
-  driver step, plus signed Hall electrical speed at 4 eRPM/count and the
-  observer PLL acquisition-gate state. Subtracting both timing fields from
-  page 6's whole-handler maximum bounds the remaining output-publication cost.
+  and warning count; a pass over 4,500 cycles latches output off.
 - WWDG requires TIM1 interrupt progress, while IWDG normally requires both
   control-cycle and injected-ADC progress. Once a fault is latched and all
   motor channels are verified disabled, TIM1 progress alone keeps IWDG alive
@@ -148,11 +144,13 @@ regular DMA scan is:
 
 The active-low brake input is PC4 with a pull-up and four matching 1 kHz
 samples. Throttle is plausible at 250--3,750 ADC counts, is at rest through
-850, and reaches full demand at 3,252. Boot-high, invalid acquisition, brake,
-current trip, Hall loss, or another safety loss disarms the ride path until a
-fresh valid rest sample is observed. A latched hardware fault is acknowledged
-only in a throttle-rest pass, after ride authority is revoked, and only while
-PB12 is inactive; that pass cannot energize the motor.
+850, and reaches full demand at 3,252. At high speed, brake enters the same
+energized zero-q coast as throttle release so field weakening can unwind with
+voltage headroom; at or below 2,500 eRPM it disarms. Boot-high, invalid
+acquisition, current trip, Hall loss, or another safety loss disarms the ride
+path until a fresh valid rest sample is observed. A latched hardware fault is
+acknowledged only in a throttle-rest pass, after ride authority is revoked,
+and only while PB12 is inactive; that pass cannot energize the motor.
 
 The display is not a safety input. Losing CAN traffic does not revoke an
 already valid local ride request; every authority decision still comes from
@@ -178,15 +176,19 @@ one-quarter rate; after exhaustion, the continuous limit remains active until
 recovery is complete. Budget accounting uses locally measured terminal power
 `Vd * Id + Vq * Iq`; it does not require BMS communication. The current limiter
 applies a circular `Id/Iq` command envelope, then derives the instantaneous
-DC-side clamp from a 2 ms low-pass of q-axis modulation using
-`Ibus ≈ Iq × modq`; it has no vehicle-speed input. The measured dq vector
-and each reconstructed physical phase have independent overcurrent checks. The
-1,273-tick voltage-vector ceiling preserves the requested dq direction, and
-the 1,103-tick centered PWM window reproduces the reviewed F103 modulation
-envelope. The PI controller uses OxiFOC's trapezoidal integrator and coordinated
-circular-limit anti-windup. The voltage vector alone is advanced by one
-measured electrical control-period step to compensate the ADC-to-PWM pipeline;
-current Park transformation remains at the sampled Hall angle.
+DC-side clamp from a 2 ms low-pass of applied dq voltage using
+`Ibus ≈ 3 * (Vd * Id + Vq * Iq) / (2 * PWM_PERIOD)`. It has no vehicle-speed
+input. Field weakening begins only when high-speed motoring voltage exceeds
+1,209 ticks, ramps negative d toward 200 counts in 50 ms, and releases over
+200 ms once headroom returns. The d-priority current circle leaves 856 counts
+of q authority at that ceiling. The measured dq vector and each reconstructed
+physical phase have independent overcurrent checks. The 1,273-tick voltage-
+vector ceiling preserves the requested dq direction, and the 1,103-tick
+centered PWM window reproduces the reviewed F103 modulation envelope. The PI
+controller uses OxiFOC's trapezoidal integrator and coordinated circular-limit
+anti-windup. The voltage vector alone is advanced by one measured electrical
+control-period step to compensate the ADC-to-PWM pipeline; current Park
+transformation remains at the sampled phase angle.
 
 ## CAN and updater
 
@@ -199,30 +201,23 @@ on PA13. The application provides:
 - stock headlight control from `0x300.b2`, mirrored into `0x201.b4` bit 1 and
   `0x64A` bits 3 and 13 without granting or revoking ride authority;
 - updater reset on `0x67F#AA552A002A...`;
-- commissioning pages 6 and 8--25 on `0x2F7`.
+- commissioning pages 6, 8--14, 18--20, and 22--25 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
 span. Page 12 carries the full internal fault mask and safety-event count.
 Page 13 retains peak phase current, quadrature tracking error, and PWM span
 from boot so short transients remain visible at CAN telemetry rates. Its direct
-current maximum restarts after each successful fault acknowledgement. Pages
-14--17 retain signed dq current and target, Hall state/direction,
-edge age and interval, Hall angle error, requested dq voltage, motor-model
-feedforward dq voltage, applied dq voltage, and limiting flags from the exact
-cycle that set the current episode's maximum |d|. Its first active sample is
-always captured. A hardware fault freezes the complete event, and a repeated
-generation prevents readers from combining different peaks.
+current maximum restarts after each successful fault acknowledgement. Page 14
+reports field-weakening active/at-limit/voltage-limit flags, target d current,
+and requested dq voltage.
 Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 11 and the crate version. Page 21 reports retained pre-driver phase-path
-and driver-step timing maxima, signed Hall speed at 4 eRPM/count, and observer
-acquisition flags. Bit 0 is set while the filtered internal PLL error is at or
-above the unchanged 0.2-radian acquisition threshold; the remaining bits are
-reserved. Page 19 supplies readiness, confidence, and observer eRPM, while
-page 20 supplies the full PLL error and external-validity progress.
+schema 12 and the crate version. Page 19 supplies readiness, confidence, and
+observer eRPM, while page 20 supplies the full PLL error and external-validity
+progress.
 Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
 retained fatal class, last control checkpoint, whole-handler timing, cycle
 number, exception detail, and low address words of the stacked PC/LR. The
@@ -232,8 +227,8 @@ predicate, fault and condition state (including RCC clock-security status),
 TIM1 status/output registers, and attempted compares. They report the first
 failure of the latest fault episode during the same boot or after a watchdog
 reset. Reset/crash and PWM-failure pages have independent slots, so all four
-are always emitted. The project-page scheduler advances through all
-nineteen slots without a wraparound phase discontinuity.
+are always emitted. The project-page scheduler advances through all fifteen
+slots without a wraparound phase discontinuity.
 The 56-byte retained record is linked at `0x20004F00`: above the recovered
 bootloader's `0x200000DC..0x20000CF7` zero-fill/stack range and outside the
 application's conservative 4 KiB runtime RAM region.
@@ -243,7 +238,7 @@ tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
 recover effective DC limits through 510 counts. The 640-count transient state
 therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
-remains exact. Firmware-version page 18 reports telemetry schema 11.
+remains exact. Firmware-version page 18 reports telemetry schema 12.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -336,4 +331,8 @@ envelope are unchanged. Version 0.4.0 restores the stock headlight status
 mirror. Version 0.5.0 adds the 65 A transient/44 A continuous battery envelope
 through OxiFOC's existing modulation-derived bus-current clamp. Version 0.5.1
 makes its accumulated budget use measured dq terminal power instead of current
-that the voltage-limited motor was unable to reach.
+that the voltage-limited motor was unable to reach. Version 0.6.0 adds
+saturation-feedback field weakening with a 200-count d-current ceiling and
+extends the instantaneous bus clamp to complete dq terminal power. Version
+0.6.1 makes its fixed-point current-circle and voltage-threshold arithmetic
+meet the F103's 16 kHz deadline without changing that weakening policy.

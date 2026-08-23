@@ -123,12 +123,10 @@ pub const fn next_telemetry_slot(slot: u8) -> u8 {
 }
 
 pub const fn next_project_telemetry_page(page: u8) -> u8 {
-    if page >= 18 { 0 } else { page + 1 }
+    if page >= 14 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 11;
-pub const OBSERVER_ACQUIRE_BLOCK_PLL_ERROR: u8 = 1 << 0;
-pub const OBSERVER_ACQUIRE_MAX_PLL_ERROR_Q16: u16 = 2_086;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 12;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -248,24 +246,13 @@ pub struct ControlPeakTelemetry {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ControlPeakEventTelemetry {
-    pub generation: u8,
-    pub measured_d_counts: i16,
-    pub measured_q_counts: i16,
-    pub target_q_counts: i16,
-    pub hall_raw: u8,
-    pub hall_angle_direction: i8,
-    pub edge_age_us: u16,
-    pub hall_interval_us: u16,
-    pub angle_error_q8: i8,
+pub struct FieldWeakeningTelemetry {
+    pub active: bool,
+    pub at_current_limit: bool,
+    pub voltage_limited: bool,
+    pub target_d_counts: i16,
     pub requested_d_ticks: i16,
     pub requested_q_ticks: i16,
-    pub feedforward_d_ticks: i16,
-    pub feedforward_q_ticks: i16,
-    pub applied_d_ticks: i16,
-    pub applied_q_ticks: i16,
-    pub voltage_limited: bool,
-    pub angle_rate_limited: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -285,18 +272,6 @@ pub struct ObserverModelTelemetry {
     pub bemf_q_mv: i16,
     pub phase_error_q16: u16,
     pub validity_progress: u8,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ControlTimingBreakdownTelemetry {
-    pub maximum_pre_driver_cycles: u16,
-    pub maximum_driver_step_cycles: u16,
-    pub hall_electrical_rpm_div4: i16,
-    pub observer_acquisition_flags: u8,
-}
-
-pub fn observer_acquisition_flags(phase_error_q16: u16) -> u8 {
-    u8::from(phase_error_q16 >= OBSERVER_ACQUIRE_MAX_PLL_ERROR_Q16)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -492,93 +467,29 @@ pub fn control_peak_telemetry(snapshot: ControlPeakTelemetry) -> Frame {
     )
 }
 
-/// Pages 14--17: fields captured from the exact 16 kHz cycle that established
-/// the current fault episode's maximum |d|. Pages 16 and 17 separate the pre-limit
-/// request, motor-model feedforward, and applied voltage. Every page repeats
-/// the event generation so readers never combine fields from different peaks.
-pub fn control_peak_event_telemetry(page_index: u8, snapshot: ControlPeakEventTelemetry) -> Frame {
-    match page_index {
-        0 => {
-            let direct = snapshot.measured_d_counts.to_le_bytes();
-            let quadrature = snapshot.measured_q_counts.to_le_bytes();
-            let target = snapshot.target_q_counts.to_le_bytes();
-            Frame::new(
-                0x2f7,
-                8,
-                [
-                    14,
-                    snapshot.generation,
-                    direct[0],
-                    direct[1],
-                    quadrature[0],
-                    quadrature[1],
-                    target[0],
-                    target[1],
-                ],
-            )
-        }
-        1 => {
-            let edge_age = snapshot.edge_age_us.to_le_bytes();
-            let interval = snapshot.hall_interval_us.to_le_bytes();
-            let hall_flags = (snapshot.hall_raw & 7)
-                | (u8::from(snapshot.hall_angle_direction < 0) << 3)
-                | (u8::from(snapshot.hall_angle_direction > 0) << 4)
-                | (u8::from(snapshot.voltage_limited) << 5)
-                | (u8::from(snapshot.angle_rate_limited) << 6);
-            Frame::new(
-                0x2f7,
-                8,
-                [
-                    15,
-                    snapshot.generation,
-                    hall_flags,
-                    edge_age[0],
-                    edge_age[1],
-                    interval[0],
-                    interval[1],
-                    snapshot.angle_error_q8 as u8,
-                ],
-            )
-        }
-        2 => {
-            let direct = snapshot.requested_d_ticks.to_le_bytes();
-            let quadrature = snapshot.requested_q_ticks.to_le_bytes();
-            let feedforward_direct = snapshot.feedforward_d_ticks.to_le_bytes();
-            Frame::new(
-                0x2f7,
-                8,
-                [
-                    16,
-                    snapshot.generation,
-                    direct[0],
-                    direct[1],
-                    quadrature[0],
-                    quadrature[1],
-                    feedforward_direct[0],
-                    feedforward_direct[1],
-                ],
-            )
-        }
-        _ => {
-            let direct = snapshot.applied_d_ticks.to_le_bytes();
-            let quadrature = snapshot.applied_q_ticks.to_le_bytes();
-            let feedforward_quadrature = snapshot.feedforward_q_ticks.to_le_bytes();
-            Frame::new(
-                0x2f7,
-                8,
-                [
-                    17,
-                    snapshot.generation,
-                    direct[0],
-                    direct[1],
-                    quadrature[0],
-                    quadrature[1],
-                    feedforward_quadrature[0],
-                    feedforward_quadrature[1],
-                ],
-            )
-        }
-    }
+/// Page 14: field-weakening current target and the pre-limit voltage request
+/// that drives its saturation feedback.
+pub fn field_weakening_telemetry(snapshot: FieldWeakeningTelemetry) -> Frame {
+    let flags = u8::from(snapshot.active)
+        | (u8::from(snapshot.at_current_limit) << 1)
+        | (u8::from(snapshot.voltage_limited) << 2);
+    let target = snapshot.target_d_counts.to_le_bytes();
+    let direct = snapshot.requested_d_ticks.to_le_bytes();
+    let quadrature = snapshot.requested_q_ticks.to_le_bytes();
+    Frame::new(
+        0x2f7,
+        8,
+        [
+            14,
+            flags,
+            target[0],
+            target[1],
+            direct[0],
+            direct[1],
+            quadrature[0],
+            quadrature[1],
+        ],
+    )
 }
 
 /// Page 19: active Hall-to-observer handoff state and angle disagreement.
@@ -622,31 +533,6 @@ pub fn observer_model_telemetry(snapshot: ObserverModelTelemetry) -> Frame {
             phase_error[0],
             phase_error[1],
             snapshot.validity_progress,
-        ],
-    )
-}
-
-/// Page 21 separates TIM1 entry through phase selection from the FOC driver
-/// step, Hall speed at 4 eRPM/count, and observer acquisition state. Bit zero
-/// marks the quantized 0.2-radian PLL-error gate; the remaining flag bits are
-/// reserved. Together with page 6's whole-handler maximum, the timing fields
-/// expose the residual post-driver cost without another hot-path boundary.
-pub fn control_timing_breakdown_telemetry(snapshot: ControlTimingBreakdownTelemetry) -> Frame {
-    let pre_driver = snapshot.maximum_pre_driver_cycles.to_le_bytes();
-    let driver = snapshot.maximum_driver_step_cycles.to_le_bytes();
-    let hall_rpm = snapshot.hall_electrical_rpm_div4.to_le_bytes();
-    Frame::new(
-        0x2f7,
-        8,
-        [
-            21,
-            pre_driver[0],
-            pre_driver[1],
-            driver[0],
-            driver[1],
-            hall_rpm[0],
-            hall_rpm[1],
-            snapshot.observer_acquisition_flags,
         ],
     )
 }
@@ -740,12 +626,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn observer_acquisition_flags_track_the_quantized_pll_gate() {
-        assert_eq!(observer_acquisition_flags(2_085), 0);
-        assert_eq!(observer_acquisition_flags(2_086), 1);
-    }
-
-    #[test]
     fn updater_magic_requires_exact_prefix_and_minimum_length() {
         let valid = Frame::new(0x67f, 5, [0xaa, 0x55, 0x2a, 0, 0x2a, 0, 0, 0]);
         assert!(is_updater_reset(valid));
@@ -816,10 +696,10 @@ mod tests {
     }
 
     #[test]
-    fn project_telemetry_rotates_through_all_nineteen_slots() {
+    fn project_telemetry_rotates_through_all_fifteen_slots() {
         let mut page = 0;
-        let mut visits = [0_u8; 19];
-        for _ in 0..190 {
+        let mut visits = [0_u8; 15];
+        for _ in 0..150 {
             visits[usize::from(page)] += 1;
             page = next_project_telemetry_page(page);
         }
@@ -991,40 +871,17 @@ mod tests {
             [13, 0x39, 0x05, 55, 0, 222, 0, 135]
         );
 
-        let event = ControlPeakEventTelemetry {
-            generation: 7,
-            measured_d_counts: -782,
-            measured_q_counts: -358,
-            target_q_counts: -732,
-            hall_raw: 5,
-            hall_angle_direction: -1,
-            edge_age_us: 321,
-            hall_interval_us: 1_234,
-            angle_error_q8: 0x11,
+        let weakening = FieldWeakeningTelemetry {
+            active: true,
+            at_current_limit: false,
+            voltage_limited: true,
+            target_d_counts: -173,
             requested_d_ticks: -600,
             requested_q_ticks: -1_800,
-            feedforward_d_ticks: -505,
-            feedforward_q_ticks: -1_704,
-            applied_d_ticks: -123,
-            applied_q_ticks: -1_273,
-            voltage_limited: true,
-            angle_rate_limited: true,
         };
         assert_eq!(
-            control_peak_event_telemetry(0, event).data,
-            [14, 7, 0xf2, 0xfc, 0x9a, 0xfe, 0x24, 0xfd]
-        );
-        assert_eq!(
-            control_peak_event_telemetry(1, event).data,
-            [15, 7, 0x6d, 0x41, 0x01, 0xd2, 0x04, 0x11]
-        );
-        assert_eq!(
-            control_peak_event_telemetry(2, event).data,
-            [16, 7, 0xa8, 0xfd, 0xf8, 0xf8, 0x07, 0xfe]
-        );
-        assert_eq!(
-            control_peak_event_telemetry(3, event).data,
-            [17, 7, 0x85, 0xff, 0x07, 0xfb, 0x58, 0xf9]
+            field_weakening_telemetry(weakening).data,
+            [14, 5, 0x53, 0xff, 0xa8, 0xfd, 0xf8, 0xf8]
         );
         assert_eq!(
             observer_status_telemetry(ObserverStatusTelemetry {
@@ -1050,18 +907,8 @@ mod tests {
             [20, 0xc4, 0x04, 0x6c, 0xd9, 0xc8, 0x01, 255]
         );
         assert_eq!(
-            control_timing_breakdown_telemetry(ControlTimingBreakdownTelemetry {
-                maximum_pre_driver_cycles: 321,
-                maximum_driver_step_cycles: 2_345,
-                hall_electrical_rpm_div4: -3_250,
-                observer_acquisition_flags: OBSERVER_ACQUIRE_BLOCK_PLL_ERROR,
-            })
-            .data,
-            [21, 0x41, 0x01, 0x29, 0x09, 0x4e, 0xf3, 1]
-        );
-        assert_eq!(
             firmware_version_telemetry().data,
-            [18, 11, b'0', b'.', b'5', b'.', b'1', 0]
+            [18, 12, b'0', b'.', b'6', b'.', b'1', 0]
         );
     }
 

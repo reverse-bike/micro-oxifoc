@@ -193,10 +193,9 @@ impl Scalar for Fixed {
 
     #[inline]
     fn circular_remaining(limit: Self, direct: Self) -> Self {
-        let limit = i64::from(limit.0.max(0));
-        let direct = i64::from(direct.0.saturating_abs()).min(limit);
-        let remaining = (limit * limit).saturating_sub(direct * direct) as u64;
-        Self(integer_sqrt_u64(remaining).min(i32::MAX as u64) as i32)
+        let limit = limit.0.max(0) as u32;
+        let direct = direct.0.unsigned_abs().min(limit);
+        Self(conservative_circular_remaining_bits(limit, direct) as i32)
     }
 
     #[inline]
@@ -288,6 +287,27 @@ fn conservative_magnitude(direct_bits: u32, quadrature_bits: u32) -> (u32, u32) 
         .saturating_mul(direct)
         .saturating_add(quadrature.saturating_mul(quadrature));
     (integer_sqrt_ceil_u32(magnitude_squared), shift)
+}
+
+#[inline]
+fn conservative_circular_remaining_bits(limit_bits: u32, direct_bits: u32) -> u32 {
+    if limit_bits == 0 {
+        return 0;
+    }
+    // Q16.16 motor-current limits use at most 31 positive bits. Scale both
+    // operands to 15 bits so their squares fit in native u32 operations.
+    // Rounding the limit down and |d| up guarantees the returned q component
+    // remains inside the original circle. At the F103's 880-count limit the
+    // quantization step is 1/32 current count.
+    let significant_bits = u32::BITS - limit_bits.leading_zeros();
+    let shift = significant_bits.saturating_sub(15);
+    let quantum = 1_u32 << shift;
+    let scaled_limit = limit_bits >> shift;
+    let scaled_direct = direct_bits.saturating_add(quantum - 1) >> shift;
+    let remaining_squared = scaled_limit
+        .saturating_mul(scaled_limit)
+        .saturating_sub(scaled_direct.saturating_mul(scaled_direct));
+    remaining_squared.isqrt().saturating_mul(quantum)
 }
 
 #[inline]
@@ -394,6 +414,32 @@ mod tests {
 
             assert!(estimate >= exact_ceil);
             assert!(estimate - exact_ceil <= 3 * quantum);
+        }
+    }
+
+    #[test]
+    fn scaled_circular_remaining_never_exceeds_the_exact_circle() {
+        let mut state = 0xa951_8c3d_u32;
+        for _ in 0..100_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let limit = (state & 0x7fff_ffff).max(1);
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let direct = (state & 0x7fff_ffff).min(limit);
+            let remaining = conservative_circular_remaining_bits(limit, direct);
+            let exact_squared =
+                u64::from(limit) * u64::from(limit) - u64::from(direct) * u64::from(direct);
+
+            assert!(
+                u64::from(direct) * u64::from(direct) + u64::from(remaining) * u64::from(remaining)
+                    <= u64::from(limit) * u64::from(limit)
+            );
+            let exact = integer_sqrt_u64(exact_squared);
+            let significant_bits = u32::BITS - limit.leading_zeros();
+            let quantum = 1_u64 << significant_bits.saturating_sub(15);
+            assert!(u64::from(remaining) <= exact);
+            if direct <= limit / 4 {
+                assert!(exact - u64::from(remaining) <= 3 * quantum);
+            }
         }
     }
 }

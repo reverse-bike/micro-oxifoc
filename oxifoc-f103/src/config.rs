@@ -61,10 +61,18 @@ pub const OBSERVER_BLEND_LOW_ERPM: i32 = 3_000;
 pub const OBSERVER_BLEND_HIGH_ERPM: i32 = 6_000;
 pub const PHASE_CURRENT_TRIP_COUNTS: u16 = 1_344;
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 = 880;
-// The q-modulation projection reads approximately three percent below the BMS
-// current. These limits therefore target about 44 A continuous and 65 A peak
-// at the battery instead of treating the nominal 100 mA/count phase scale as
-// an exact DC-current conversion.
+pub const FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS: u16 = 200;
+pub const FIELD_WEAKENING_MINIMUM_ERPM: u32 = 6_000;
+pub const FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS: Fixed =
+    Fixed::ratio(FOC_VECTOR_LIMIT_TICKS.integer() * 95, 100);
+// The d target reaches its initial 20 A ceiling in 50 ms and releases over
+// 200 ms once voltage headroom returns.
+pub const FIELD_WEAKENING_RAMP_IN_PER_CYCLE: Fixed = Fixed::ratio(1, 4);
+pub const FIELD_WEAKENING_RAMP_OUT_PER_CYCLE: Fixed = Fixed::ratio(1, 16);
+// The terminal-power projection reads approximately three percent below the
+// BMS current. These limits therefore target about 44 A continuous and 65 A
+// peak at the battery instead of treating the nominal 100 mA/count phase scale
+// as an exact DC-current conversion.
 pub const RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS: u16 = 431;
 pub const RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS: u16 = 640;
 pub const RIDE_DC_BUS_TRANSIENT_DURATION_MS: u32 = 7_000;
@@ -73,6 +81,13 @@ pub const RIDE_DC_BUS_REGEN_LIMIT_COUNTS: u16 = 40;
 pub const VBUS_UV_PER_COUNT: u32 = 18_530;
 
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
+const _: () = assert!(FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS < RIDE_PHASE_CURRENT_LIMIT_COUNTS);
+const _: () = assert!(FIELD_WEAKENING_MINIMUM_ERPM >= OBSERVER_BLEND_HIGH_ERPM as u32);
+const _: () = assert!(FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS.to_bits() > 0);
+const _: () =
+    assert!(FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS.to_bits() < FOC_VECTOR_LIMIT_TICKS.to_bits());
+const _: () = assert!(FIELD_WEAKENING_RAMP_IN_PER_CYCLE.to_bits() > 0);
+const _: () = assert!(FIELD_WEAKENING_RAMP_OUT_PER_CYCLE.to_bits() > 0);
 const _: () = assert!(RIDE_DC_BUS_REGEN_LIMIT_COUNTS < RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS);
 const _: () = assert!(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS < RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS);
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR > 0);
@@ -269,6 +284,9 @@ mod tests {
         assert_eq!(RIDE_DC_BUS_TRANSIENT_DURATION_MS, 7_000);
         assert_eq!(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR, 4);
         assert_eq!(RIDE_DC_BUS_REGEN_LIMIT_COUNTS, 40);
+        assert_eq!(FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS, 200);
+        assert_eq!(FIELD_WEAKENING_MINIMUM_ERPM, 6_000);
+        assert_eq!(FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS.integer(), 1_209);
         assert_eq!(PHASE_CURRENT_TRIP_COUNTS, 1_344);
         assert_eq!(
             i32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS) * PHASE_CURRENT_MA_PER_ADC_COUNT,
