@@ -126,7 +126,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 14 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 12;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 13;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -207,7 +207,6 @@ pub struct PassiveInputTelemetry {
 pub struct ControlTimingTelemetry {
     pub current_trips: u32,
     pub maximum_cycles: u32,
-    pub warning_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -224,10 +223,8 @@ pub struct ControlLiveTelemetry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlOutputTelemetry {
-    pub phase_limit_counts: u16,
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
-    pub pwm_span_ticks: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -241,8 +238,6 @@ pub struct ControlFaultTelemetry {
 pub struct ControlPeakTelemetry {
     pub maximum_phase_current_abs: u16,
     pub maximum_direct_current_abs: u16,
-    pub maximum_quadrature_error_abs: u16,
-    pub maximum_pwm_span_ticks: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -343,8 +338,7 @@ pub fn passive_input_telemetry(page_index: u8, snapshot: PassiveInputTelemetry) 
     }
 }
 
-/// Established page 6 fields used by the bench tooling to verify that the
-/// 16 kHz ISR has margin on the target MCU.
+/// Page 6 reports the hard current-trip count and worst 16 kHz control time.
 pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
     let current_trips = snapshot
         .current_trips
@@ -352,10 +346,6 @@ pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
         .to_le_bytes();
     let maximum_cycles = snapshot
         .maximum_cycles
-        .min(u32::from(u16::MAX))
-        .to_le_bytes();
-    let warnings = snapshot
-        .warning_count
         .min(u32::from(u16::MAX))
         .to_le_bytes();
     Frame::new(
@@ -368,8 +358,8 @@ pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
             current_trips[1],
             maximum_cycles[0],
             maximum_cycles[1],
-            warnings[0],
-            warnings[1],
+            0,
+            0,
         ],
     )
 }
@@ -401,11 +391,9 @@ pub fn control_live_telemetry(snapshot: ControlLiveTelemetry) -> Frame {
     )
 }
 
-/// Page 11: instantaneous dynamic current limit and applied modulation. PWM
-/// span is encoded in 16-tick units so the complete timer range fits in one
-/// byte.
+/// Page 11 reports the applied dq modulation used by the local DC-current
+/// projection. Unused bytes remain zero for deterministic decoding.
 pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
-    let phase_limit = snapshot.phase_limit_counts.to_le_bytes();
     let direct = snapshot.applied_d_ticks.to_le_bytes();
     let quadrature = snapshot.applied_q_ticks.to_le_bytes();
     Frame::new(
@@ -413,13 +401,13 @@ pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
         8,
         [
             11,
-            phase_limit[0],
-            phase_limit[1],
+            0,
+            0,
             direct[0],
             direct[1],
             quadrature[0],
             quadrature[1],
-            (snapshot.pwm_span_ticks / 16).min(u16::from(u8::MAX)) as u8,
+            0,
         ],
     )
 }
@@ -445,25 +433,15 @@ pub fn control_fault_telemetry(snapshot: ControlFaultTelemetry) -> Frame {
     )
 }
 
-/// Page 13: boot-retained phase/q-error/PWM peaks and the current fault
-/// episode's maximum |d|. PWM span uses the same 16-tick scale as page 11.
+/// Page 13 reports the boot-retained phase-current peak and the current fault
+/// episode's maximum |d|.
 pub fn control_peak_telemetry(snapshot: ControlPeakTelemetry) -> Frame {
     let phase = snapshot.maximum_phase_current_abs.to_le_bytes();
     let direct = snapshot.maximum_direct_current_abs.to_le_bytes();
-    let quadrature = snapshot.maximum_quadrature_error_abs.to_le_bytes();
     Frame::new(
         0x2f7,
         8,
-        [
-            13,
-            phase[0],
-            phase[1],
-            direct[0],
-            direct[1],
-            quadrature[0],
-            quadrature[1],
-            (snapshot.maximum_pwm_span_ticks / 16).min(u16::from(u8::MAX)) as u8,
-        ],
+        [13, phase[0], phase[1], direct[0], direct[1], 0, 0, 0],
     )
 }
 
@@ -815,10 +793,9 @@ mod tests {
             control_timing_telemetry(ControlTimingTelemetry {
                 current_trips: 1,
                 maximum_cycles: 1_396,
-                warning_count: 2,
             })
             .data,
-            [6, 0, 1, 0, 0x74, 0x05, 2, 0]
+            [6, 0, 1, 0, 0x74, 0x05, 0, 0]
         );
     }
 
@@ -840,14 +817,12 @@ mod tests {
         );
 
         let output = ControlOutputTelemetry {
-            phase_limit_counts: 838,
             applied_d_ticks: -123,
             applied_q_ticks: -1_240,
-            pwm_span_ticks: 2_168,
         };
         assert_eq!(
             control_output_telemetry(output).data,
-            [11, 0x46, 0x03, 0x85, 0xff, 0x28, 0xfb, 135]
+            [11, 0, 0, 0x85, 0xff, 0x28, 0xfb, 0]
         );
 
         let faults = ControlFaultTelemetry {
@@ -863,12 +838,10 @@ mod tests {
         let peaks = ControlPeakTelemetry {
             maximum_phase_current_abs: 1_337,
             maximum_direct_current_abs: 55,
-            maximum_quadrature_error_abs: 222,
-            maximum_pwm_span_ticks: 2_168,
         };
         assert_eq!(
             control_peak_telemetry(peaks).data,
-            [13, 0x39, 0x05, 55, 0, 222, 0, 135]
+            [13, 0x39, 0x05, 55, 0, 0, 0, 0]
         );
 
         let weakening = FieldWeakeningTelemetry {
@@ -908,7 +881,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 12, b'0', b'.', b'6', b'.', b'1', 0]
+            [18, 13, b'0', b'.', b'7', b'.', b'0', 0]
         );
     }
 

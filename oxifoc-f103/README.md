@@ -190,6 +190,14 @@ anti-windup. The voltage vector alone is advanced by one measured electrical
 control-period step to compensate the ADC-to-PWM pipeline; current Park
 transformation remains at the sampled phase angle.
 
+The interrupt-owned control state retains dq values in native fixed point. The
+1 kHz ride path copies only the Hall, safety, measured-current, and applied-
+voltage fields required for authority and local battery protection; CAN uses a
+separate diagnostic snapshot. Unit conversion happens in the foreground after
+interrupts are unmasked. Observer health is captured at 62.5 Hz on the first
+scheduled control cycle without a Hall transition, preventing diagnostic and
+Hall-edge work from forming one worst-case pass.
+
 ## CAN and updater
 
 bxCAN runs at 250 kbit/s on PA11/PA12, with the active-low transceiver control
@@ -204,18 +212,16 @@ on PA13. The application provides:
 - commissioning pages 6, 8--14, 18--20, and 22--25 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
-voltage-limit state, dynamic phase-current limit, applied dq voltage, and PWM
-span. Page 12 carries the full internal fault mask and safety-event count.
-Page 13 retains peak phase current, quadrature tracking error, and PWM span
-from boot so short transients remain visible at CAN telemetry rates. Its direct
-current maximum restarts after each successful fault acknowledgement. Page 14
-reports field-weakening active/at-limit/voltage-limit flags, target d current,
-and requested dq voltage.
+voltage-limit state, and applied dq voltage. Page 12 carries the full internal
+fault mask and safety-event count. Page 13 retains peak phase current from boot;
+its direct-current maximum restarts after each successful fault
+acknowledgement. Page 14 reports field-weakening active/at-limit/voltage-limit
+flags, target d current, and requested dq voltage.
 Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 12 and the crate version. Page 19 supplies readiness, confidence, and
+schema 13 and the crate version. Page 19 supplies readiness, confidence, and
 observer eRPM, while page 20 supplies the full PLL error and external-validity
 progress.
 Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
@@ -238,7 +244,7 @@ tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
 recover effective DC limits through 510 counts. The 640-count transient state
 therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
-remains exact. Firmware-version page 18 reports telemetry schema 12.
+remains exact. Firmware-version page 18 reports telemetry schema 13.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -335,4 +341,7 @@ that the voltage-limited motor was unable to reach. Version 0.6.0 adds
 saturation-feedback field weakening with a 200-count d-current ceiling and
 extends the instantaneous bus clamp to complete dq terminal power. Version
 0.6.1 makes its fixed-point current-circle and voltage-threshold arithmetic
-meet the F103's 16 kHz deadline without changing that weakening policy.
+meet the F103's 16 kHz deadline without changing that weakening policy. Version
+0.7.0 moves diagnostic formatting out of the 16 kHz path, separates the compact
+ride snapshot from CAN commissioning data, and speed-optimizes the shared core
+without changing field weakening or the current envelopes.

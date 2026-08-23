@@ -6,6 +6,42 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.7.0 - 2026-08-23
+
+Changes:
+
+- Split the 1 kHz ride/safety snapshot from the complete CAN diagnostic
+  snapshot. The frequent foreground path now masks interrupts only long enough
+  to copy Hall state, safety progress, and the measured/applied dq values used
+  by the local battery envelope.
+- Kept target, measured, requested, and applied dq values in their native fixed-
+  point representation inside the interrupt-owned state. Integer scaling for
+  CAN and the foreground battery monitor now happens after interrupts are
+  unmasked instead of on every 16 kHz control pass.
+- Kept observer health telemetry but moved its scaling into the foreground.
+  Raw observer capture is deferred from a scheduled Hall-edge cycle to the next
+  quiet control cycle so diagnostic work cannot stack with Hall transition
+  handling.
+- Removed the saturated timing-warning counter, dynamic q-limit and PWM-span
+  telemetry, and cumulative q-error/PWM-span peaks. Schema 13 retains applied
+  dq voltage, phase and direct-current peaks, field-weakening request data,
+  observer health, and all fault/reset evidence.
+- Wrote validated PWM compares before optional diagnostic bookkeeping and
+  compiled `oxifoc-core` at release `opt-level = 2`; the firmware wrapper and
+  protocol remain size-optimized. The 6,000-eRPM entry, 1,209-tick threshold,
+  200-count weakening ceiling, ramp rates, and every current/fault envelope are
+  unchanged.
+
+Reason: the fault-free loaded 0.6.1 ride held field weakening for five episodes
+and reached 55.7 km/h, but the worst control pass consumed 4,351 of the 4,500
+available cycles. The per-page CAN cadence is about 1.25 Hz while observer
+diagnostics were formatted at 62.5 Hz and live commissioning values were
+formatted at the full 16 kHz rate. Retaining raw control state preserves the
+same evidence and local battery protection while removing diagnostic work from
+the deadline-critical path. The resulting release payload is 25,644 bytes, and
+the ARM `TIM1_UP` body shrinks from 0x928 to 0x840 bytes before hardware timing
+validation.
+
 ## 0.6.1 - 2026-08-22
 
 Changes:

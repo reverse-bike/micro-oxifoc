@@ -1,6 +1,6 @@
 [package]
 name = "oxifoc-f103"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 publish = false
 description = "26,200-byte Hall/back-EMF CAN FOC firmware for STM32F103"
@@ -33,3 +33,6 @@ lto = "fat"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[profile.release.package.oxifoc-core]
+opt-level = 2

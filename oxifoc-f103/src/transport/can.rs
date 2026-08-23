@@ -176,7 +176,7 @@ pub fn service(
     let slot = TELEMETRY_SLOT.load(Ordering::Relaxed);
     TELEMETRY_SLOT.store(protocol::next_telemetry_slot(slot), Ordering::Relaxed);
     let inputs = sensors::latest();
-    let control = foc::snapshot();
+    let control = foc::diagnostic_snapshot();
     let fault_page = STOCK_FAULT_PAGE.load(Ordering::Relaxed);
     let controller_temperature = inputs.analog_valid.then(|| {
         sensors::environment::controller_temperature_deci_c(inputs.controller_temperature_adc)
@@ -233,7 +233,6 @@ pub fn service(
             2 => protocol::control_timing_telemetry(protocol::ControlTimingTelemetry {
                 current_trips: control.phase_current_trips,
                 maximum_cycles: control.control_max_cycles,
-                warning_count: control.control_budget_warnings,
             }),
             3 => protocol::control_live_telemetry(protocol::ControlLiveTelemetry {
                 hall_valid: control.hall_valid,
@@ -246,10 +245,8 @@ pub fn service(
                 measured_q_counts: control.measured_q_counts,
             }),
             4 => protocol::control_output_telemetry(protocol::ControlOutputTelemetry {
-                phase_limit_counts: control.phase_current_limit_counts,
                 applied_d_ticks: control.applied_d_ticks,
                 applied_q_ticks: control.applied_q_ticks,
-                pwm_span_ticks: control.pwm_span_ticks,
             }),
             5 => protocol::control_fault_telemetry(protocol::ControlFaultTelemetry {
                 fault_flags: control.fault_flags,
@@ -259,8 +256,6 @@ pub fn service(
             6 => protocol::control_peak_telemetry(protocol::ControlPeakTelemetry {
                 maximum_phase_current_abs: control.maximum_phase_current_abs,
                 maximum_direct_current_abs: control.maximum_direct_current_abs,
-                maximum_quadrature_error_abs: control.maximum_quadrature_error_abs,
-                maximum_pwm_span_ticks: control.maximum_pwm_span_ticks,
             }),
             7 => protocol::field_weakening_telemetry(protocol::FieldWeakeningTelemetry {
                 active: control.target_d_counts < 0,

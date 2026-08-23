@@ -20,7 +20,6 @@ const CONTROL_CURRENT_VALID: u32 = 1 << 1;
 const CONTROL_OUTPUT_ACTIVE: u32 = 1 << 2;
 const CONTROL_VOLTAGE_LIMITED: u32 = 1 << 3;
 const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
-const CONTROL_BUDGET_WARNING_CYCLES: u32 = 3_900;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
 const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
 // One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
@@ -75,28 +74,39 @@ pub struct Snapshot {
     pub hall_valid: bool,
     pub current_valid: bool,
     pub output_active: bool,
+    pub measured_d_counts: i16,
+    pub measured_q_counts: i16,
+    pub applied_d_ticks: i16,
+    pub applied_q_ticks: i16,
+    pub safety_events: u32,
+    pub hall_sequence: u32,
+    pub hall_interval_us: u32,
+    pub hall_progress: i32,
+    pub electrical_rpm: i32,
+    pub fault_flags: u32,
+    pub control_cycles: u32,
+    pub injected_samples: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DiagnosticSnapshot {
+    pub hall_valid: bool,
+    pub current_valid: bool,
+    pub output_active: bool,
     pub voltage_limited: bool,
     pub target_q_counts: i16,
     pub target_d_counts: i16,
     pub requested_d_ticks: i16,
     pub requested_q_ticks: i16,
-    pub phase_current_limit_counts: u16,
     pub measured_d_counts: i16,
     pub measured_q_counts: i16,
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
-    pub pwm_span_ticks: u16,
     pub maximum_phase_current_abs: u16,
     pub maximum_direct_current_abs: u16,
-    pub maximum_quadrature_error_abs: u16,
-    pub maximum_pwm_span_ticks: u16,
     pub safety_events: u32,
     pub last_safety_loss_reason: u8,
     pub phase_current_trips: u32,
-    pub hall_sequence: u32,
-    pub hall_interval_us: u32,
-    pub hall_progress: i32,
-    pub electrical_rpm: i32,
     pub observer_configured: bool,
     pub observer_ready: bool,
     pub observer_active: bool,
@@ -109,30 +119,18 @@ pub struct Snapshot {
     pub observer_bemf_q_mv: i16,
     pub observer_phase_error_q16: u16,
     pub fault_flags: u32,
-    pub control_cycles: u32,
-    pub injected_samples: u32,
     pub control_max_cycles: u32,
-    pub control_budget_warnings: u32,
-    pub control_budget_overruns: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ControlDiagnostics {
     flags: u32,
-    target_q_counts: i16,
-    target_d_counts: i16,
-    requested_d_ticks: i16,
-    requested_q_ticks: i16,
-    phase_current_limit_counts: u16,
-    measured_d_counts: i16,
-    measured_q_counts: i16,
-    applied_d_ticks: i16,
-    applied_q_ticks: i16,
-    pwm_span_ticks: u16,
+    target: Dq,
+    requested_voltage: Dq,
+    measured_current: Dq,
+    applied_voltage: Dq,
     maximum_phase_current_abs: u32,
     maximum_direct_current_abs: u32,
-    maximum_quadrature_error_abs: u32,
-    maximum_pwm_span_ticks: u32,
     safety_events: u32,
     last_safety_loss_reason: u8,
     phase_current_trips: u32,
@@ -140,21 +138,22 @@ struct ControlDiagnostics {
     hall_interval_us: u32,
     hall_progress: i32,
     electrical_rpm: i32,
-    observer_configured: bool,
-    observer_ready: bool,
-    observer_active: bool,
-    observer_blend: u8,
-    observer_confidence: u8,
-    observer_validity_progress: u8,
-    observer_electrical_rpm: i16,
-    observer_hall_error_q16: i16,
-    observer_flux_centi_mwb: u16,
-    observer_bemf_q_mv: i16,
-    observer_phase_error_q16: u16,
+    observer: ObserverDiagnostics,
     injected_samples: u32,
     control_max_cycles: u32,
-    control_budget_warnings: u32,
-    control_budget_overruns: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeSnapshotRaw {
+    flags: u32,
+    measured_current: Dq,
+    applied_voltage: Dq,
+    safety_events: u32,
+    hall_sequence: u32,
+    hall_interval_us: u32,
+    hall_progress: i32,
+    electrical_rpm: i32,
+    injected_samples: u32,
 }
 
 struct ControlState {
@@ -165,6 +164,7 @@ struct ControlState {
     hardware_hall_sequence: u32,
     hall_recovery_raw: u8,
     hall_recovery_cycles: u8,
+    observer_diagnostics_due: bool,
     command_was_enabled: bool,
     diagnostics: ControlDiagnostics,
 }
@@ -204,10 +204,14 @@ pub fn start(offsets: CurrentOffsets) {
             hardware_hall_sequence: 0,
             hall_recovery_raw: 0,
             hall_recovery_cycles: 0,
+            observer_diagnostics_due: false,
             command_was_enabled: false,
             diagnostics: ControlDiagnostics {
                 flags: initial_flags,
-                observer_configured: source_configured,
+                observer: ObserverDiagnostics {
+                    configured: source_configured,
+                    ..ObserverDiagnostics::default()
+                },
                 ..ControlDiagnostics::default()
             },
         });
@@ -271,9 +275,49 @@ pub fn begin_fault_diagnostic_episode() {
 }
 
 pub fn snapshot() -> Snapshot {
-    // SAFETY: TIM1_UP is the only writer after start(). Global interrupt
-    // masking makes this one coherent copy and keeps atomics out of the 16 kHz
-    // diagnostic path.
+    // SAFETY: TIM1_UP is the only writer after start(). The 1 kHz ride path
+    // masks interrupts only while copying the fields it consumes.
+    let raw = cortex_m::interrupt::free(|_| {
+        if CONTROL_INITIALIZED.load(Ordering::Acquire) {
+            let diagnostics = unsafe { &(*(*CONTROL.0.get()).as_ptr()).diagnostics };
+            RuntimeSnapshotRaw {
+                flags: diagnostics.flags,
+                measured_current: diagnostics.measured_current,
+                applied_voltage: diagnostics.applied_voltage,
+                safety_events: diagnostics.safety_events,
+                hall_sequence: diagnostics.hall_sequence,
+                hall_interval_us: diagnostics.hall_interval_us,
+                hall_progress: diagnostics.hall_progress,
+                electrical_rpm: diagnostics.electrical_rpm,
+                injected_samples: diagnostics.injected_samples,
+            }
+        } else {
+            RuntimeSnapshotRaw::default()
+        }
+    });
+    let flags = raw.flags;
+    Snapshot {
+        hall_valid: flags & CONTROL_HALL_VALID != 0,
+        current_valid: flags & CONTROL_CURRENT_VALID != 0,
+        output_active: flags & CONTROL_OUTPUT_ACTIVE != 0,
+        measured_d_counts: fixed_to_i16(raw.measured_current.d),
+        measured_q_counts: fixed_to_i16(raw.measured_current.q),
+        applied_d_ticks: fixed_to_i16(raw.applied_voltage.d),
+        applied_q_ticks: fixed_to_i16(raw.applied_voltage.q),
+        safety_events: raw.safety_events,
+        hall_sequence: raw.hall_sequence,
+        hall_interval_us: raw.hall_interval_us,
+        hall_progress: raw.hall_progress,
+        electrical_rpm: raw.electrical_rpm,
+        fault_flags: hardware::fault_flags(),
+        control_cycles: CONTROL_CYCLE.load(Ordering::Relaxed),
+        injected_samples: raw.injected_samples,
+    }
+}
+
+pub fn diagnostic_snapshot() -> DiagnosticSnapshot {
+    // SAFETY: CAN diagnostics run in the foreground. Interrupt masking covers
+    // only the coherent raw copy; unit conversion happens after it is lifted.
     let diagnostics = cortex_m::interrupt::free(|_| {
         if CONTROL_INITIALIZED.load(Ordering::Acquire) {
             unsafe { (*(*CONTROL.0.get()).as_ptr()).diagnostics }
@@ -282,51 +326,40 @@ pub fn snapshot() -> Snapshot {
         }
     });
     let flags = diagnostics.flags;
-    Snapshot {
+    let observer = diagnostics.observer;
+    DiagnosticSnapshot {
         hall_valid: flags & CONTROL_HALL_VALID != 0,
         current_valid: flags & CONTROL_CURRENT_VALID != 0,
         output_active: flags & CONTROL_OUTPUT_ACTIVE != 0,
         voltage_limited: flags & CONTROL_VOLTAGE_LIMITED != 0,
-        target_q_counts: diagnostics.target_q_counts,
-        target_d_counts: diagnostics.target_d_counts,
-        requested_d_ticks: diagnostics.requested_d_ticks,
-        requested_q_ticks: diagnostics.requested_q_ticks,
-        phase_current_limit_counts: diagnostics.phase_current_limit_counts,
-        measured_d_counts: diagnostics.measured_d_counts,
-        measured_q_counts: diagnostics.measured_q_counts,
-        applied_d_ticks: diagnostics.applied_d_ticks,
-        applied_q_ticks: diagnostics.applied_q_ticks,
-        pwm_span_ticks: diagnostics.pwm_span_ticks,
+        target_q_counts: fixed_to_i16(diagnostics.target.q),
+        target_d_counts: fixed_to_i16(diagnostics.target.d),
+        requested_d_ticks: fixed_to_i16(diagnostics.requested_voltage.d),
+        requested_q_ticks: fixed_to_i16(diagnostics.requested_voltage.q),
+        measured_d_counts: fixed_to_i16(diagnostics.measured_current.d),
+        measured_q_counts: fixed_to_i16(diagnostics.measured_current.q),
+        applied_d_ticks: fixed_to_i16(diagnostics.applied_voltage.d),
+        applied_q_ticks: fixed_to_i16(diagnostics.applied_voltage.q),
         maximum_phase_current_abs: saturating_u32_to_u16(diagnostics.maximum_phase_current_abs),
         maximum_direct_current_abs: saturating_u32_to_u16(diagnostics.maximum_direct_current_abs),
-        maximum_quadrature_error_abs: saturating_u32_to_u16(
-            diagnostics.maximum_quadrature_error_abs,
-        ),
-        maximum_pwm_span_ticks: saturating_u32_to_u16(diagnostics.maximum_pwm_span_ticks),
         safety_events: diagnostics.safety_events,
         last_safety_loss_reason: diagnostics.last_safety_loss_reason,
         phase_current_trips: diagnostics.phase_current_trips,
-        hall_sequence: diagnostics.hall_sequence,
-        hall_interval_us: diagnostics.hall_interval_us,
-        hall_progress: diagnostics.hall_progress,
-        electrical_rpm: diagnostics.electrical_rpm,
-        observer_configured: diagnostics.observer_configured,
-        observer_ready: diagnostics.observer_ready,
-        observer_active: diagnostics.observer_active,
-        observer_blend: diagnostics.observer_blend,
-        observer_confidence: diagnostics.observer_confidence,
-        observer_validity_progress: diagnostics.observer_validity_progress,
-        observer_electrical_rpm: diagnostics.observer_electrical_rpm,
-        observer_hall_error_q16: diagnostics.observer_hall_error_q16,
-        observer_flux_centi_mwb: diagnostics.observer_flux_centi_mwb,
-        observer_bemf_q_mv: diagnostics.observer_bemf_q_mv,
-        observer_phase_error_q16: diagnostics.observer_phase_error_q16,
+        observer_configured: observer.configured,
+        observer_ready: observer.ready,
+        observer_active: observer.active,
+        observer_blend: fixed_unit_to_u8(observer.blend),
+        observer_confidence: fixed_unit_to_u8(observer.confidence),
+        observer_validity_progress: observer.validity_progress,
+        observer_electrical_rpm: saturating_i32_to_i16(observer.electrical_rpm),
+        observer_hall_error_q16: (observer.hall_error_q32 >> 16) as i16,
+        observer_flux_centi_mwb: fixed_to_scaled_i32(observer.flux_magnitude_mwb, 100)
+            .clamp(0, i32::from(u16::MAX)) as u16,
+        observer_bemf_q_mv: saturating_i32_to_i16(fixed_to_scaled_i32(observer.bemf_q_v, 1_000)),
+        observer_phase_error_q16: (observer.phase_error_filtered_q32 >> 16).min(u32::from(u16::MAX))
+            as u16,
         fault_flags: hardware::fault_flags(),
-        control_cycles: CONTROL_CYCLE.load(Ordering::Relaxed),
-        injected_samples: diagnostics.injected_samples,
         control_max_cycles: diagnostics.control_max_cycles,
-        control_budget_warnings: diagnostics.control_budget_warnings,
-        control_budget_overruns: diagnostics.control_budget_overruns,
     }
 }
 
@@ -355,16 +388,10 @@ fn note_safety_loss(diagnostics: &mut ControlDiagnostics, reason: SafetyLossReas
 #[inline(never)]
 fn publish_stopped_output(diagnostics: &mut ControlDiagnostics) {
     diagnostics.flags &= !(CONTROL_OUTPUT_ACTIVE | CONTROL_VOLTAGE_LIMITED);
-    diagnostics.target_q_counts = 0;
-    diagnostics.target_d_counts = 0;
-    diagnostics.requested_d_ticks = 0;
-    diagnostics.requested_q_ticks = 0;
-    diagnostics.phase_current_limit_counts = 0;
-    diagnostics.measured_d_counts = 0;
-    diagnostics.measured_q_counts = 0;
-    diagnostics.applied_d_ticks = 0;
-    diagnostics.applied_q_ticks = 0;
-    diagnostics.pwm_span_ticks = 0;
+    diagnostics.target = Dq::default();
+    diagnostics.requested_voltage = Dq::default();
+    diagnostics.measured_current = Dq::default();
+    diagnostics.applied_voltage = Dq::default();
 }
 
 const fn lease_is_active(now: u32, deadline: u32) -> bool {
@@ -399,18 +426,12 @@ fn TIM1_UP() {
         // handler is its only writer.
         let state = unsafe { &mut *(*CONTROL.0.get()).as_mut_ptr() };
         let _ = update_max(&mut state.diagnostics.control_max_cycles, elapsed);
-        if elapsed > CONTROL_BUDGET_WARNING_CYCLES {
-            state.diagnostics.control_budget_warnings =
-                state.diagnostics.control_budget_warnings.wrapping_add(1);
-        }
-        if elapsed > CONTROL_BUDGET_CYCLES {
-            state.diagnostics.control_budget_overruns =
-                state.diagnostics.control_budget_overruns.wrapping_add(1);
-            if hardware::fault_flags() & hardware::FAULT_CONTROL_TIMING == 0 {
-                hardware::latch_control_timing_fault();
-                publish_stopped_output(&mut state.diagnostics);
-                note_safety_loss(&mut state.diagnostics, SafetyLossReason::ControlTiming);
-            }
+        if elapsed > CONTROL_BUDGET_CYCLES
+            && hardware::fault_flags() & hardware::FAULT_CONTROL_TIMING == 0
+        {
+            hardware::latch_control_timing_fault();
+            publish_stopped_output(&mut state.diagnostics);
+            note_safety_loss(&mut state.diagnostics, SafetyLossReason::ControlTiming);
         }
         crate::safety::record_control_timing(elapsed, state.diagnostics.control_max_cycles);
     }
@@ -485,7 +506,8 @@ fn control_cycle() {
     }
 
     let (sequence, raw, interval_us) = hardware::hall_edge_snapshot();
-    if sequence != state.hardware_hall_sequence {
+    let hall_edge_updated = sequence != state.hardware_hall_sequence;
+    if hall_edge_updated {
         if state.hardware_hall_sequence != 0
             && sequence.wrapping_sub(state.hardware_hall_sequence) != 1
         {
@@ -570,12 +592,14 @@ fn control_cycle() {
         return;
     }
 
-    if control_cycle & 0xff == 0 && !command_started {
-        publish_observer_diagnostics(
-            &mut state.diagnostics,
-            state.driver.phase().observer_diagnostics(),
+    let (capture_observer_diagnostics, observer_diagnostics_due) =
+        super::observer_diagnostic_schedule(
+            state.observer_diagnostics_due,
+            control_cycle & 0xff == 0,
+            command_started,
+            hall_edge_updated,
         );
-    }
+    state.observer_diagnostics_due = observer_diagnostics_due;
 
     let dc_current_limit = DC_CURRENT_LIMIT_COUNTS
         .load(Ordering::Relaxed)
@@ -618,30 +642,18 @@ fn control_cycle() {
         }
     };
     crate::safety::record_control_checkpoint(crate::safety::checkpoint::DRIVER_COMPLETE);
-    let phase_limit = output
-        .quadrature_limit
-        .abs_ceil_u32()
-        .min(u32::from(u16::MAX)) as u16;
-    let target_q = output.target.q.integer();
-    let target_d = output.target.d.integer();
-    let measured_current = output.measured_current;
     let duty = output.duties;
-    let measured_d_counts = fixed_to_i16(measured_current.d);
-    let measured_q_counts = fixed_to_i16(measured_current.q);
-    let applied_voltage = output.applied_voltage;
-    let applied_d_ticks = fixed_to_i16(applied_voltage.d);
-    let applied_q_ticks = fixed_to_i16(applied_voltage.q);
-    let pwm_span_ticks = pwm_span(duty);
-    state.diagnostics.target_q_counts = target_q as i16;
-    state.diagnostics.target_d_counts = target_d as i16;
-    state.diagnostics.requested_d_ticks = fixed_to_i16(output.requested_voltage.d);
-    state.diagnostics.requested_q_ticks = fixed_to_i16(output.requested_voltage.q);
-    state.diagnostics.phase_current_limit_counts = phase_limit;
-    state.diagnostics.measured_d_counts = measured_d_counts;
-    state.diagnostics.measured_q_counts = measured_q_counts;
-    state.diagnostics.applied_d_ticks = applied_d_ticks;
-    state.diagnostics.applied_q_ticks = applied_q_ticks;
-    state.diagnostics.pwm_span_ticks = pwm_span_ticks;
+    if !hardware::write_pwm_duties(duty) || !hardware::enable_motor_outputs() {
+        stop_control(state, Some(SafetyLossReason::PwmOutput));
+        return;
+    }
+    crate::safety::record_control_checkpoint(crate::safety::checkpoint::PWM_WRITTEN);
+    publish_flag(&mut state.diagnostics, CONTROL_OUTPUT_ACTIVE, true);
+
+    state.diagnostics.target = output.target;
+    state.diagnostics.requested_voltage = output.requested_voltage;
+    state.diagnostics.measured_current = output.measured_current;
+    state.diagnostics.applied_voltage = output.applied_voltage;
     publish_flag(
         &mut state.diagnostics,
         CONTROL_VOLTAGE_LIMITED,
@@ -649,45 +661,11 @@ fn control_cycle() {
     );
     let _ = update_max(
         &mut state.diagnostics.maximum_direct_current_abs,
-        u32::from(measured_d_counts.unsigned_abs()),
+        output.measured_current.d.abs_ceil_u32(),
     );
-    let _ = update_max(
-        &mut state.diagnostics.maximum_quadrature_error_abs,
-        target_q
-            .saturating_sub(i32::from(measured_q_counts))
-            .unsigned_abs(),
-    );
-    let _ = update_max(
-        &mut state.diagnostics.maximum_pwm_span_ticks,
-        u32::from(pwm_span_ticks),
-    );
-    if !hardware::write_pwm_duties(duty) || !hardware::enable_motor_outputs() {
-        stop_control(state, Some(SafetyLossReason::PwmOutput));
-        return;
+    if capture_observer_diagnostics {
+        state.diagnostics.observer = state.driver.phase().observer_diagnostics();
     }
-    crate::safety::record_control_checkpoint(crate::safety::checkpoint::PWM_WRITTEN);
-    publish_flag(&mut state.diagnostics, CONTROL_OUTPUT_ACTIVE, true);
-}
-
-fn publish_observer_diagnostics(
-    published: &mut ControlDiagnostics,
-    diagnostics: ObserverDiagnostics,
-) {
-    published.observer_configured = diagnostics.configured;
-    published.observer_ready = diagnostics.ready;
-    published.observer_active = diagnostics.active;
-    published.observer_blend = fixed_unit_to_u8(diagnostics.blend);
-    published.observer_confidence = fixed_unit_to_u8(diagnostics.confidence);
-    published.observer_validity_progress = diagnostics.validity_progress;
-    published.observer_electrical_rpm = saturating_i32_to_i16(diagnostics.electrical_rpm);
-    published.observer_hall_error_q16 = (diagnostics.hall_error_q32 >> 16) as i16;
-    let flux_centi_mwb = fixed_to_scaled_i32(diagnostics.flux_magnitude_mwb, 100)
-        .clamp(0, i32::from(u16::MAX)) as u16;
-    let bemf_q_mv = saturating_i32_to_i16(fixed_to_scaled_i32(diagnostics.bemf_q_v, 1_000));
-    published.observer_flux_centi_mwb = flux_centi_mwb;
-    published.observer_bemf_q_mv = bemf_q_mv;
-    published.observer_phase_error_q16 =
-        (diagnostics.phase_error_filtered_q32 >> 16).min(u32::from(u16::MAX)) as u16;
 }
 
 fn fixed_unit_to_u8(value: Fixed) -> u8 {
@@ -776,12 +754,6 @@ fn fixed_to_i16(value: Fixed) -> i16 {
     value
         .integer()
         .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
-}
-
-fn pwm_span(duty: oxifoc_core::foc::PwmDuty) -> u16 {
-    let minimum = duty.a.min(duty.b).min(duty.c);
-    let maximum = duty.a.max(duty.b).max(duty.c);
-    maximum - minimum
 }
 
 fn recover_stationary_hall(state: &mut ControlState) -> bool {
