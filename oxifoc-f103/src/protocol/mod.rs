@@ -126,7 +126,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 14 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 13;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 14;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -223,6 +223,7 @@ pub struct ControlLiveTelemetry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlOutputTelemetry {
+    pub transient_budget_ms: u16,
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
 }
@@ -391,9 +392,10 @@ pub fn control_live_telemetry(snapshot: ControlLiveTelemetry) -> Frame {
     )
 }
 
-/// Page 11 reports the applied dq modulation used by the local DC-current
-/// projection. Unused bytes remain zero for deterministic decoding.
+/// Page 11 reports the remaining full-transient-equivalent time and the
+/// applied dq modulation used by the local DC-current projection.
 pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
+    let transient_budget = snapshot.transient_budget_ms.to_le_bytes();
     let direct = snapshot.applied_d_ticks.to_le_bytes();
     let quadrature = snapshot.applied_q_ticks.to_le_bytes();
     Frame::new(
@@ -401,8 +403,8 @@ pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
         8,
         [
             11,
-            0,
-            0,
+            transient_budget[0],
+            transient_budget[1],
             direct[0],
             direct[1],
             quadrature[0],
@@ -817,12 +819,13 @@ mod tests {
         );
 
         let output = ControlOutputTelemetry {
+            transient_budget_ms: 0x1234,
             applied_d_ticks: -123,
             applied_q_ticks: -1_240,
         };
         assert_eq!(
             control_output_telemetry(output).data,
-            [11, 0, 0, 0x85, 0xff, 0x28, 0xfb, 0]
+            [11, 0x34, 0x12, 0x85, 0xff, 0x28, 0xfb, 0]
         );
 
         let faults = ControlFaultTelemetry {
@@ -881,7 +884,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_telemetry().data,
-            [18, 13, b'0', b'.', b'7', b'.', b'0', 0]
+            [18, 14, b'0', b'.', b'7', b'.', b'1', 0]
         );
     }
 

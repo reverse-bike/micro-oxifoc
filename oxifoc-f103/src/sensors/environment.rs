@@ -18,6 +18,7 @@ const TRANSIENT_BUDGET_CAPACITY: u16 = (RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
     * TRANSIENT_BUDGET_SAMPLES;
 
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS.is_multiple_of(UPDATE_PERIOD_MS));
+const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS <= u16::MAX as u32);
 const _: () = assert!(TRANSIENT_BUDGET_CAPACITY > 0);
 
 pub mod reason {
@@ -124,6 +125,13 @@ impl EnvironmentMonitor {
 
     pub const fn derating_reasons(&self) -> u8 {
         self.derating_reasons
+    }
+
+    /// Remaining time at the full transient-minus-continuous current excess.
+    pub const fn transient_budget_ms(&self) -> u16 {
+        let peak_excess =
+            (RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS - RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS) as u32;
+        (self.transient_budget as u32 * UPDATE_PERIOD_MS / peak_excess) as u16
     }
 
     fn update_transient_limit(&mut self, current: u16) -> u16 {
@@ -278,7 +286,10 @@ mod tests {
     fn missing_local_sensor_data_removes_drive_authority() {
         let mut monitor = EnvironmentMonitor::new(0);
         assert_eq!(monitor.update(0, RawLocalSensors::default(), 0), None);
-        assert_eq!(monitor.update(50, nominal(), 0), Some(640));
+        assert_eq!(
+            monitor.update(UPDATE_PERIOD_MS, nominal(), 0),
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+        );
     }
 
     #[test]
@@ -310,7 +321,10 @@ mod tests {
         for sample in 20..40 {
             assert_eq!(monitor.update(sample * 50, nominal(), 0), Some(0));
         }
-        assert_eq!(monitor.update(40 * 50, nominal(), 0), Some(640));
+        assert_eq!(
+            monitor.update(40 * UPDATE_PERIOD_MS, nominal(), 0),
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+        );
         assert_eq!(monitor.derating_reasons(), 0);
     }
 
@@ -330,18 +344,31 @@ mod tests {
     }
 
     #[test]
-    fn full_transient_current_expires_after_seven_seconds() {
+    fn full_transient_current_expires_when_the_budget_is_consumed() {
         let mut monitor = EnvironmentMonitor::new(0);
-        for sample in 0..139 {
+        assert_eq!(
+            monitor.transient_budget_ms(),
+            RIDE_DC_BUS_TRANSIENT_DURATION_MS as u16
+        );
+        for sample in 0..u32::from(TRANSIENT_BUDGET_SAMPLES - 1) {
             assert_eq!(
-                monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 640),
-                Some(640)
+                monitor.update(
+                    sample * UPDATE_PERIOD_MS,
+                    nominal(),
+                    RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
+                ),
+                Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
             );
         }
         assert_eq!(
-            monitor.update(139 * UPDATE_PERIOD_MS, nominal(), 640),
-            Some(431)
+            monitor.update(
+                u32::from(TRANSIENT_BUDGET_SAMPLES - 1) * UPDATE_PERIOD_MS,
+                nominal(),
+                RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
+            ),
+            Some(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
         );
+        assert_eq!(monitor.transient_budget_ms(), 0);
         assert_ne!(
             monitor.derating_reasons() & reason::DC_BUS_TRANSIENT_RECOVERY,
             0
@@ -353,7 +380,7 @@ mod tests {
         let mut monitor = EnvironmentMonitor::new(0);
         assert_eq!(
             monitor.update(0, nominal(), RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS + 10),
-            Some(640)
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
         );
         assert_eq!(monitor.transient_budget, TRANSIENT_BUDGET_CAPACITY - 10);
         assert_eq!(
@@ -362,28 +389,80 @@ mod tests {
                 nominal(),
                 RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS - 40
             ),
-            Some(640)
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
         );
-        assert_eq!(monitor.transient_budget, TRANSIENT_BUDGET_CAPACITY);
+        let recovery = 40_u16.div_ceil(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR);
+        assert_eq!(
+            monitor.transient_budget,
+            TRANSIENT_BUDGET_CAPACITY - 10 + recovery
+        );
+    }
+
+    #[test]
+    fn repeated_pull_budget_reaches_continuous_before_the_third_pull_ends() {
+        fn run_samples(
+            monitor: &mut EnvironmentMonitor,
+            sample: &mut u32,
+            current: u16,
+            count: u32,
+        ) {
+            for _ in 0..count {
+                let _ = monitor.update(*sample * UPDATE_PERIOD_MS, nominal(), current);
+                *sample += 1;
+            }
+        }
+
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut sample = 0;
+        run_samples(&mut monitor, &mut sample, 550, 160);
+        run_samples(&mut monitor, &mut sample, 0, 600);
+        run_samples(&mut monitor, &mut sample, 570, 120);
+        run_samples(&mut monitor, &mut sample, 0, 170);
+
+        for _ in 0..168 {
+            assert_eq!(
+                monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 560),
+                Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+            );
+            sample += 1;
+        }
+        assert_eq!(
+            monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 560),
+            Some(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
+        );
+        assert_eq!(monitor.transient_budget_ms(), 0);
     }
 
     #[test]
     fn exhausted_transient_budget_stays_continuous_until_fully_recovered() {
         let mut monitor = EnvironmentMonitor::new(0);
-        for sample in 0..140 {
-            let _ = monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 640);
+        for sample in 0..u32::from(TRANSIENT_BUDGET_SAMPLES) {
+            let _ = monitor.update(
+                sample * UPDATE_PERIOD_MS,
+                nominal(),
+                RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS,
+            );
         }
 
-        let mut sample = 140;
+        let recovery_per_sample =
+            RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS.div_ceil(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR);
+        let recovery_samples = TRANSIENT_BUDGET_CAPACITY.div_ceil(recovery_per_sample);
+        let expected_final_sample =
+            u32::from(TRANSIENT_BUDGET_SAMPLES - 1) + u32::from(recovery_samples);
+        let mut sample = u32::from(TRANSIENT_BUDGET_SAMPLES);
         assert_eq!(
             monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 0),
-            Some(431)
+            Some(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
         );
         while monitor.transient_recovery_active {
             sample += 1;
             let _ = monitor.update(sample * UPDATE_PERIOD_MS, nominal(), 0);
-            assert!(sample < 500);
+            assert!(sample <= expected_final_sample);
         }
-        assert_eq!(monitor.latest_limit, Some(640));
+        assert_eq!(sample, expected_final_sample);
+        assert_eq!(
+            monitor.latest_limit,
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+        );
     }
 }

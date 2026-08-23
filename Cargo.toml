@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["oxifoc-core"]
-exclude = [
+members = [
+    "oxifoc-core",
     "oxifoc-f103",
     "oxifoc-f103-calibration",
 ]
+
+[workspace.dependencies]
+oxifoc-core = { path = "oxifoc-core" }
+oxifoc-f103 = { path = "oxifoc-f103", default-features = false }
+cortex-m = { version = "=0.7.8", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.6"
+stm32f1 = { version = "0.15", features = ["stm32f103", "rt"] }
 
 # Curated strict lints; members opt in through their lints table.
 [workspace.lints.rust]
@@ -35,7 +42,21 @@ incremental = true
 
 [profile.release]
 codegen-units = 1
-lto = true
+lto = "fat"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[profile.release.package.oxifoc-core]
+opt-level = 2
+
+# The calibration image trades more speed for size than the ride firmware.
+[profile.calibration]
+inherits = "release"
+opt-level = "z"
+
+[profile.calibration.package.oxifoc-core]
+opt-level = "s"
+
+[profile.calibration.package.oxifoc-f103]
+opt-level = "s"

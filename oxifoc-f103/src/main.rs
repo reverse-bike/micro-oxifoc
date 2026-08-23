@@ -36,6 +36,7 @@ fn main() -> ! {
     let mut wheel_distance = wheel::DistanceCounter::new();
     let mut dc_bus_undervoltage = false;
     let mut effective_current_limit = 0;
+    let mut transient_budget_ms = 0;
     let mut derating_reasons = environment::reason::LOCAL_DATA_MISSING;
     let mut ride_stage = ride::Stage::Disarmed;
     peripherals::select_application_vector_table();
@@ -109,6 +110,7 @@ fn main() -> ! {
             );
             dc_bus_undervoltage = environment.undervoltage_active();
             effective_current_limit = environment_limit.unwrap_or(0);
+            transient_budget_ms = environment.transient_budget_ms();
             derating_reasons = environment.derating_reasons();
             let command = ride.update(ride::Observation {
                 now_ms: now,
@@ -147,12 +149,15 @@ fn main() -> ! {
         }
         transport::service(
             now,
-            wheel_state.speed_tenths_kph(),
-            wheel_distance.value(),
-            dc_bus_undervoltage,
-            effective_current_limit,
-            derating_reasons,
-            ride_stage as u8,
+            transport::RuntimeTelemetry {
+                vehicle_speed_tenths_kph: wheel_state.speed_tenths_kph(),
+                distance_counter: wheel_distance.value(),
+                dc_bus_undervoltage,
+                effective_current_limit,
+                transient_budget_ms,
+                derating_reasons,
+                ride_stage: ride_stage as u8,
+            },
         );
         if watchdog_started && now.wrapping_sub(last_watchdog_feed_ms) >= WATCHDOG_FEED_PERIOD_MS {
             let progress = foc::snapshot();

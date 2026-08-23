@@ -6,6 +6,27 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.7.1 - 2026-08-23
+
+Changes:
+
+- Slowed transient-current recovery from one quarter to one eighth of unused
+  continuous-current headroom. A fully exhausted bucket now requires about 27
+  seconds at zero drive current to restore the 65 A allowance; the 7-second
+  fresh-bucket duration and 44 A continuous limit are unchanged.
+- Added the remaining full-transient-equivalent time in milliseconds to page
+  11 bytes 1--2. Schema 14 reports this foreground-owned state without adding
+  any work to the 16 kHz current-control interrupt.
+
+Reason: the 0.7.0 loaded ride made three high-current pulls and then triggered
+the battery's protection at 113.06 seconds. BMS current fell from 53.7 A to
+zero, battery-side voltage rebounded, the controller DC link decayed, and the
+next boot reported a pin/power reset; no controller fault or current trip was
+present. The firmware still exposed its 640-count transient allowance with no
+recovery flag immediately before shutdown. Replaying the BMS current against
+the one-eighth recovery model exhausts the bucket at about 110.4 seconds,
+allowing the existing 431-count continuous clamp to act before the pack opens.
+
 ## 0.7.0 - 2026-08-23
 
 Changes:

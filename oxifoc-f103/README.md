@@ -212,8 +212,9 @@ on PA13. The application provides:
 - commissioning pages 6, 8--14, 18--20, and 22--25 on `0x2F7`.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
-voltage-limit state, and applied dq voltage. Page 12 carries the full internal
-fault mask and safety-event count. Page 13 retains peak phase current from boot;
+voltage-limit state, applied dq voltage, and the remaining equivalent
+full-transient time in milliseconds. Page 12 carries the full internal fault
+mask and safety-event count. Page 13 retains peak phase current from boot;
 its direct-current maximum restarts after each successful fault
 acknowledgement. Page 14 reports field-weakening active/at-limit/voltage-limit
 flags, target d current, and requested dq voltage.
@@ -221,7 +222,7 @@ Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 13 and the crate version. Page 19 supplies readiness, confidence, and
+schema 14 and the crate version. Page 19 supplies readiness, confidence, and
 observer eRPM, while page 20 supplies the full PLL error and external-validity
 progress.
 Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
@@ -244,7 +245,9 @@ tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
 recover effective DC limits through 510 counts. The 640-count transient state
 therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
-remains exact. Firmware-version page 18 reports telemetry schema 13.
+remains exact. Page 11 bytes 1--2 report how many milliseconds of equivalent
+full-transient excess remain. Firmware-version page 18 reports telemetry
+schema 14.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4
@@ -344,4 +347,6 @@ extends the instantaneous bus clamp to complete dq terminal power. Version
 meet the F103's 16 kHz deadline without changing that weakening policy. Version
 0.7.0 moves diagnostic formatting out of the 16 kHz path, separates the compact
 ride snapshot from CAN commissioning data, and speed-optimizes the shared core
-without changing field weakening or the current envelopes.
+without changing field weakening or the current envelopes. Version 0.7.1
+slows recovery of the repeated-pull transient budget and reports its remaining
+equivalent peak time without adding ISR work.

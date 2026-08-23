@@ -157,17 +157,30 @@ pub fn initialize() -> bool {
 }
 
 #[cfg(feature = "firmware")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelemetry {
+    pub vehicle_speed_tenths_kph: u16,
+    pub distance_counter: u32,
+    pub dc_bus_undervoltage: bool,
+    pub effective_current_limit: u16,
+    pub transient_budget_ms: u16,
+    pub derating_reasons: u8,
+    pub ride_stage: u8,
+}
+
+#[cfg(feature = "firmware")]
 #[inline(never)]
 #[optimize(size)]
-pub fn service(
-    now_ms: u32,
-    vehicle_speed_tenths_kph: u16,
-    distance_counter: u32,
-    dc_bus_undervoltage: bool,
-    effective_current_limit: u16,
-    derating_reasons: u8,
-    ride_stage: u8,
-) {
+pub fn service(now_ms: u32, runtime: RuntimeTelemetry) {
+    let RuntimeTelemetry {
+        vehicle_speed_tenths_kph,
+        distance_counter,
+        dc_bus_undervoltage,
+        effective_current_limit,
+        transient_budget_ms,
+        derating_reasons,
+        ride_stage,
+    } = runtime;
     let next = NEXT_TELEMETRY_MS.load(Ordering::Relaxed);
     if next != now_ms && next.wrapping_sub(now_ms) < 0x8000_0000 {
         return;
@@ -245,6 +258,7 @@ pub fn service(
                 measured_q_counts: control.measured_q_counts,
             }),
             4 => protocol::control_output_telemetry(protocol::ControlOutputTelemetry {
+                transient_budget_ms,
                 applied_d_ticks: control.applied_d_ticks,
                 applied_q_ticks: control.applied_q_ticks,
             }),
