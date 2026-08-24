@@ -21,7 +21,7 @@ firmware = [
     "dep:cortex-m",
     "dep:cortex-m-rt",
     "dep:stm32f1",
-    "oxifoc-f103/calibration-image",
+    "oxifoc-f103/board",
 ]
 
 [dependencies]

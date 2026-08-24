@@ -6,7 +6,6 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use oxifoc_core::foc::{Dq, Fixed, FixedFocController, NoDecoupling, PIController};
 use oxifoc_f103::{config as board_config, hardware::peripherals as hardware, safety};
-use stm32f1::stm32f103::interrupt;
 
 use crate::calibration::{
     flux_linkage::{FluxLinkageCalibration, Observation as FluxObservation},
@@ -253,8 +252,8 @@ pub fn pulse_diagnostic(slot: u8) -> PulseDiagnostic {
     })
 }
 
-#[interrupt]
-fn TIM1_UP() {
+#[inline(always)]
+pub fn timer_update_interrupt() {
     let started = hardware::cycle_count();
     hardware::clear_tim1_update_flag();
     safety::timer_update_entered();

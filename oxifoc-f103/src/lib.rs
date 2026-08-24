@@ -13,6 +13,9 @@ pub mod protocol;
 pub mod safety;
 pub mod sensors;
 
+#[cfg(feature = "firmware")]
+pub mod app;
+
 #[cfg(feature = "board")]
 pub mod hardware;
 #[cfg(feature = "board")]

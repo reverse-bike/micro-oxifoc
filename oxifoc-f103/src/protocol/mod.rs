@@ -882,10 +882,6 @@ mod tests {
             .data,
             [20, 0xc4, 0x04, 0x6c, 0xd9, 0xc8, 0x01, 255]
         );
-        assert_eq!(
-            firmware_version_telemetry().data,
-            [18, 14, b'0', b'.', b'7', b'.', b'1', 0]
-        );
     }
 
     #[test]

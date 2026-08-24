@@ -1,6 +1,6 @@
 [package]
 name = "oxifoc-f103"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 publish = false
 description = "26,200-byte Hall/back-EMF CAN FOC firmware for STM32F103"
@@ -19,7 +19,6 @@ required-features = ["firmware"]
 default = []
 board = ["dep:cortex-m", "dep:cortex-m-rt", "dep:stm32f1"]
 firmware = ["board"]
-calibration-image = ["board"]
 
 [dependencies]
 oxifoc-core = { workspace = true }

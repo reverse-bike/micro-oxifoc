@@ -7,4 +7,8 @@ pub mod config;
 pub mod protocol;
 
 #[cfg(feature = "firmware")]
+pub mod app;
+#[cfg(feature = "firmware")]
 pub mod control;
+#[cfg(feature = "firmware")]
+pub mod transport;

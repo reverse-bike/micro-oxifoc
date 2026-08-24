@@ -25,16 +25,18 @@ split keeps reusable synchronous control logic out of the device crate:
 
 The package exposes that device layer through its additive `board` feature.
 The sibling [`oxifoc-f103-calibration`](../oxifoc-f103-calibration/README.md)
-links it with `calibration-image`, retaining the identical ADC, TIM1, BKIN,
-watchdog, reset-forensics, and updater implementations while supplying its own
-calibration control ISR. The production ride build still selects only
-`firmware`; its linked size is unchanged.
+enables `board`, retaining the identical ADC, TIM1, BKIN, watchdog, and
+reset-forensics implementations while supplying its own control ISR and CAN
+policy. The two applications remain separate packages because their current
+loop and flash budgets require different optimization profiles; shared Cargo
+features are additive capabilities, never mutually exclusive product modes.
 
 The device crate follows OxiFOC's device/core boundary while remaining
 synchronous:
 
 ```text
 src/
+├── app.rs                 foreground ride application and owned state
 ├── config.rs              board constants, limits, and Hall geometry
 ├── control/
 │   ├── foc.rs             TIM1 current-control interrupt
@@ -49,10 +51,15 @@ src/
 │   ├── throttle.rs        throttle qualification and demand mapping
 │   ├── wheel.rs           wheel estimation and distance
 │   └── wheel_capture.rs   TIM3 wheel capture
-├── transport/can.rs       bxCAN driver and message schedule
-├── safety.rs              fatal gate shutdown and watchdog supervision
+├── transport/
+│   ├── can.rs             generic bxCAN register driver
+│   └── ride.rs            stock-bike ISR policy and telemetry schedule
+├── safety/
+│   ├── mod.rs             public diagnostic types and pure supervision rule
+│   ├── retained.rs        retained reset-record encoding and validation
+│   └── runtime.rs         shutdown handlers and hardware watchdogs
 ├── lib.rs                 host-testable module boundary
-└── main.rs                synchronous initialization and foreground loop
+└── main.rs                entry point and application-owned IRQ wrappers
 ```
 
 Every image prepared for a real CAN flash receives one version bump and a brief

@@ -2,10 +2,7 @@
 
 pub mod can;
 
-pub use can::initialize;
-#[cfg(feature = "calibration-image")]
-pub use can::take_received_frame;
 #[cfg(feature = "firmware")]
-pub use can::take_reset_request;
+mod ride;
 #[cfg(feature = "firmware")]
-pub use can::{RuntimeTelemetry, service};
+pub use ride::{RideCan, RuntimeTelemetry, receive_interrupt};

@@ -6,6 +6,30 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.7.2 - 2026-08-23
+
+Changes:
+
+- Replaced the shared crate's ride-versus-calibration feature branches with
+  additive `board` and `firmware` capabilities. Ride and calibration retain
+  separate packages and optimization profiles, while each binary now owns its
+  TIM1 and CAN interrupt entry points.
+- Split bxCAN register access from application policy. The shared driver takes
+  a receive callback; ride owns stock-bike commands and telemetry, while the
+  calibration image owns its command queue and unconditional emergency updater
+  reset path.
+- Moved foreground state into `RideApp`, `RideCan`, and `CalibrationApp`
+  instances, and split safety into public diagnostics, retained-record
+  encoding, and hardware watchdog/runtime modules.
+- Configured Rust Analyzer from the workspace root so both additive firmware
+  feature sets can be checked together without contradictory IDE expansion.
+
+Reason: application mode was encoded through many item-level feature gates,
+which made the firmware difficult to navigate and let Cargo feature unification
+produce misleading IDE errors. The new module and ownership boundaries preserve
+the synchronous control, safety, CAN updater, and telemetry behavior while
+reducing the ride payload from 25,752 to 25,632 bytes.
+
 ## 0.7.1 - 2026-08-23
 
 Changes:

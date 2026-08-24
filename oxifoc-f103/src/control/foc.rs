@@ -13,7 +13,6 @@ use oxifoc_core::foc::{
     ramp::QuadratureTargetRamp,
 };
 use oxifoc_core::motor::foc_driver::{CurrentLimits, FieldWeakening, FocDriver, StepError};
-use stm32f1::stm32f103::interrupt;
 
 const CONTROL_HALL_VALID: u32 = 1;
 const CONTROL_CURRENT_VALID: u32 = 1 << 1;
@@ -411,8 +410,8 @@ fn stop_control(state: &mut ControlState, safety_loss: Option<SafetyLossReason>)
     }
 }
 
-#[interrupt]
-fn TIM1_UP() {
+#[inline(always)]
+pub fn timer_update_interrupt() {
     let started = hardware::cycle_count();
     hardware::clear_tim1_update_flag();
     crate::safety::timer_update_entered();
