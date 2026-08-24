@@ -44,6 +44,7 @@ impl RideCan {
 pub struct RuntimeTelemetry {
     pub vehicle_speed_tenths_kph: u16,
     pub distance_counter: u32,
+    pub cadence: sensors::cadence::Observation,
     pub dc_bus_undervoltage: bool,
     pub effective_current_limit: u16,
     pub transient_budget_ms: u16,
@@ -58,6 +59,7 @@ impl RideCan {
         let RuntimeTelemetry {
             vehicle_speed_tenths_kph,
             distance_counter,
+            cadence,
             dc_bus_undervoltage,
             effective_current_limit,
             transient_budget_ms,
@@ -84,6 +86,7 @@ impl RideCan {
         let stock = protocol::StockTelemetry {
             vehicle_speed_tenths_kph,
             distance_counter,
+            cadence_rpm: cadence.rpm,
             digital_input_flags: (u8::from(HEADLIGHT_COMMAND.load(Ordering::Relaxed)) << 1)
                 | (u8::from(inputs.brake_active) << 2),
             controller_temperature_deci_c: controller_temperature,
@@ -111,8 +114,12 @@ impl RideCan {
                         throttle_valid: inputs.throttle.is_valid(),
                         throttle_at_rest: inputs.throttle.is_at_rest(),
                         throttle_raw: inputs.throttle.raw(),
-                        throttle_demand: inputs.throttle.normalized_counts(),
+                        throttle_demand_percent: inputs.throttle.demand_percent(),
                         throttle_current_limit_counts: config::RIDE_PHASE_CURRENT_LIMIT_COUNTS,
+                        cadence_active: cadence.is_active(),
+                        cadence_pin_low: cadence.pin_low,
+                        cadence_raw_pin_low: cadence.raw_pin_low,
+                        cadence_demand_percent: cadence.demand_percent,
                         live_hall_state: peripherals::live_hall_state(),
                         bus_voltage_mv: if inputs.analog_valid {
                             sensors::bus_voltage_mv(inputs.bus_voltage_adc).min(u32::from(u16::MAX))

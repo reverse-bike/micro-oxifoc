@@ -5,7 +5,7 @@ pub const REST_ADC: u16 = 726;
 pub const REST_MAX_ADC: u16 = 850;
 pub const FULL_ADC: u16 = 3_252;
 pub const PLAUSIBLE_HIGH_ADC: u16 = 3_750;
-pub const DEMAND_MAX_COUNTS: u8 = 240;
+pub const MAXIMUM_DEMAND_PERCENT: u8 = 100;
 
 const _: () = assert!(PLAUSIBLE_LOW_ADC <= REST_ADC);
 const _: () = assert!(REST_ADC < REST_MAX_ADC);
@@ -49,13 +49,13 @@ impl Observation {
 
         let span = u32::from(FULL_ADC - REST_MAX_ADC);
         let above_rest = u32::from(raw.min(FULL_ADC) - REST_MAX_ADC);
-        let counts = above_rest
-            .saturating_mul(u32::from(DEMAND_MAX_COUNTS))
+        let percent = above_rest
+            .saturating_mul(u32::from(MAXIMUM_DEMAND_PERCENT))
             .saturating_add(span - 1)
             / span;
         Self {
             raw,
-            state: State::Demand(Demand(counts.min(u32::from(DEMAND_MAX_COUNTS)) as u8)),
+            state: State::Demand(Demand(percent.min(u32::from(MAXIMUM_DEMAND_PERCENT)) as u8)),
         }
     }
 
@@ -70,9 +70,9 @@ impl Observation {
         }
     }
 
-    pub const fn normalized_counts(self) -> u8 {
+    pub const fn demand_percent(self) -> u8 {
         match self.demand() {
-            Some(demand) => demand.counts(),
+            Some(demand) => demand.percent(),
             None => 0,
         }
     }
@@ -90,7 +90,17 @@ impl Observation {
 pub struct Demand(u8);
 
 impl Demand {
-    pub const fn counts(self) -> u8 {
+    pub const fn from_percent(percent: u8) -> Option<Self> {
+        if percent == 0 {
+            None
+        } else if percent > MAXIMUM_DEMAND_PERCENT {
+            Some(Self(MAXIMUM_DEMAND_PERCENT))
+        } else {
+            Some(Self(percent))
+        }
+    }
+
+    pub const fn percent(self) -> u8 {
         self.0
     }
 
@@ -98,8 +108,8 @@ impl Demand {
         let limit = phase_current_limit_counts.min(RIDE_PHASE_CURRENT_LIMIT_COUNTS);
         let scaled = u32::from(self.0)
             .saturating_mul(u32::from(limit))
-            .saturating_add(u32::from(DEMAND_MAX_COUNTS - 1))
-            / u32::from(DEMAND_MAX_COUNTS);
+            .saturating_add(u32::from(MAXIMUM_DEMAND_PERCENT - 1))
+            / u32::from(MAXIMUM_DEMAND_PERCENT);
         -(scaled.min(i16::MAX as u32) as i16)
     }
 }
@@ -153,12 +163,12 @@ mod tests {
         assert!(Observation::from_raw(REST_MAX_ADC).is_at_rest());
         assert!(Observation::from_raw(REST_MAX_ADC + 1).demand().is_some());
         assert_eq!(
-            Observation::from_raw(FULL_ADC).normalized_counts(),
-            DEMAND_MAX_COUNTS
+            Observation::from_raw(FULL_ADC).demand_percent(),
+            MAXIMUM_DEMAND_PERCENT
         );
         assert_eq!(
-            Observation::from_raw(PLAUSIBLE_HIGH_ADC).normalized_counts(),
-            DEMAND_MAX_COUNTS
+            Observation::from_raw(PLAUSIBLE_HIGH_ADC).demand_percent(),
+            MAXIMUM_DEMAND_PERCENT
         );
         assert!(!Observation::from_raw(PLAUSIBLE_HIGH_ADC + 1).is_valid());
     }
@@ -167,9 +177,9 @@ mod tests {
     fn demand_is_monotonic_and_bounded() {
         let mut previous = 0;
         for raw in REST_MAX_ADC + 1..=PLAUSIBLE_HIGH_ADC {
-            let demand = Observation::from_raw(raw).normalized_counts();
+            let demand = Observation::from_raw(raw).demand_percent();
             assert!(demand >= previous);
-            assert!(demand <= DEMAND_MAX_COUNTS);
+            assert!(demand <= MAXIMUM_DEMAND_PERCENT);
             previous = demand;
         }
     }

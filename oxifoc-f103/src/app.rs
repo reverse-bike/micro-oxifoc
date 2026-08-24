@@ -6,7 +6,7 @@ use crate::{
     control::{foc, ride},
     hardware::peripherals,
     safety,
-    sensors::{self, environment, wheel, wheel_capture},
+    sensors::{self, cadence, cadence_input, environment, wheel, wheel_capture},
     transport::{RideCan, RuntimeTelemetry},
 };
 
@@ -25,6 +25,9 @@ pub struct RideApp {
     wheel_estimator: wheel::Estimator,
     wheel_state: wheel::State,
     wheel_distance: wheel::DistanceCounter,
+    cadence_tracker: cadence::Tracker,
+    cadence: cadence::Observation,
+    last_cadence_ms: u32,
     dc_bus_undervoltage: bool,
     effective_current_limit: u16,
     transient_budget_ms: u16,
@@ -54,6 +57,9 @@ impl RideApp {
             wheel_estimator: wheel::Estimator::new(),
             wheel_state: wheel::State::Uninitialized,
             wheel_distance: wheel::DistanceCounter::new(),
+            cadence_tracker: cadence::Tracker::new(),
+            cadence: cadence::Observation::INACTIVE,
+            last_cadence_ms: u32::MAX,
             dc_bus_undervoltage: false,
             effective_current_limit: 0,
             transient_budget_ms: 0,
@@ -73,6 +79,7 @@ impl RideApp {
 
         peripherals::configure_tim1_passive();
         wheel_capture::initialize();
+        cadence_input::initialize();
         self.wheel_initialized = true;
         if let Ok(offsets) = peripherals::configure_and_calibrate_current_adcs() {
             peripherals::configure_hall_capture();
@@ -113,13 +120,15 @@ impl RideApp {
         if let Some(inputs) = self.inputs.as_mut() {
             inputs.service(now_ms);
         }
-        self.service_ride(now_ms);
         self.service_wheel();
+        self.service_cadence(now_ms);
+        self.service_ride(now_ms);
         self.can.service(
             now_ms,
             RuntimeTelemetry {
                 vehicle_speed_tenths_kph: self.wheel_state.speed_tenths_kph(),
                 distance_counter: self.wheel_distance.value(),
+                cadence: self.cadence,
                 dc_bus_undervoltage: self.dc_bus_undervoltage,
                 effective_current_limit: self.effective_current_limit,
                 transient_budget_ms: self.transient_budget_ms,
@@ -170,6 +179,7 @@ impl RideApp {
         let command = ride_controller.update(ride::Observation {
             now_ms,
             throttle: local.throttle,
+            cadence_demand_percent: self.cadence.demand_percent,
             brake_active: local.brake_active,
             environment_dc_limit_counts: environment_limit,
             hall_valid: control.hall_valid,
@@ -204,6 +214,18 @@ impl RideApp {
             self.wheel_state = self.wheel_estimator.update(capture);
             self.wheel_distance.update(capture.pulse_count);
         }
+    }
+
+    fn service_cadence(&mut self, now_ms: u32) {
+        if now_ms == self.last_cadence_ms {
+            return;
+        }
+        self.cadence = self.cadence_tracker.update(
+            now_ms,
+            cadence_input::pin_is_low(),
+            self.wheel_state.speed_tenths_kph(),
+        );
+        self.last_cadence_ms = now_ms;
     }
 
     fn service_watchdog(&mut self, now_ms: u32) {

@@ -44,6 +44,7 @@ pub const fn headlight_command(frame: Frame) -> Option<bool> {
 pub struct StockTelemetry {
     pub vehicle_speed_tenths_kph: u16,
     pub distance_counter: u32,
+    pub cadence_rpm: u16,
     /// `0x201.b4` input bits: headlight in bit 1 and brake in bit 2.
     pub digital_input_flags: u8,
     pub controller_temperature_deci_c: Option<i16>,
@@ -78,7 +79,16 @@ pub fn telemetry_slot(slot: u8, snapshot: StockTelemetry) -> [Option<Frame>; 3] 
     let primary = if slot & 1 == 0 {
         [Some(motion), Some(profile), None]
     } else {
-        [Some(Frame::new(0x203, 8, [0; 8])), None, None]
+        let cadence = snapshot.cadence_rpm.saturating_mul(40).to_le_bytes();
+        [
+            Some(Frame::new(
+                0x203,
+                8,
+                [cadence[0], cadence[1], 0, 0, 0, 0, 0, 0],
+            )),
+            None,
+            None,
+        ]
     };
     match slot % 60 {
         1 => [
@@ -126,7 +136,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 14 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 14;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 15;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -193,8 +203,12 @@ pub struct PassiveInputTelemetry {
     pub throttle_valid: bool,
     pub throttle_at_rest: bool,
     pub throttle_raw: u16,
-    pub throttle_demand: u8,
+    pub throttle_demand_percent: u8,
     pub throttle_current_limit_counts: u16,
+    pub cadence_active: bool,
+    pub cadence_pin_low: bool,
+    pub cadence_raw_pin_low: bool,
+    pub cadence_demand_percent: u8,
     pub live_hall_state: u8,
     pub bus_voltage_mv: u16,
     pub effective_current_limit: u16,
@@ -298,16 +312,19 @@ pub fn passive_input_telemetry(page_index: u8, snapshot: PassiveInputTelemetry) 
         let interlocks = u8::from(snapshot.throttle_at_rest)
             | (u8::from(snapshot.brake_active) << 1)
             | (u8::from(snapshot.analog_valid) << 2)
-            | (u8::from(snapshot.throttle_valid) << 4);
+            | (u8::from(snapshot.throttle_valid) << 4)
+            | (u8::from(snapshot.cadence_active) << 5)
+            | (u8::from(snapshot.cadence_pin_low) << 6)
+            | (u8::from(snapshot.cadence_raw_pin_low) << 7);
         Frame::new(
             0x2f7,
             8,
             [
                 8,
-                0,
+                snapshot.cadence_demand_percent,
                 raw[0],
                 raw[1],
-                snapshot.throttle_demand,
+                snapshot.throttle_demand_percent,
                 current_limit[0],
                 interlocks,
                 (snapshot.live_hall_state & 7) | ((current_limit[1] & 1) << 3),
@@ -664,6 +681,18 @@ mod tests {
     }
 
     #[test]
+    fn stock_power_status_reports_cadence_rpm_times_forty() {
+        let snapshot = StockTelemetry {
+            cadence_rpm: 75,
+            ..StockTelemetry::default()
+        };
+        assert_eq!(
+            telemetry_slot(1, snapshot)[0].unwrap(),
+            Frame::new(0x203, 8, [0xb8, 0x0b, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
     fn telemetry_schedule_keeps_its_sixty_slot_phase_across_u8_wrap() {
         let mut slot = 0;
         let mut visits = [0_u16; 60];
@@ -692,6 +721,7 @@ mod tests {
         let snapshot = StockTelemetry {
             vehicle_speed_tenths_kph: 14,
             distance_counter: 0x1234_5678,
+            cadence_rpm: 0,
             digital_input_flags: 4,
             controller_temperature_deci_c: Some(410),
             motor_temperature_deci_c: Some(270),
@@ -749,8 +779,12 @@ mod tests {
             throttle_valid: true,
             throttle_at_rest: true,
             throttle_raw: 726,
-            throttle_demand: 0,
+            throttle_demand_percent: 0,
             throttle_current_limit_counts: 838,
+            cadence_active: true,
+            cadence_pin_low: false,
+            cadence_raw_pin_low: true,
+            cadence_demand_percent: 44,
             live_hall_state: 5,
             bus_voltage_mv: 52_300,
             effective_current_limit: 250,
@@ -760,7 +794,7 @@ mod tests {
         };
         assert_eq!(
             passive_input_telemetry(0, snapshot).data,
-            [8, 0, 0xd6, 0x02, 0, 0xa3, 0x15, 0x0d]
+            [8, 44, 0xd6, 0x02, 0, 0xa3, 0xb5, 0x0d]
         );
         assert_eq!(
             passive_input_telemetry(1, snapshot).data,

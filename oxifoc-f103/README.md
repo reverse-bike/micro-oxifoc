@@ -46,6 +46,8 @@ src/
 ├── protocol/mod.rs        pure stock/project CAN frame encoding
 ├── sensors/
 │   ├── analog.rs          ADC/DMA input acquisition
+│   ├── cadence.rs         pedal-pulse qualification and RPM
+│   ├── cadence_input.rs   PB9 active-low cadence input
 │   ├── environment.rs     voltage/temperature protection and derating
 │   ├── inputs.rs          debounced active-low safety inputs
 │   ├── throttle.rs        throttle qualification and demand mapping
@@ -138,9 +140,10 @@ Enabling motor channels requires a fresh 10 ms local authority lease, valid
 Hall/current samples, no latched fault or pending TIM1 break, and an inactive
 PB12 break input.
 
-## Local ride input
+## Local ride inputs
 
-Ride demand comes directly from `PC5/ADC_IN15`; CAN never grants torque. ADC1's
+Ride demand comes from the directly connected throttle and cadence sensor; CAN
+never grants torque. ADC1's
 regular DMA scan is:
 
 1. `PC3/ADC_IN13` motor temperature
@@ -158,6 +161,23 @@ acquisition, current trip, Hall loss, or another safety loss disarms the ride
 path until a fresh valid rest sample is observed. A latched hardware fault is
 acknowledged only in a throttle-rest pass, after ride authority is revoked,
 and only while PB12 is inactive; that pass cannot energize the motor.
+
+The stock cadence sensor is active-low PB9 with a pull-up. Its 1 kHz tracker
+requires four matching samples per edge and three complete pulses before it
+can request torque. It reports RPM for the 24-pulse ring, drops qualification
+after 500 ms without an edge at or below 20 km/h and after 300 ms above 20
+km/h, and rejects a low phase longer than 400 ms. The average of the latest two
+qualified low widths feeds the recovered stock `41074 / width_ms + 67` command
+curve, whose 0--2,500 range is normalized to 0--100 percent and saturates at a
+16 ms low width. Throttle travel is independently normalized to 0--100
+percent; the larger of throttle and cadence becomes the ride demand applied to
+the unchanged phase-current ceiling.
+
+Cadence and throttle share one ride owner: either can sustain an active run,
+throttle can take over without a stop, and brake or any local protection
+removes both sources together. The display used on this bike reports zero in
+the stock assist-percentage byte, so that compatibility field does not
+suppress the directly wired cadence input.
 
 The display is not a safety input. Losing CAN traffic does not revoke an
 already valid local ride request; every authority decision still comes from
@@ -212,11 +232,16 @@ on PA13. The application provides:
 
 - zero-length identity queries `0x210`--`0x212`;
 - scheduled stock frames `0x200`--`0x204`, `0x265`, `0x266`, and `0x64A`,
-  including local brake, wheel speed/distance, temperatures, and fault pages;
+  including local brake, wheel speed/distance, cadence RPM, temperatures, and
+  fault pages;
 - stock headlight control from `0x300.b2`, mirrored into `0x201.b4` bit 1 and
   `0x64A` bits 3 and 13 without granting or revoking ride authority;
 - updater reset on `0x67F#AA552A002A...`;
 - commissioning pages 6, 8--14, 18--20, and 22--25 on `0x2F7`.
+
+Page 8 includes throttle and cadence demand percentages plus cadence-active,
+debounced-level, and raw-level diagnostics alongside the other input
+interlocks. Stock frame `0x203.b0..b1` reports cadence RPM multiplied by 40.
 
 Pages 10 and 11 report live target/measured dq current, ride stage, output and
 voltage-limit state, applied dq voltage, and the remaining equivalent
@@ -229,7 +254,7 @@ Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 14 and the crate version. Page 19 supplies readiness, confidence, and
+schema 15 and the crate version. Page 19 supplies readiness, confidence, and
 observer eRPM, while page 20 supplies the full PLL error and external-validity
 progress.
 Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
@@ -254,7 +279,7 @@ therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
 remains exact. Page 11 bytes 1--2 report how many milliseconds of equivalent
 full-transient excess remain. Firmware-version page 18 reports telemetry
-schema 14.
+schema 15.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4

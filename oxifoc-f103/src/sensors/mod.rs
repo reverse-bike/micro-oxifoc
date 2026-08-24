@@ -2,6 +2,9 @@
 
 #[cfg(feature = "board")]
 pub mod analog;
+pub mod cadence;
+#[cfg(feature = "board")]
+pub mod cadence_input;
 pub mod environment;
 pub mod inputs;
 pub mod throttle;

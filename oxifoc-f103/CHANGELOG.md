@@ -6,6 +6,32 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.8.0 - 2026-08-23
+
+Changes:
+
+- Restored the stock active-low PB9 cadence input as a local ride-demand
+  source. The 1 kHz tracker uses four-sample edge debounce, requires three
+  qualified pulses, rejects low phases longer than 400 ms, and expires after
+  500 ms at or below 20 km/h or 300 ms above it.
+- Routed qualified cadence through the existing ride owner, target ramp,
+  phase-current circle, battery-current envelope, brake handling, Hall startup
+  lifecycle, and fault protections. Throttle travel and the recovered stock
+  cadence low-width command are each normalized to 0--100 percent; the larger
+  request drives the unchanged phase-current target, allowing either input to
+  take over without cycling the power stage.
+- Restored stock cadence reporting in `0x203.b0..b1` as RPM multiplied by 40.
+  Project page 8 now exposes cadence demand and qualification plus
+  raw/debounced PB9 levels; project telemetry moves to schema 15.
+
+Reason: the controller has a directly connected 24-pulse cadence sensor, but
+the ride application only accepted throttle demand. The installed display
+transmits zero in the stock assist-percentage field, so applying that field
+would leave pedal assist permanently disabled. Converting its measured pulse
+width into a bounded local demand restores proportional pedal assist without
+making CAN a torque source or bypassing any existing current, brake, startup,
+or safety envelope.
+
 ## 0.7.2 - 2026-08-23
 
 Changes:

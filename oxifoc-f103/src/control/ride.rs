@@ -1,7 +1,7 @@
-//! Local-throttle ride authority and Hall-progress lifecycle.
+//! Local ride-demand authority and Hall-progress lifecycle.
 
 use crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS;
-use crate::sensors::throttle::Observation as ThrottleObservation;
+use crate::sensors::throttle::{Demand, Observation as ThrottleObservation};
 
 pub const OUTPUT_LEASE_CYCLES: u32 = 160;
 pub const STARTUP_HALL_TIMEOUT_MS: u32 = 500;
@@ -27,6 +27,7 @@ pub enum Stage {
 pub struct Observation {
     pub now_ms: u32,
     pub throttle: ThrottleObservation,
+    pub cadence_demand_percent: u8,
     pub brake_active: bool,
     pub environment_dc_limit_counts: Option<u16>,
     pub hall_valid: bool,
@@ -123,7 +124,7 @@ impl RideController {
 
         match self.state {
             State::Disarmed => {
-                if observation.throttle.is_at_rest() {
+                if observation.throttle.is_at_rest() && observation.cadence_demand_percent == 0 {
                     self.state = State::Ready;
                     Command {
                         stage: Stage::Ready,
@@ -139,7 +140,7 @@ impl RideController {
     }
 
     fn update_ready(&mut self, observation: Observation, environment_limit: u16) -> Command {
-        let Some(demand) = observation.throttle.demand() else {
+        let Some(demand) = ride_demand(observation) else {
             if !observation.throttle.is_at_rest() {
                 self.state = State::Disarmed;
                 return Command::OFF;
@@ -180,7 +181,7 @@ impl RideController {
         let demand = if observation.brake_active {
             None
         } else {
-            observation.throttle.demand()
+            ride_demand(observation)
         };
         if matches!(run.stage, Stage::AwaitingFirstEdge | Stage::StartupTracking)
             && demand.is_none()
@@ -279,6 +280,15 @@ impl RideController {
     }
 }
 
+fn ride_demand(observation: Observation) -> Option<Demand> {
+    let throttle = observation.throttle.demand();
+    if throttle.is_some_and(|demand| demand.percent() >= observation.cadence_demand_percent) {
+        throttle
+    } else {
+        Demand::from_percent(observation.cadence_demand_percent)
+    }
+}
+
 fn active_command(target_q_counts: i16, environment_limit: u16, stage: Stage) -> Command {
     Command {
         energize: true,
@@ -308,12 +318,13 @@ const fn deadline_reached(now: u32, deadline: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sensors::throttle::{FULL_ADC, REST_ADC};
+    use crate::sensors::throttle::{FULL_ADC, REST_ADC, REST_MAX_ADC};
 
     fn observation(now_ms: u32, throttle_raw: u16) -> Observation {
         Observation {
             now_ms,
             throttle: ThrottleObservation::from_raw(throttle_raw),
+            cadence_demand_percent: 0,
             brake_active: false,
             environment_dc_limit_counts: Some(crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS),
             hall_valid: true,
@@ -345,6 +356,51 @@ mod tests {
         let command = controller.update(observation(2, FULL_ADC));
         assert!(command.energize);
         assert_eq!(command.target_q_counts, -880);
+    }
+
+    #[test]
+    fn qualified_cadence_scales_the_existing_ride_envelope() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let mut pedaling = observation(1, REST_ADC);
+        pedaling.cadence_demand_percent = 44;
+        let command = controller.update(pedaling);
+        assert!(command.energize);
+        assert_eq!(command.target_q_counts, -388);
+        assert_eq!(command.stage, Stage::AwaitingFirstEdge);
+    }
+
+    #[test]
+    fn active_cadence_cannot_arm_at_boot_and_throttle_can_take_over() {
+        let mut blocked = RideController::new(0);
+        let mut already_pedaling = observation(0, REST_ADC);
+        already_pedaling.cadence_demand_percent = 44;
+        assert_eq!(blocked.update(already_pedaling), Command::OFF);
+
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let mut pedaling = observation(1, REST_ADC);
+        pedaling.cadence_demand_percent = 44;
+        assert!(controller.update(pedaling).energize);
+
+        let throttle_takeover = observation(2, FULL_ADC);
+        let command = controller.update(throttle_takeover);
+        assert!(command.energize);
+        assert_eq!(command.target_q_counts, -880);
+    }
+
+    #[test]
+    fn ride_uses_the_larger_of_throttle_and_cadence_percent() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let half_throttle_raw = REST_MAX_ADC + (FULL_ADC - REST_MAX_ADC) / 2;
+        let mut mixed = observation(1, half_throttle_raw);
+        mixed.cadence_demand_percent = 44;
+        assert_eq!(controller.update(mixed).target_q_counts, -440);
+
+        mixed.now_ms = 2;
+        mixed.cadence_demand_percent = 60;
+        assert_eq!(controller.update(mixed).target_q_counts, -528);
     }
 
     #[test]
