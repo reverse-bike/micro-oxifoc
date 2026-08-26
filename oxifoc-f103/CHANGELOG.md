@@ -6,6 +6,25 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.9.0 - 2026-08-26
+
+Changes:
+
+- Raised the common throttle/cadence phase-current circle from 880 to 900 ADC
+  counts, nominally 90 A peak or 63.6 A RMS per phase at the loaded-run fit of
+  100 mA/count. The 1,344-count software trip remains unchanged.
+- Doubled increasing-torque target slew from four to eight current counts per
+  millisecond, reducing a zero-to-full command ramp from 225 to 112.5 ms.
+  Reductions in demand, brake action, and safety shutdown remain immediate.
+
+Reason: the amplitude-invariant Clarke/Park transform confirms that the dq
+current-circle magnitude is the sinusoidal phase-current peak, making 900
+counts the requested 90 A target. The prior quarter-second torque ramp was
+longer than needed for this proven Hall/observer control path; the faster ramp
+improves initial response while retaining the unchanged 65 A transient and
+44 A continuous battery-current envelopes and a small margin below the lowest
+previously observed hardware break.
+
 ## 0.8.0 - 2026-08-23
 
 Changes:

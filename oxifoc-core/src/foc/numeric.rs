@@ -297,8 +297,8 @@ fn conservative_circular_remaining_bits(limit_bits: u32, direct_bits: u32) -> u3
     // Q16.16 motor-current limits use at most 31 positive bits. Scale both
     // operands to 15 bits so their squares fit in native u32 operations.
     // Rounding the limit down and |d| up guarantees the returned q component
-    // remains inside the original circle. At the F103's 880-count limit the
-    // quantization step is 1/32 current count.
+    // remains inside the original circle. At the F103's operating current
+    // limits the quantization step is 1/32 current count.
     let significant_bits = u32::BITS - limit_bits.leading_zeros();
     let shift = significant_bits.saturating_sub(15);
     let quantum = 1_u32 << shift;

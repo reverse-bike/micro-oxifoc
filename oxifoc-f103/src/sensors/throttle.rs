@@ -187,9 +187,13 @@ mod tests {
     #[test]
     fn full_throttle_uses_confirmed_forward_sign_and_current_scale() {
         let demand = Observation::from_raw(FULL_ADC).demand().unwrap();
-        assert_eq!(demand.negative_q_target(880), -880);
+        let ride_limit = RIDE_PHASE_CURRENT_LIMIT_COUNTS;
+        assert_eq!(demand.negative_q_target(ride_limit), -(ride_limit as i16));
         assert_eq!(demand.negative_q_target(60), -60);
-        assert_eq!(demand.negative_q_target(900), -880);
+        assert_eq!(
+            demand.negative_q_target(ride_limit + 1),
+            -(ride_limit as i16)
+        );
     }
 
     #[test]

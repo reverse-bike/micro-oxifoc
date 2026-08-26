@@ -355,7 +355,10 @@ mod tests {
         );
         let command = controller.update(observation(2, FULL_ADC));
         assert!(command.energize);
-        assert_eq!(command.target_q_counts, -880);
+        assert_eq!(
+            command.target_q_counts,
+            -(RIDE_PHASE_CURRENT_LIMIT_COUNTS as i16)
+        );
     }
 
     #[test]
@@ -366,7 +369,12 @@ mod tests {
         pedaling.cadence_demand_percent = 44;
         let command = controller.update(pedaling);
         assert!(command.energize);
-        assert_eq!(command.target_q_counts, -388);
+        assert_eq!(
+            command.target_q_counts,
+            Demand::from_percent(44)
+                .unwrap()
+                .negative_q_target(RIDE_PHASE_CURRENT_LIMIT_COUNTS)
+        );
         assert_eq!(command.stage, Stage::AwaitingFirstEdge);
     }
 
@@ -386,7 +394,10 @@ mod tests {
         let throttle_takeover = observation(2, FULL_ADC);
         let command = controller.update(throttle_takeover);
         assert!(command.energize);
-        assert_eq!(command.target_q_counts, -880);
+        assert_eq!(
+            command.target_q_counts,
+            -(RIDE_PHASE_CURRENT_LIMIT_COUNTS as i16)
+        );
     }
 
     #[test]
@@ -396,11 +407,21 @@ mod tests {
         let half_throttle_raw = REST_MAX_ADC + (FULL_ADC - REST_MAX_ADC) / 2;
         let mut mixed = observation(1, half_throttle_raw);
         mixed.cadence_demand_percent = 44;
-        assert_eq!(controller.update(mixed).target_q_counts, -440);
+        assert_eq!(
+            controller.update(mixed).target_q_counts,
+            Demand::from_percent(50)
+                .unwrap()
+                .negative_q_target(RIDE_PHASE_CURRENT_LIMIT_COUNTS)
+        );
 
         mixed.now_ms = 2;
         mixed.cadence_demand_percent = 60;
-        assert_eq!(controller.update(mixed).target_q_counts, -528);
+        assert_eq!(
+            controller.update(mixed).target_q_counts,
+            Demand::from_percent(60)
+                .unwrap()
+                .negative_q_target(RIDE_PHASE_CURRENT_LIMIT_COUNTS)
+        );
     }
 
     #[test]
