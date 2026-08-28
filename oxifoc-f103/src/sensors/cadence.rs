@@ -1,13 +1,16 @@
 //! Qualification and speed measurement for the stock 24-pulse cadence sensor.
 
-pub const DEBOUNCE_SAMPLES: u8 = 4;
-pub const QUALIFYING_PULSES: u8 = 3;
-pub const MAXIMUM_LOW_MS: u32 = 400;
-pub const SLOW_TIMEOUT_MS: u32 = 500;
-pub const FAST_TIMEOUT_MS: u32 = 300;
-pub const FAST_TIMEOUT_THRESHOLD_TENTHS_KPH: u16 = 200;
-pub const PULSES_PER_REVOLUTION: u32 = 24;
-pub const MINIMUM_COMMAND_LOW_MS: u16 = 16;
+use crate::config::BIKE_CONFIG;
+
+pub const DEBOUNCE_SAMPLES: u8 = BIKE_CONFIG.cadence.debounce_milliseconds;
+pub const QUALIFYING_PULSES: u8 = BIKE_CONFIG.cadence.qualifying_pulses;
+pub const MAXIMUM_LOW_MS: u32 = BIKE_CONFIG.cadence.maximum_low_milliseconds;
+pub const SLOW_TIMEOUT_MS: u32 = BIKE_CONFIG.cadence.slow_timeout_milliseconds;
+pub const FAST_TIMEOUT_MS: u32 = BIKE_CONFIG.cadence.fast_timeout_milliseconds;
+pub const FAST_TIMEOUT_THRESHOLD_TENTHS_KPH: u16 =
+    BIKE_CONFIG.cadence.fast_timeout_threshold_kph * 10;
+pub const PULSES_PER_REVOLUTION: u32 = BIKE_CONFIG.cadence.pulses_per_revolution;
+pub const MINIMUM_COMMAND_LOW_MS: u16 = BIKE_CONFIG.cadence.full_demand_low_milliseconds;
 pub const STOCK_COMMAND_MAXIMUM: u16 = 2_500;
 pub const STOCK_COMMAND_NUMERATOR: u32 = 41_074;
 pub const STOCK_COMMAND_OFFSET: u32 = 67;

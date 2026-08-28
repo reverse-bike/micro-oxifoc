@@ -559,7 +559,7 @@ pub fn reset_summary_telemetry(snapshot: ResetSummaryTelemetry) -> Frame {
 
 /// Page 23 carries compact exception context from the preceding watchdog
 /// reset. Application addresses fit below 0x0801_0000, so their low 16 bits
-/// identify the exact instruction in this 26,200-byte image. The low 16 bits
+/// identify the exact instruction in this application image. The low 16 bits
 /// also distinguish normal link addresses from Cortex-M EXC_RETURN values.
 pub fn crash_context_telemetry(snapshot: CrashContextTelemetry) -> Frame {
     let cycle = snapshot.control_cycle.to_le_bytes();

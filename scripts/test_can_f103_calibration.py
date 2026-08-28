@@ -19,6 +19,7 @@ from can_f103_calibration import (
     arm_with_retry,
     build_hall_geometry,
     format_hall_geometry,
+    parse_hall_geometry,
     start_routine_with_retry,
     submit_stop_safely,
     validate_flux_hall_speed,
@@ -122,6 +123,31 @@ class StatusTests(unittest.TestCase):
 
 
 class HallGeometryTests(unittest.TestCase):
+    def test_source_parser_ignores_struct_field_types(self) -> None:
+        source = """
+pub struct MotorConfig {
+    pub hall_sequence: [u8; 6],
+    pub hall_boundaries_electrical_millidegrees: [u32; 6],
+    pub forward_hall_direction: i8,
+}
+pub const BIKE_CONFIG: BikeConfig = BikeConfig {
+    motor: MotorConfig {
+        hall_sequence: [5, 1, 3, 2, 6, 4],
+        hall_boundaries_electrical_millidegrees: [
+            30_125, 84_683, 145_448, 209_877, 273_384, 334_396,
+        ],
+        forward_hall_direction: -1,
+    },
+};
+"""
+        geometry = parse_hall_geometry(source)
+        self.assertEqual(geometry.electrical_states, (5, 1, 3, 2, 6, 4))
+        self.assertEqual(
+            geometry.boundaries_q16,
+            (5_484, 15_416, 26_478, 38_207, 49_768, 60_875),
+        )
+        self.assertEqual(geometry.positive_angle_direction, -1)
+
     def test_centers_compile_to_rotation_ordered_boundaries(self) -> None:
         centers = [0, 20_000, 40_000, 30_000, 60_000, 10_000, 50_000, 0]
         geometry = build_hall_geometry(centers, 0x7E, CURRENT_HALL_GEOMETRY)

@@ -1,9 +1,11 @@
-//! TIM3 capture for the PB4 wheel sensor.
+//! TIM3 CH1 capture for the configured wheel sensor.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering, compiler_fence};
 
 use super::wheel::{Capture, extended_capture_timestamp, qualified_interval_us};
+use crate::config::BIKE_CONFIG;
+use crate::hardware::gpio;
 use stm32f1::stm32f103::interrupt;
 
 const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
@@ -11,11 +13,8 @@ const RCC_APB1RSTR: *mut u32 = 0x4002_1010 as *mut u32;
 const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const RCC_APB1ENR_TIM3EN: u32 = 1 << 1;
 const RCC_APB2ENR_AFIOEN: u32 = 1;
-const RCC_APB2ENR_IOPBEN: u32 = 1 << 3;
 
 const AFIO_MAPR: *mut u32 = 0x4001_0004 as *mut u32;
-const GPIOB_CRL: *mut u32 = 0x4001_0c00 as *mut u32;
-const GPIOB_BSRR: *mut u32 = 0x4001_0c10 as *mut u32;
 const TIM3_BASE: usize = 0x4000_0400;
 const TIM3_CR1: *mut u32 = TIM3_BASE as *mut u32;
 const TIM3_DIER: *mut u32 = (TIM3_BASE + 0x0c) as *mut u32;
@@ -28,16 +27,22 @@ const TIM3_PSC: *mut u32 = (TIM3_BASE + 0x28) as *mut u32;
 const TIM3_ARR: *mut u32 = (TIM3_BASE + 0x2c) as *mut u32;
 const TIM3_CCR1: *const u32 = (TIM3_BASE + 0x34) as *const u32;
 
-const TIM3_PARTIAL_REMAP: u32 = 2 << 10;
 const TIM3_REMAP_MASK: u32 = 3 << 10;
 const SWJ_CONFIGURATION_MASK: u32 = 7 << 24;
 const SWJ_DISABLED: u32 = 4 << 24;
-const WHEEL_PIN: u32 = 4;
-const GPIO_INPUT_PULL: u32 = 0x8;
 const TIM3_UIF: u32 = 1;
 const TIM3_CC1IF: u32 = 1 << 1;
 const TIM3_CC1OF: u32 = 1 << 9;
-const TIM3_QUIET_OVERFLOWS: u32 = 13;
+const TIM3_QUIET_OVERFLOWS: u32 = BIKE_CONFIG
+    .wheel
+    .quiet_timeout_microseconds
+    .div_ceil(u16::MAX as u32 + 1);
+const _: () = assert!(
+    BIKE_CONFIG
+        .wheel
+        .quiet_timeout_microseconds
+        .is_multiple_of(u16::MAX as u32 + 1)
+);
 
 const FLAG_INITIALIZED: u32 = 1;
 const FLAG_PRIMED: u32 = 1 << 1;
@@ -53,13 +58,10 @@ static QUIET_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
 static LAST_CAPTURE_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
 
 pub fn initialize() {
-    // SAFETY: one-time TIM3, AFIO, and PB4 setup before the interrupt is
-    // unmasked. The partial remap routes CH1 to PB4.
+    // SAFETY: one-time TIM3, AFIO, and GPIO setup before the interrupt is
+    // unmasked.
     unsafe {
-        write_volatile(
-            RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_IOPBEN,
-        );
+        write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN);
         write_volatile(RCC_APB1ENR, read_volatile(RCC_APB1ENR) | RCC_APB1ENR_TIM3EN);
         write_volatile(
             RCC_APB1RSTR,
@@ -72,15 +74,10 @@ pub fn initialize() {
         write_volatile(
             AFIO_MAPR,
             (read_volatile(AFIO_MAPR) & !(TIM3_REMAP_MASK | SWJ_CONFIGURATION_MASK))
-                | TIM3_PARTIAL_REMAP
+                | crate::config::tim3_remap_bits()
                 | SWJ_DISABLED,
         );
-        let shift = WHEEL_PIN * 4;
-        write_volatile(
-            GPIOB_CRL,
-            (read_volatile(GPIOB_CRL) & !(0xf << shift)) | (GPIO_INPUT_PULL << shift),
-        );
-        write_volatile(GPIOB_BSRR, 1 << WHEEL_PIN);
+        gpio::configure_pull_up_input(BIKE_CONFIG.pins.wheel_speed);
 
         write_volatile(TIM3_CR1, 0);
         write_volatile(TIM3_PSC, 71);

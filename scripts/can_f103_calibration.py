@@ -124,17 +124,7 @@ class HallGeometry:
     positive_angle_direction: int
 
 
-def load_hall_geometry(path: Path) -> HallGeometry:
-    source = path.read_text()
-    match = re.search(
-        r"pub static HALL_GEOMETRY:\s*HallGeometry\s*=\s*HallGeometry::new\("
-        r"\s*\[([^]]+)\],\s*\[([^]]+)\],\s*(-?1)\s*,?\s*\)",
-        source,
-        re.DOTALL,
-    )
-    if match is None:
-        raise CalibrationError(f"could not read HALL_GEOMETRY from {path}")
-
+def parse_hall_geometry(source: str, origin: object = "BikeConfig source") -> HallGeometry:
     def integers(value: str) -> tuple[int, ...]:
         return tuple(
             int(part.strip().replace("_", ""))
@@ -142,10 +132,38 @@ def load_hall_geometry(path: Path) -> HallGeometry:
             if part.strip()
         )
 
-    geometry = HallGeometry(integers(match[1]), integers(match[2]), int(match[3]))
+    configured = re.search(
+        r"pub const BIKE_CONFIG:\s*BikeConfig\s*=\s*BikeConfig\s*\{(.*?)\n\};",
+        source,
+        re.DOTALL,
+    )
+    if configured is None:
+        raise CalibrationError(f"could not read BikeConfig initializer from {origin}")
+    body = configured[1]
+    sequence = re.search(r"hall_sequence:\s*\[([^]]+)\]", body, re.DOTALL)
+    boundaries = re.search(
+        r"hall_boundaries_electrical_millidegrees:\s*\[([^]]+)\]",
+        body,
+        re.DOTALL,
+    )
+    direction = re.search(r"forward_hall_direction:\s*(-?1)\s*,", body)
+    if sequence is None or boundaries is None or direction is None:
+        raise CalibrationError(f"could not read BikeConfig Hall geometry from {origin}")
+
+    boundaries_q16 = tuple(
+        (millidegrees * 65_536 + 180_000) // 360_000
+        for millidegrees in integers(boundaries[1])
+    )
+    geometry = HallGeometry(
+        integers(sequence[1]), boundaries_q16, int(direction[1])
+    )
     if len(geometry.electrical_states) != 6 or len(geometry.boundaries_q16) != 6:
-        raise CalibrationError(f"invalid HALL_GEOMETRY in {path}")
+        raise CalibrationError(f"invalid BikeConfig Hall geometry in {origin}")
     return geometry
+
+
+def load_hall_geometry(path: Path) -> HallGeometry:
+    return parse_hall_geometry(path.read_text(), path)
 
 
 CURRENT_HALL_GEOMETRY = load_hall_geometry(

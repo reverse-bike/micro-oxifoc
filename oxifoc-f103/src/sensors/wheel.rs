@@ -1,7 +1,9 @@
 //! Wheel-pulse qualification for stock speed, distance, and updater safety.
 
-pub const DISTANCE_PER_PULSE_MM: u16 = 312;
-pub const MINIMUM_INTERVAL_US: u32 = 1_000;
+use crate::config::BIKE_CONFIG;
+
+pub const DISTANCE_PER_PULSE_MM: u16 = BIKE_CONFIG.wheel.distance_per_pulse_millimeters;
+pub const MINIMUM_INTERVAL_US: u32 = BIKE_CONFIG.wheel.minimum_interval_microseconds;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capture {

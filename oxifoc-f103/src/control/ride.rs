@@ -1,15 +1,16 @@
 //! Local ride-demand authority and Hall-progress lifecycle.
 
-use crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS;
+use crate::config::{BIKE_CONFIG, RIDE_PHASE_CURRENT_LIMIT_COUNTS};
 use crate::sensors::throttle::{Demand, Observation as ThrottleObservation};
 
-pub const OUTPUT_LEASE_CYCLES: u32 = 160;
-pub const STARTUP_HALL_TIMEOUT_MS: u32 = 500;
-pub const STARTUP_TIMEOUT_MS: u32 = 2_000;
-pub const STARTUP_FORWARD_TRANSITIONS: i32 = 12;
-pub const MINIMUM_HALL_TIMEOUT_MS: u32 = 100;
-pub const MAXIMUM_HALL_TIMEOUT_MS: u32 = 500;
-pub const HALL_ENTRY_MAXIMUM_ERPM: u32 = 2_500;
+pub const OUTPUT_LEASE_CYCLES: u32 =
+    BIKE_CONFIG.ride.command_lease_milliseconds * crate::config::PWM_HZ / 1_000;
+pub const STARTUP_HALL_TIMEOUT_MS: u32 = BIKE_CONFIG.ride.startup_first_hall_timeout_milliseconds;
+pub const STARTUP_TIMEOUT_MS: u32 = BIKE_CONFIG.ride.startup_timeout_milliseconds;
+pub const STARTUP_FORWARD_TRANSITIONS: i32 = BIKE_CONFIG.ride.startup_forward_hall_transitions;
+pub const MINIMUM_HALL_TIMEOUT_MS: u32 = BIKE_CONFIG.ride.minimum_running_hall_timeout_milliseconds;
+pub const MAXIMUM_HALL_TIMEOUT_MS: u32 = BIKE_CONFIG.ride.maximum_running_hall_timeout_milliseconds;
+pub const HALL_ENTRY_MAXIMUM_ERPM: u32 = BIKE_CONFIG.ride.maximum_entry_electrical_rpm;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]

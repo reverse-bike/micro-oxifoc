@@ -1,23 +1,32 @@
 //! Local voltage and temperature conversion plus the ride-current envelope.
 
 use crate::config::{
-    PWM_ARR, RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_DURATION_MS,
+    BIKE_CONFIG, PWM_ARR, RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_DURATION_MS,
     RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR,
+    VBUS_MILLIVOLTS_Q10_PER_COUNT,
 };
 
 pub const UPDATE_PERIOD_MS: u32 = 50;
-pub const DC_BUS_UNDERVOLTAGE_MV: u32 = 39_000;
-pub const DC_BUS_UNDERVOLTAGE_SAMPLES: u8 = 20;
-const CONTROLLER_DERATE_START_DECI_C: i16 = 700;
-const CONTROLLER_STOP_DECI_C: i16 = 800;
-const MOTOR_DERATE_START_DECI_C: i16 = 1_000;
-const MOTOR_STOP_DECI_C: i16 = 1_300;
+pub const DC_BUS_UNDERVOLTAGE_MV: u32 = BIKE_CONFIG.battery.minimum_bus_voltage_millivolts;
+pub const DC_BUS_UNDERVOLTAGE_SAMPLES: u8 =
+    (BIKE_CONFIG.battery.undervoltage_debounce_milliseconds / UPDATE_PERIOD_MS) as u8;
+const CONTROLLER_DERATE_START_DECI_C: i16 =
+    BIKE_CONFIG.thermal.controller_derate_start_celsius * 10;
+const CONTROLLER_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.controller_stop_celsius * 10;
+const MOTOR_DERATE_START_DECI_C: i16 = BIKE_CONFIG.thermal.motor_derate_start_celsius * 10;
+const MOTOR_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.motor_stop_celsius * 10;
 const TRANSIENT_BUDGET_SAMPLES: u16 = (RIDE_DC_BUS_TRANSIENT_DURATION_MS / UPDATE_PERIOD_MS) as u16;
 const TRANSIENT_BUDGET_CAPACITY: u16 = (RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
     - RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
     * TRANSIENT_BUDGET_SAMPLES;
 
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS.is_multiple_of(UPDATE_PERIOD_MS));
+const _: () = assert!(
+    BIKE_CONFIG
+        .battery
+        .undervoltage_debounce_milliseconds
+        .is_multiple_of(UPDATE_PERIOD_MS)
+);
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS <= u16::MAX as u32);
 const _: () = assert!(TRANSIENT_BUDGET_CAPACITY > 0);
 
@@ -185,7 +194,7 @@ impl Default for EnvironmentMonitor {
 }
 
 pub fn bus_voltage_mv(raw: u16) -> u32 {
-    u32::from(raw).saturating_mul(18_975) >> 10
+    (u32::from(raw) * VBUS_MILLIVOLTS_Q10_PER_COUNT) >> 10
 }
 
 /// Project motor-terminal input current from a coherent foreground copy of

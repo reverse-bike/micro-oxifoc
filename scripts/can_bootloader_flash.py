@@ -34,7 +34,7 @@ HEARTBEAT_ID = 0x77F
 IDENTITY_ID = 0x211
 
 APPLICATION_BASE = 0x0800_3800
-APPLICATION_BYTES = 26_200
+APPLICATION_BYTES = 29_396
 APPLICATION_SLOT_BYTES = 0xC800
 SRAM_BASE = 0x2000_0000
 SRAM_END = 0x2000_5000
@@ -445,7 +445,7 @@ def default_log_path() -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "image", type=Path, help="26,200-byte controller flash-region bin"
+        "image", type=Path, help="29,396-byte controller flash-region bin"
     )
     parser.add_argument("--interface", default="gs_usb")
     parser.add_argument("--channel", default="0")

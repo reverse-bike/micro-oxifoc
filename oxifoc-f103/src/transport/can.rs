@@ -1,6 +1,7 @@
 //! Poll-free bxCAN transport for the required stock-bike interface.
 
-use crate::hardware::peripherals;
+use crate::config::BIKE_CONFIG;
+use crate::hardware::{gpio, peripherals};
 use crate::protocol::Frame;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +10,6 @@ const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
 const RCC_APB1RSTR: *mut u32 = 0x4002_1010 as *mut u32;
 const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const AFIO_MAPR: *mut u32 = 0x4001_0004 as *mut u32;
-const GPIOA_CRH: *mut u32 = 0x4001_0804 as *mut u32;
-const GPIOA_BRR: *mut u32 = 0x4001_0814 as *mut u32;
 
 const CAN_BASE: usize = 0x4000_6400;
 const CAN_MCR: *mut u32 = CAN_BASE as *mut u32;
@@ -31,7 +30,10 @@ const CAN_F1R1: *mut u32 = (CAN_BASE + 0x248) as *mut u32;
 const CAN_F1R2: *mut u32 = (CAN_BASE + 0x24c) as *mut u32;
 
 const CAN_INIT_TIMEOUT: u32 = 1_000_000;
-const CAN_BTR_250K: u32 = (0b10 << 20) | (0b111 << 16) | 11;
+const CAN_BTR_CONFIG: u32 = ((crate::config::CAN_BS2_TQ as u32 - 1) << 20)
+    | ((crate::config::CAN_BS1_TQ as u32 - 1) << 16)
+    | (crate::config::CAN_SJW_TQ as u32 - 1) << 24
+    | (crate::config::CAN_PRESCALER as u32 - 1);
 const CAN_RESET_REQUEST: u32 = 1;
 const CAN_RESET_ACK: u32 = 1;
 const CAN_FIFO_PENDING_INTERRUPT: u32 = 1 << 1;
@@ -51,17 +53,19 @@ impl BxCan {
     pub fn initialize(filters: FilterConfig) -> bool {
         // SAFETY: one-time peripheral setup before CAN IRQ is unmasked.
         unsafe {
-            write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | 0b1101);
+            write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | 1);
             write_volatile(RCC_APB1ENR, read_volatile(RCC_APB1ENR) | (1 << 25));
             write_volatile(RCC_APB1RSTR, read_volatile(RCC_APB1RSTR) | (1 << 25));
             write_volatile(RCC_APB1RSTR, read_volatile(RCC_APB1RSTR) & !(1 << 25));
 
-            let crh = read_volatile(GPIOA_CRH) & !((0xf << 12) | (0xf << 16) | (0xf << 20));
-            write_volatile(GPIOA_BRR, 1 << 13);
-            write_volatile(GPIOA_CRH, crh | (0x4 << 12) | (0xb << 16) | (0x3 << 20));
+            gpio::configure(BIKE_CONFIG.pins.can.rx, gpio::FLOATING_INPUT);
+            gpio::configure(BIKE_CONFIG.pins.can.tx, gpio::ALTERNATE_PUSH_PULL_50MHZ);
+            gpio::configure_output(BIKE_CONFIG.pins.can.transceiver_enable, true);
             write_volatile(
                 AFIO_MAPR,
-                (read_volatile(AFIO_MAPR) & !(0b111 << 24)) | (0b100 << 24),
+                (read_volatile(AFIO_MAPR) & !((0b111 << 24) | (0b11 << 13)))
+                    | (0b100 << 24)
+                    | crate::config::can_remap_bits(),
             );
 
             write_volatile(CAN_MCR, CAN_RESET_REQUEST);
@@ -69,7 +73,7 @@ impl BxCan {
                 return false;
             }
             write_volatile(CAN_MCR, CAN_RESET_REQUEST | (1 << 6) | (1 << 2));
-            write_volatile(CAN_BTR, CAN_BTR_250K);
+            write_volatile(CAN_BTR, CAN_BTR_CONFIG);
 
             write_volatile(CAN_FMR, read_volatile(CAN_FMR) | 1);
             match filters {

@@ -1,10 +1,19 @@
-use crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS;
+use crate::config::{BIKE_CONFIG, RIDE_PHASE_CURRENT_LIMIT_COUNTS};
 
-pub const PLAUSIBLE_LOW_ADC: u16 = 250;
-pub const REST_ADC: u16 = 726;
-pub const REST_MAX_ADC: u16 = 850;
-pub const FULL_ADC: u16 = 3_252;
-pub const PLAUSIBLE_HIGH_ADC: u16 = 3_750;
+const fn adc_counts_from_microvolts(microvolts: u32) -> u16 {
+    ((microvolts as u64 * BIKE_CONFIG.sensors.adc_levels as u64
+        + BIKE_CONFIG.sensors.adc_reference_microvolts as u64 / 2)
+        / BIKE_CONFIG.sensors.adc_reference_microvolts as u64) as u16
+}
+
+pub const PLAUSIBLE_LOW_ADC: u16 =
+    adc_counts_from_microvolts(BIKE_CONFIG.throttle.plausible_minimum_microvolts);
+pub const REST_ADC: u16 = adc_counts_from_microvolts(BIKE_CONFIG.throttle.rest_microvolts);
+pub const REST_MAX_ADC: u16 =
+    adc_counts_from_microvolts(BIKE_CONFIG.throttle.rest_maximum_microvolts);
+pub const FULL_ADC: u16 = adc_counts_from_microvolts(BIKE_CONFIG.throttle.full_scale_microvolts);
+pub const PLAUSIBLE_HIGH_ADC: u16 =
+    adc_counts_from_microvolts(BIKE_CONFIG.throttle.plausible_maximum_microvolts);
 pub const MAXIMUM_DEMAND_PERCENT: u8 = 100;
 
 const _: () = assert!(PLAUSIBLE_LOW_ADC <= REST_ADC);

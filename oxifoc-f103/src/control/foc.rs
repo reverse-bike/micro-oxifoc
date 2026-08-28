@@ -21,8 +21,6 @@ const CONTROL_VOLTAGE_LIMITED: u32 = 1 << 3;
 const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
 const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
-// One IIR step per 1/32 of the error gives the 2 ms bus-modulation filter at 16 kHz.
-const BUS_MODULATION_FILTER_SHIFT: u8 = 5;
 
 type RideDecoupling = NoDecoupling;
 type RideFocController = FixedFocController<
@@ -707,7 +705,7 @@ const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> RideFocDriver {
         phase,
         ride_current_limits(),
         crate::config::PWM_ARR,
-        BUS_MODULATION_FILTER_SHIFT,
+        crate::config::DC_LINK_CURRENT_FILTER_SHIFT,
     )
     .with_observer_scales(Fixed::ZERO, crate::config::PHASE_CURRENT_AMPS_PER_ADC_COUNT)
     .with_field_weakening(FieldWeakening::new(

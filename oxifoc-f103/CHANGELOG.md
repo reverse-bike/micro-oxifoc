@@ -6,6 +6,34 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.10.0 - 2026-08-26
+
+Changes:
+
+- Added one unified `BikeConfig` for the motor model, sensor scaling, inverter,
+  current control, observer, field weakening, battery and thermal envelopes,
+  ride lifecycle, rider inputs, wheel, CAN timing, and controller pin map. Its
+  tuning values use named engineering units; the existing ADC-count, PWM-tick,
+  fixed-point, and register constants are now derived from it.
+- Replaced fixed PA/PB/PC GPIO operations with a small STM32F103 GPIO layer that
+  consumes the configured pins. Compile-time checks validate pin uniqueness,
+  ADC channel mappings, and supported TIM1, TIM2, TIM3, and bxCAN remaps before
+  an image can be built.
+- Expanded the linked and padded ride/calibration application region from
+  26,200 to 29,396 bytes (`0x08003800..0x0800AAD4`), matching the updater
+  metadata successfully exercised by the 0.9.0 BLE package.
+- Added a post-link ride-firmware check that rejects ARM EABI and compiler
+  runtime helpers for 64-bit division or remainder. Compile-time wide
+  arithmetic remains available for deriving fixed-point coefficients without
+  allowing another expensive runtime helper to enter the control image.
+
+Reason: tuning and adapting another STM32F103 controller should require editing
+one physical configuration instead of locating count-domain constants and pin
+register literals throughout the firmware. Deriving the low-level values keeps
+the 16 kHz fixed-point implementation efficient while const assertions retain
+the safety relationships. The larger validated region provides the space for
+that interface without weakening runtime RAM or retained-fault boundaries.
+
 ## 0.9.0 - 2026-08-26
 
 Changes:

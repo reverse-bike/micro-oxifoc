@@ -20,12 +20,21 @@ check-f103:
     command cargo fmt --check
     command cargo test --target "$host_triple"
     command cargo clippy --release --features firmware -- -D warnings
-    command cargo build --release --features firmware
+    # Keep symbols for the post-link architecture checks. Debug/symbol sections
+    # are not allocated into the flashed image.
+    command cargo rustc --release --features firmware --bin oxifoc-f103 -- -C strip=none
     llvm_objdump="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objdump"
-    read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h ../target/thumbv7m-none-eabi/release/oxifoc-f103 | command awk '$2 == ".retained" { print $3, $4, $5 }')"
+    llvm_nm="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-nm"
+    elf=../target/thumbv7m-none-eabi/release/oxifoc-f103
+    read -r retained_size retained_address retained_type <<< "$(command "$llvm_objdump" -h "$elf" | command awk '$2 == ".retained" { print $3, $4, $5 }')"
     test "$retained_address" = 20004f00
     test "$retained_type" = BSS
     test "$((16#$retained_size))" -le 256
+    forbidden_wide_helpers="$(command "$llvm_nm" --defined-only --just-symbol-name "$elf" | command grep -E '^(__aeabi_uldivmod|__aeabi_ldivmod|__udivmoddi4|__divmoddi4|__udivdi3|__divdi3|__umoddi3|__moddi3)$' || true)"
+    if [[ -n "$forbidden_wide_helpers" ]]; then
+        printf 'ride firmware links forbidden 64-bit division/remainder helpers:\n%s\n' "$forbidden_wide_helpers" >&2
+        exit 1
+    fi
 
 check-f103-calibration:
     #!/usr/bin/env bash
@@ -69,7 +78,7 @@ build-f103-calibration:
     cd oxifoc-f103-calibration
     command cargo build --profile calibration --features firmware
 
-# Build the exact 26,200-byte image consumed by the resident CAN bootloader.
+# Build the exact 29,396-byte image accepted by the installed updater metadata.
 image-f103: build-f103
     #!/usr/bin/env bash
     set -euo pipefail
@@ -77,11 +86,11 @@ image-f103: build-f103
     llvm_objcopy="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objcopy"
     elf=target/thumbv7m-none-eabi/release/oxifoc-f103
     image="$elf.flash-region.bin"
-    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x08009e58 "$elf" "$image"
-    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
-    echo "$image: 26,200 bytes"
+    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x0800aad4 "$elf" "$image"
+    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 29396
+    echo "$image: 29,396 bytes"
 
-# Build the exact 26,200-byte calibration image consumed by the CAN bootloader.
+# Build the exact 29,396-byte calibration image accepted by the installed updater metadata.
 image-f103-calibration: build-f103-calibration
     #!/usr/bin/env bash
     set -euo pipefail
@@ -89,9 +98,9 @@ image-f103-calibration: build-f103-calibration
     llvm_objcopy="$(command rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-objcopy"
     elf=target/thumbv7m-none-eabi/calibration/oxifoc-f103-calibration
     image="$elf.flash-region.bin"
-    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x08009e58 "$elf" "$image"
-    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 26200
-    echo "$image: 26,200 bytes"
+    command "$llvm_objcopy" -O binary --gap-fill=0xff --pad-to=0x0800aad4 "$elf" "$image"
+    test "$(command wc -c < "$image" | command tr -d ' ')" -eq 29396
+    echo "$image: 29,396 bytes"
 
 # With no arguments this validates only. Pass --yes to transmit and install.
 flash-f103 *ARGS: image-f103

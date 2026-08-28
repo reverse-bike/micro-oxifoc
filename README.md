@@ -55,7 +55,7 @@ The pinned Rust nightly includes the thumbv7m-none-eabi target and LLVM tools.
     just image-f103-calibration
 
 Both application images are linked at 0x08003800 and padded to the exact
-26,200-byte application region expected by the resident bootloader.
+29,396-byte application region accepted by the installed updater metadata.
 
 The flash commands are dry runs unless --yes is passed:
 

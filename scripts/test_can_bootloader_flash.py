@@ -44,7 +44,7 @@ class FirmwareValidationTests(unittest.TestCase):
         self.assertEqual(image.crc16, crc16_xmodem(valid_image()))
 
     def test_rejects_nonstandard_length(self) -> None:
-        with self.assertRaisesRegex(FirmwareValidationError, "26,200"):
+        with self.assertRaisesRegex(FirmwareValidationError, "29,396"):
             validate_firmware(valid_image()[:-1])
 
     def test_rejects_a_non_thumb_reset_vector(self) -> None:

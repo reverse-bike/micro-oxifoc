@@ -2,7 +2,7 @@
 
 `oxifoc-f103` is the isolated STM32F103 application for the recovered S73
 controller. It is linked at `0x08003800` for the resident CAN bootloader and is
-hard-limited to a 26,200-byte application image and 4 KiB of linked RAM.
+hard-limited to a 29,396-byte application image and 4 KiB of linked RAM.
 
 The firmware has no async executor, allocator, floating-point operations, or
 non-CAN communication stack. The 16 kHz loop uses ADC-count and PWM-tick
@@ -19,9 +19,8 @@ split keeps reusable synchronous control logic out of the device crate:
   CORDIC, SVPWM, target slew, `HallSensor`, `BackEmfObserver`, and the phase
   provider/manager interfaces. These live in OxiFOC's canonical modules rather
   than a parallel F103 algorithm tree.
-- `oxifoc-f103` owns the recovered pin map, direct register access, interrupt
-  scheduling, board-specific gains and limits, ride safety, local inputs, and
-  stock-bike CAN.
+- `oxifoc-f103` owns the unified physical bike configuration, direct register
+  access, interrupt scheduling, ride safety, local inputs, and stock-bike CAN.
 
 The package exposes that device layer through its additive `board` feature.
 The sibling [`oxifoc-f103-calibration`](../oxifoc-f103-calibration/README.md)
@@ -37,11 +36,12 @@ synchronous:
 ```text
 src/
 ├── app.rs                 foreground ride application and owned state
-├── config.rs              board constants, limits, and Hall geometry
+├── config.rs              physical BikeConfig and derived F103 constants
 ├── control/
 │   ├── foc.rs             TIM1 current-control interrupt
 │   └── ride.rs            local ride state machine
 ├── hardware/
+│   ├── gpio.rs            pin-map-driven STM32F103 GPIO access
 │   └── peripherals.rs     clocks and raw STM32F103 peripheral access
 ├── protocol/mod.rs        pure stock/project CAN frame encoding
 ├── sensors/
@@ -70,6 +70,29 @@ minor version; bug fixes bump the patch version. Validation-only builds do not
 bump the version. Page 18 of project telemetry reports the crate version
 embedded in the running image so ride logs remain attributable.
 
+## Bike configuration
+
+[`BIKE_CONFIG`](src/config.rs) is the single adaptation and tuning surface. It
+groups the motor model, current sensing, inverter timing, current loop,
+observer crossover, field weakening, battery envelope, thermal limits, ride
+startup, throttle, cadence, wheel, CAN, and complete controller pin map. Its
+numeric fields are expressed in named engineering units such as milliohms,
+microhenries, milliamps, microvolts, electrical RPM, degrees Celsius, and
+milliseconds. ADC counts, PWM ticks, Q16 values, timer periods, and CAN timing
+registers are derived implementation details.
+
+The `PinMap` names both pins and ADC channels. GPIO access consumes it directly;
+compile-time validation checks pin numbers and uniqueness, STM32F103 ADC
+channel assignments, and the selected TIM1, TIM2, TIM3, and bxCAN remap. The
+supported timer routes cover the legal STM32F103 remaps rather than assuming
+this board's PA/PB/PC layout throughout the drivers.
+
+Const assertions also reject inconsistent current envelopes, non-representable
+current thresholds, an invalid Hall table, unsafe modulation limits, impossible
+thermal bands, malformed throttle ranges, and CAN timing that does not divide
+the peripheral clock exactly. Changing a physical value therefore either
+produces one coherent set of fixed-point/register constants or fails the build.
+
 Recovered firmware establishes the hardware map, peripheral timing, Hall
 geometry, and reviewed electrical envelope. Ride telemetry supplies the
 effective loaded motor model where the recovered constants and physical sensor
@@ -78,8 +101,8 @@ follow OxiFOC's control architecture.
 
 The shared controller applies OxiFOC's current-sign dead-time compensation
 after inverse Park and actuation-frame advance, immediately before SVPWM. The
-hardware's 25 CKD-divided dead-time ticks are represented as 50/3 controller
-phase-voltage ticks. Commanded stationary voltage remains uncompensated, as in
+configured 694 ns dead time derives both the 25 CKD-divided hardware ticks and
+approximately 16.66 controller phase-voltage ticks. Commanded stationary voltage remains uncompensated, as in
 the original architecture, because the bridge correction makes applied
 voltage track that command for the observer.
 

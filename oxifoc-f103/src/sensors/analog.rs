@@ -5,23 +5,14 @@ use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
+use crate::config::BIKE_CONFIG;
+use crate::hardware::gpio;
+
 use super::inputs::DebouncedActiveLow;
 use super::throttle::Observation;
 
 const RCC_AHBENR: *mut u32 = 0x4002_1014 as *mut u32;
-const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const RCC_AHBENR_DMA1EN: u32 = 1;
-const RCC_APB2ENR_IOPAEN: u32 = 1 << 2;
-const RCC_APB2ENR_IOPBEN: u32 = 1 << 3;
-const RCC_APB2ENR_IOPCEN: u32 = 1 << 4;
-
-const GPIOA_CRL: *mut u32 = 0x4001_0800 as *mut u32;
-const GPIOB_CRL: *mut u32 = 0x4001_0c00 as *mut u32;
-const GPIOC_CRL: *mut u32 = 0x4001_1000 as *mut u32;
-const GPIOC_IDR: *const u32 = 0x4001_1008 as *const u32;
-const GPIOC_BSRR: *mut u32 = 0x4001_1010 as *mut u32;
-const BRAKE_PIN: u32 = 4;
-const GPIO_INPUT_PULL: u32 = 0x8;
 
 const ADC1_BASE: usize = 0x4001_2400;
 const ADC_CR1: *mut u32 = (ADC1_BASE + 0x04) as *mut u32;
@@ -58,7 +49,7 @@ const DMA_CLEAR_CHANNEL_1: u32 = 0x0f;
 
 const SAMPLE_COUNT: usize = crate::config::REGULAR_ADC_CHANNELS.len();
 const ANALOG_SAMPLE_PERIOD_MS: u32 = 10;
-const BRAKE_DEBOUNCE_SAMPLES: u8 = 4;
+const BRAKE_DEBOUNCE_SAMPLES: u8 = BIKE_CONFIG.ride.brake_debounce_milliseconds;
 const INITIAL_SCAN_WAIT: u32 = 100_000;
 
 #[repr(align(4))]
@@ -192,23 +183,17 @@ fn publish(readings: AnalogReadings, now_ms: u32) {
 }
 
 fn configure_input_pins() {
-    // SAFETY: fixed STM32F103 GPIO/RCC registers, configured once at startup.
+    // SAFETY: configured once at startup before the inputs are sampled.
     unsafe {
-        write_volatile(
-            RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR)
-                | RCC_APB2ENR_IOPAEN
-                | RCC_APB2ENR_IOPBEN
-                | RCC_APB2ENR_IOPCEN,
-        );
-
-        write_volatile(GPIOA_CRL, read_volatile(GPIOA_CRL) & !(0xf << (5 * 4)));
-        write_volatile(GPIOB_CRL, read_volatile(GPIOB_CRL) & !0xf);
-        let mut gpioc = read_volatile(GPIOC_CRL);
-        gpioc &= !((0xf << (3 * 4)) | (0xf << (4 * 4)) | (0xf << (5 * 4)));
-        gpioc |= GPIO_INPUT_PULL << (4 * 4);
-        write_volatile(GPIOC_CRL, gpioc);
-        write_volatile(GPIOC_BSRR, 1 << BRAKE_PIN);
+        for input in [
+            BIKE_CONFIG.pins.motor_temperature,
+            BIKE_CONFIG.pins.throttle,
+            BIKE_CONFIG.pins.bus_voltage,
+            BIKE_CONFIG.pins.auxiliary_analog,
+        ] {
+            gpio::configure(input.pin, gpio::ANALOG_INPUT);
+        }
+        gpio::configure_pull_up_input(BIKE_CONFIG.pins.brake);
     }
 }
 
@@ -329,6 +314,6 @@ fn sample_analog(initialized: bool) -> AnalogReadings {
 }
 
 fn brake_pin_is_low() -> bool {
-    // SAFETY: read-only access to GPIOC input data.
-    unsafe { read_volatile(GPIOC_IDR) & (1 << BRAKE_PIN) == 0 }
+    // SAFETY: read-only access to the configured GPIO input.
+    unsafe { !gpio::read(BIKE_CONFIG.pins.brake) }
 }

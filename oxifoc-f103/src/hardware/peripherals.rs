@@ -1,14 +1,16 @@
 //! Minimal, fail-closed STM32F103 register bring-up.
 //!
-//! No motor output is configured here. The first operation enables GPIOA and
-//! drives PA2 high, which disables the active-low power stage before TIM1,
-//! ADC, or Hall peripherals are touched.
+//! No motor output is configured here. The first operation drives the
+//! configured power-stage enable inactive before TIM1, ADC, or Hall
+//! peripherals are touched.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use oxifoc_core::foc::PwmDuty;
 use stm32f1::stm32f103::interrupt;
 
+use crate::config::BIKE_CONFIG;
+use crate::hardware::gpio;
 use crate::safety::{PwmFailureContext, pwm_failure_cause as pwm_cause, pwm_pin_flag as pwm_pin};
 
 const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
@@ -44,29 +46,13 @@ const RCC_CFGR_STATUS_PLL: u32 = 0b10 << 2;
 const FLASH_ACR_72MHZ: u32 = (1 << 4) | 0b010;
 const CLOCK_WAIT_ITERATIONS: u32 = 1_000_000;
 
-const RCC_APB2ENR_IOPAEN: u32 = 1 << 2;
 const RCC_APB2ENR_AFIOEN: u32 = 1;
-const RCC_APB2ENR_IOPBEN: u32 = 1 << 3;
-const RCC_APB2ENR_IOPCEN: u32 = 1 << 4;
 const RCC_APB2ENR_ADC1EN: u32 = 1 << 9;
 const RCC_APB2ENR_ADC2EN: u32 = 1 << 10;
 const RCC_APB2ENR_TIM1EN: u32 = 1 << 11;
 const RCC_APB1ENR_TIM2EN: u32 = 1;
 
-const GPIOA_CRL: *mut u32 = 0x4001_0800 as *mut u32;
-const GPIOA_CRH: *mut u32 = 0x4001_0804 as *mut u32;
-const GPIOA_IDR: *const u32 = 0x4001_0808 as *const u32;
-const GPIOA_ODR: *const u32 = 0x4001_080c as *const u32;
-const GPIOA_BSRR: *mut u32 = 0x4001_0810 as *mut u32;
 const AFIO_MAPR: *mut u32 = 0x4001_0004 as *mut u32;
-const GPIOB_CRL: *mut u32 = 0x4001_0c00 as *mut u32;
-const GPIOB_CRH: *mut u32 = 0x4001_0c04 as *mut u32;
-const GPIOB_IDR: *const u32 = 0x4001_0c08 as *const u32;
-const GPIOB_BSRR: *mut u32 = 0x4001_0c10 as *mut u32;
-const GPIOC_CRL: *mut u32 = 0x4001_1000 as *mut u32;
-const PA2_CONFIG_MASK: u32 = 0b1111 << 8;
-const PA2_OUTPUT_PUSH_PULL_2MHZ: u32 = 0b0010 << 8;
-const PA2_SET: u32 = 1 << 2;
 
 const TIM1_CR1: *mut u32 = 0x4001_2c00 as *mut u32;
 const TIM1_CR2: *mut u32 = 0x4001_2c04 as *mut u32;
@@ -86,9 +72,6 @@ const TIM1_CCR3: *mut u32 = 0x4001_2c3c as *mut u32;
 const TIM1_CCR4: *mut u32 = 0x4001_2c40 as *mut u32;
 const TIM1_BDTR: *mut u32 = 0x4001_2c44 as *mut u32;
 
-const PWM_PIN_AF_PUSH_PULL_50MHZ: u32 = 0b1011;
-const BREAK_PIN_INPUT_PULL: u32 = 0b1000;
-const HALL_PIN_INPUT_FLOATING: u32 = 0b0100;
 const TIM1_CENTER_ALIGNED_MODE_3: u32 = 0b11 << 5;
 const TIM1_AUTO_RELOAD_PRELOAD: u32 = 1 << 7;
 const TIM1_CLOCK_DIVISION_2: u32 = 0b01 << 8;
@@ -173,16 +156,9 @@ pub const FAULT_CONTROL_TIMING: u32 = 1 << 3;
 /// Establishes the hardware invariant that the active-low power stage is
 /// disabled. This is idempotent and must precede every other peripheral init.
 pub fn disable_power_stage() {
-    // SAFETY: these fixed addresses are the STM32F103 RCC and GPIOA registers;
-    // this function runs once during reset before interrupts are enabled.
+    // SAFETY: this runs once during reset before interrupts are enabled.
     unsafe {
-        write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | RCC_APB2ENR_IOPAEN);
-        let crl = read_volatile(GPIOA_CRL);
-        write_volatile(
-            GPIOA_CRL,
-            (crl & !PA2_CONFIG_MASK) | PA2_OUTPUT_PUSH_PULL_2MHZ,
-        );
-        write_volatile(GPIOA_BSRR, PA2_SET);
+        gpio::configure_output(BIKE_CONFIG.pins.inverter.power_stage_enable, false);
     }
 }
 
@@ -199,11 +175,7 @@ pub fn emergency_shutdown() {
     // break independently clears MOE before software reaches this function.
     unsafe {
         configure_inert_motor_pins();
-        write_volatile(GPIOA_BSRR, PA2_SET);
-        write_volatile(
-            GPIOA_CRL,
-            (read_volatile(GPIOA_CRL) & !PA2_CONFIG_MASK) | PA2_OUTPUT_PUSH_PULL_2MHZ,
-        );
+        gpio::configure_output(BIKE_CONFIG.pins.inverter.power_stage_enable, false);
         write_volatile(
             TIM1_BDTR,
             read_volatile(TIM1_BDTR) & !TIM1_MAIN_OUTPUT_ENABLE,
@@ -311,11 +283,7 @@ pub fn configure_tim1_passive() {
     unsafe {
         write_volatile(
             RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR)
-                | RCC_APB2ENR_AFIOEN
-                | RCC_APB2ENR_IOPAEN
-                | RCC_APB2ENR_IOPBEN
-                | RCC_APB2ENR_TIM1EN,
+            read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_TIM1EN,
         );
         write_volatile(
             RCC_APB2RSTR,
@@ -326,10 +294,11 @@ pub fn configure_tim1_passive() {
             read_volatile(RCC_APB2RSTR) & !RCC_APB2ENR_TIM1EN,
         );
 
-        let mut gpiob_crh = read_volatile(GPIOB_CRH);
-        gpiob_crh = (gpiob_crh & !(0b1111 << 16)) | (BREAK_PIN_INPUT_PULL << 16);
-        write_volatile(GPIOB_CRH, gpiob_crh);
-        write_volatile(GPIOB_BSRR, 1 << 12);
+        write_volatile(
+            AFIO_MAPR,
+            (read_volatile(AFIO_MAPR) & !(0b11 << 6)) | crate::config::tim1_remap_bits(),
+        );
+        gpio::configure_pull_up_input(BIKE_CONFIG.pins.inverter.hardware_break);
         configure_inert_motor_pins();
 
         write_volatile(
@@ -362,7 +331,7 @@ pub fn configure_tim1_passive() {
         // The validated board firmware keeps this active after passive timer
         // setup. Normal stops use TIM1 channel gating and inert GPIO modes;
         // fatal shutdown still raises PA2 independently.
-        write_volatile(GPIOA_BSRR, 1 << 18);
+        gpio::set_output_active(BIKE_CONFIG.pins.inverter.power_stage_enable, true);
     }
 }
 
@@ -381,25 +350,16 @@ pub fn configure_hall_capture() {
             RCC_APB1RSTR,
             read_volatile(RCC_APB1RSTR) & !RCC_APB1ENR_TIM2EN,
         );
-        write_volatile(
-            RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR)
-                | RCC_APB2ENR_AFIOEN
-                | RCC_APB2ENR_IOPAEN
-                | RCC_APB2ENR_IOPBEN,
-        );
+        write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN);
 
         let mapr = read_volatile(AFIO_MAPR) & !((0b111 << 24) | (0b11 << 8));
-        write_volatile(AFIO_MAPR, mapr | (0b100 << 24) | (0b11 << 8));
-
-        let gpioa = (read_volatile(GPIOA_CRH) & !(0b1111 << 28)) | (HALL_PIN_INPUT_FLOATING << 28);
-        write_volatile(GPIOA_CRH, gpioa);
-        let gpiob_crl =
-            (read_volatile(GPIOB_CRL) & !(0b1111 << 12)) | (HALL_PIN_INPUT_FLOATING << 12);
-        write_volatile(GPIOB_CRL, gpiob_crl);
-        let gpiob_crh =
-            (read_volatile(GPIOB_CRH) & !(0b1111 << 8)) | (HALL_PIN_INPUT_FLOATING << 8);
-        write_volatile(GPIOB_CRH, gpiob_crh);
+        write_volatile(
+            AFIO_MAPR,
+            mapr | (0b100 << 24) | crate::config::tim2_remap_bits(),
+        );
+        for pin in BIKE_CONFIG.pins.hall {
+            gpio::configure(pin, gpio::FLOATING_INPUT);
+        }
 
         write_volatile(TIM2_CR1, TIM2_UPDATE_REQUEST_OVERFLOW_ONLY);
         write_volatile(TIM2_CR2, TIM2_HALL_XOR_ENABLE);
@@ -510,14 +470,14 @@ pub fn enable_motor_outputs() -> bool {
     }
     // The gate-driver control is established once during passive setup so it
     // has settled before the first ride request.
-    if unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0 {
+    if power_stage_is_disabled() {
         retain_current_pwm_failure(pwm_cause::POWER_STAGE_DISABLED);
         return false;
     }
     unsafe {
         if read_volatile(TIM1_CCER) == TIM1_ACTIVE_CCER
             && read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE != 0
-            && read_volatile(GPIOA_ODR) & PA2_SET == 0
+            && !power_stage_is_disabled()
         {
             let enabled = fault_flags() == 0 && !break_event_pending();
             if !enabled {
@@ -546,13 +506,13 @@ pub fn enable_motor_outputs() -> bool {
             );
             if read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE == 0
                 || break_event_pending()
-                || read_volatile(GPIOA_ODR) & PA2_SET != 0
+                || power_stage_is_disabled()
             {
                 return false;
             }
             read_volatile(TIM1_CCER) == TIM1_ACTIVE_CCER
                 && read_volatile(TIM1_BDTR) & TIM1_MAIN_OUTPUT_ENABLE != 0
-                && read_volatile(GPIOA_ODR) & PA2_SET == 0
+                && !power_stage_is_disabled()
         }
     });
     let post_enable_failure = fault_flags() != 0 || break_event_pending();
@@ -588,7 +548,7 @@ fn retain_current_pwm_failure(cause: u8) {
 #[inline(never)]
 fn retain_pwm_failure(cause: u8, duty: PwmDuty) {
     let break_active = break_input_active();
-    let power_stage_disabled = unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0;
+    let power_stage_disabled = power_stage_is_disabled();
     let clock_security_failed =
         unsafe { read_volatile(RCC_CIR) } & RCC_CIR_CLOCK_SECURITY_FAILURE != 0;
     // SAFETY: read-only inspection of TIM1 state at the exact rejected output
@@ -654,7 +614,13 @@ pub fn fault_flags() -> u32 {
 
 pub fn break_input_active() -> bool {
     // SAFETY: read-only observation of the configured active-low BKIN pin.
-    unsafe { read_volatile(GPIOB_IDR) & (1 << 12) == 0 }
+    unsafe { !gpio::read(BIKE_CONFIG.pins.inverter.hardware_break) }
+}
+
+fn power_stage_is_disabled() -> bool {
+    let enable = BIKE_CONFIG.pins.inverter.power_stage_enable;
+    // SAFETY: read-only observation of the configured output latch.
+    unsafe { gpio::output_is_high(enable.pin) == enable.active_low }
 }
 
 fn break_event_pending() -> bool {
@@ -671,7 +637,7 @@ pub fn acknowledge_faults() -> bool {
     if fault_flags() == 0 {
         return true;
     }
-    if break_input_active() || unsafe { read_volatile(GPIOA_ODR) } & PA2_SET != 0 {
+    if break_input_active() || power_stage_is_disabled() {
         return false;
     }
     cortex_m::interrupt::free(|_| {
@@ -832,37 +798,29 @@ unsafe fn set_interrupt_priority(interrupt_number: usize, priority: u8) {
 
 unsafe fn configure_inert_motor_pins() {
     unsafe {
-        write_volatile(
-            RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR) | RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN,
-        );
-        let mut gpioa = read_volatile(GPIOA_CRH);
-        for pin in 8..=10 {
-            gpioa &= !(0xf << ((pin - 8) * 4));
+        for pin in BIKE_CONFIG
+            .pins
+            .inverter
+            .high_side_pwm
+            .into_iter()
+            .chain(BIKE_CONFIG.pins.inverter.low_side_pwm)
+        {
+            gpio::configure(pin, gpio::ANALOG_INPUT);
         }
-        write_volatile(GPIOA_CRH, gpioa);
-        let mut gpiob = read_volatile(GPIOB_CRH);
-        for pin in 13..=15 {
-            gpiob &= !(0xf << ((pin - 8) * 4));
-        }
-        write_volatile(GPIOB_CRH, gpiob);
     }
 }
 
 unsafe fn configure_active_motor_pins() {
     unsafe {
-        let mut gpioa = read_volatile(GPIOA_CRH);
-        for pin in 8..=10 {
-            let shift = (pin - 8) * 4;
-            gpioa = (gpioa & !(0xf << shift)) | (PWM_PIN_AF_PUSH_PULL_50MHZ << shift);
+        for pin in BIKE_CONFIG
+            .pins
+            .inverter
+            .high_side_pwm
+            .into_iter()
+            .chain(BIKE_CONFIG.pins.inverter.low_side_pwm)
+        {
+            gpio::configure(pin, gpio::ALTERNATE_PUSH_PULL_50MHZ);
         }
-        write_volatile(GPIOA_CRH, gpioa);
-        let mut gpiob = read_volatile(GPIOB_CRH);
-        for pin in 13..=15 {
-            let shift = (pin - 8) * 4;
-            gpiob = (gpiob & !(0xf << shift)) | (PWM_PIN_AF_PUSH_PULL_50MHZ << shift);
-        }
-        write_volatile(GPIOB_CRH, gpiob);
     }
 }
 
@@ -880,10 +838,10 @@ unsafe fn enable_cycle_counter() {
 }
 
 unsafe fn read_hall_pins() -> u8 {
-    let a = (unsafe { read_volatile(GPIOA_IDR) } >> 15) & 1;
-    let b = (unsafe { read_volatile(GPIOB_IDR) } >> 3) & 1;
-    let c = (unsafe { read_volatile(GPIOB_IDR) } >> 10) & 1;
-    (a | (b << 1) | (c << 2)) as u8
+    let hall = BIKE_CONFIG.pins.hall;
+    u8::from(unsafe { gpio::read(hall[0]) })
+        | (u8::from(unsafe { gpio::read(hall[1]) }) << 1)
+        | (u8::from(unsafe { gpio::read(hall[2]) }) << 2)
 }
 
 pub fn live_hall_state() -> u8 {
@@ -891,8 +849,8 @@ pub fn live_hall_state() -> u8 {
     unsafe { read_hall_pins() }
 }
 
-/// Configures ADC1 channel 11 and ADC2 channel 12, calibrates both ADCs, then
-/// measures the midpoint offsets while the bridge is disabled. Hardware
+/// Configures the two mapped injected-current channels, calibrates both ADCs,
+/// then measures midpoint offsets while the bridge is disabled. Hardware
 /// triggering is selected only after the offset average is complete.
 pub fn configure_and_calibrate_current_adcs() -> Result<CurrentOffsets, AdcError> {
     // SAFETY: startup-time exclusive access; all motor PWM pins and channel
@@ -900,10 +858,7 @@ pub fn configure_and_calibrate_current_adcs() -> Result<CurrentOffsets, AdcError
     unsafe {
         write_volatile(
             RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR)
-                | RCC_APB2ENR_IOPCEN
-                | RCC_APB2ENR_ADC1EN
-                | RCC_APB2ENR_ADC2EN,
+            read_volatile(RCC_APB2ENR) | RCC_APB2ENR_ADC1EN | RCC_APB2ENR_ADC2EN,
         );
         write_volatile(
             RCC_APB2RSTR,
@@ -913,11 +868,17 @@ pub fn configure_and_calibrate_current_adcs() -> Result<CurrentOffsets, AdcError
             RCC_APB2RSTR,
             read_volatile(RCC_APB2RSTR) & !(RCC_APB2ENR_ADC1EN | RCC_APB2ENR_ADC2EN),
         );
-        let crl = read_volatile(GPIOC_CRL) & !((0b1111 << 4) | (0b1111 << 8));
-        write_volatile(GPIOC_CRL, crl);
+        gpio::configure(BIKE_CONFIG.pins.phase_current[0].pin, gpio::ANALOG_INPUT);
+        gpio::configure(BIKE_CONFIG.pins.phase_current[1].pin, gpio::ANALOG_INPUT);
 
-        configure_adc(ADC1_BASE, 11)?;
-        configure_adc(ADC2_BASE, 12)?;
+        configure_adc(
+            ADC1_BASE,
+            u32::from(BIKE_CONFIG.pins.phase_current[0].channel),
+        )?;
+        configure_adc(
+            ADC2_BASE,
+            u32::from(BIKE_CONFIG.pins.phase_current[1].channel),
+        )?;
 
         let mut sum_a = 0_u32;
         let mut sum_b = 0_u32;
