@@ -313,11 +313,6 @@ class Status:
     pulse_step_d_ticks: int = 0
     pulse_step_q_ticks: int = 0
     last_pulse_di_counts: int = 0
-    proportional_d_q16: int = 0
-    proportional_q_q16: int = 0
-    integral_per_cycle_q16: int = 0
-    gain_bus_voltage_mv: int = 0
-    tuning_bandwidth_rad_s: int = 0
     flux_linkage_nwb: int = 0
     average_bemf_d_uv: int = 0
     average_bemf_q_uv: int = 0
@@ -364,11 +359,6 @@ class Status:
     def can_command_queue_drop(self) -> bool:
         return bool(self.flags & 0x80)
 
-    @property
-    def pulse_step_ticks(self) -> int:
-        """Compatibility name for schema-2 logs, whose pulse was the q-axis value."""
-        return self.pulse_step_q_ticks
-
     def update_combined_hall_centers(self) -> None:
         for raw in range(1, 7):
             forward = self.hall_forward_centers_q16[raw]
@@ -394,7 +384,8 @@ class Status:
         page = data[0] & 0x0F
         if page >= STATUS_PAGE_COUNT:
             return False
-        if page != 0 and self.schema == 0:
+        # Other pages are decoded only once page 0 has confirmed this schema.
+        if page != 0 and self.schema != SCHEMA:
             return True
         self.pages_seen.add(page)
         if page == 0:
@@ -435,93 +426,50 @@ class Status:
             self.inductance_d_nwb_per_count = int.from_bytes(data[1:5], "little")
             self.inductance_q_nwb_per_count = int.from_bytes(data[5:8], "little")
         elif page == 8:
-            if self.schema >= 3:
-                self.residual_dead_time_uv = int.from_bytes(data[1:3], "little") * 1_000
-                self.pulse_step_d_ticks = int.from_bytes(
-                    data[3:5], "little", signed=True
-                )
-                self.pulse_step_q_ticks = int.from_bytes(
-                    data[5:7], "little", signed=True
-                )
-            else:
-                self.residual_dead_time_uv = int.from_bytes(data[1:5], "little")
-                self.pulse_step_q_ticks = int.from_bytes(
-                    data[5:7], "little", signed=True
-                )
+            self.residual_dead_time_uv = int.from_bytes(data[1:3], "little") * 1_000
+            self.pulse_step_d_ticks = int.from_bytes(data[3:5], "little", signed=True)
+            self.pulse_step_q_ticks = int.from_bytes(data[5:7], "little", signed=True)
             self.last_pulse_di_counts = int.from_bytes(data[7:8], "little", signed=True)
         elif page == 9:
-            if self.schema >= 4:
-                for raw in range(1, 4):
-                    offset = 1 + (raw - 1) * 2
-                    self.hall_forward_centers_q16[raw] = int.from_bytes(
-                        data[offset : offset + 2], "little"
-                    )
-                self.hall_forward_minimum_samples = data[7]
-                self.update_combined_hall_centers()
-            else:
-                self.proportional_d_q16 = int.from_bytes(
-                    data[1:5], "little", signed=True
+            for raw in range(1, 4):
+                offset = 1 + (raw - 1) * 2
+                self.hall_forward_centers_q16[raw] = int.from_bytes(
+                    data[offset : offset + 2], "little"
                 )
-                self.proportional_q_q16 = signed_i24(data[5:8])
+            self.hall_forward_minimum_samples = data[7]
+            self.update_combined_hall_centers()
         elif page == 10:
-            if self.schema >= 4:
-                for raw in range(4, 7):
-                    offset = 1 + (raw - 4) * 2
-                    self.hall_forward_centers_q16[raw] = int.from_bytes(
-                        data[offset : offset + 2], "little"
-                    )
-                self.hall_valid_mask = data[7]
-                self.update_combined_hall_centers()
-            else:
-                self.integral_per_cycle_q16 = int.from_bytes(
-                    data[1:5], "little", signed=True
+            for raw in range(4, 7):
+                offset = 1 + (raw - 4) * 2
+                self.hall_forward_centers_q16[raw] = int.from_bytes(
+                    data[offset : offset + 2], "little"
                 )
-                self.gain_bus_voltage_mv = int.from_bytes(data[5:7], "little")
-                self.tuning_bandwidth_rad_s = data[7] * 10
+            self.hall_valid_mask = data[7]
+            self.update_combined_hall_centers()
         elif page == 11:
-            if self.schema >= 3:
-                self.flux_linkage_nwb = int.from_bytes(data[1:3], "little") * 10_000
-                self.flux_measurement_erpm = int.from_bytes(
-                    data[3:5], "little", signed=True
-                )
-                self.hall_measurement_erpm = int.from_bytes(
-                    data[5:7], "little", signed=True
-                )
-            else:
-                self.flux_linkage_nwb = int.from_bytes(data[1:5], "little")
-                self.flux_measurement_erpm = int.from_bytes(
-                    data[5:7], "little", signed=True
-                )
+            self.flux_linkage_nwb = int.from_bytes(data[1:3], "little") * 10_000
+            self.flux_measurement_erpm = int.from_bytes(data[3:5], "little", signed=True)
+            self.hall_measurement_erpm = int.from_bytes(data[5:7], "little", signed=True)
             self.sync_minimum_percent = data[7]
         elif page == 12:
             self.average_bemf_d_uv = int.from_bytes(data[1:5], "little", signed=True)
             self.average_bemf_q_uv = signed_i24(data[5:8])
         elif page == 13:
-            target = (
-                self.hall_reverse_centers_q16
-                if self.schema >= 4
-                else self.hall_centers_q16
-            )
             for raw in range(1, 4):
                 offset = 1 + (raw - 1) * 2
-                target[raw] = int.from_bytes(data[offset : offset + 2], "little")
-            if self.schema >= 4:
-                self.hall_reverse_minimum_samples = data[7]
-                self.update_combined_hall_centers()
-            else:
-                self.hall_minimum_samples = data[7]
+                self.hall_reverse_centers_q16[raw] = int.from_bytes(
+                    data[offset : offset + 2], "little"
+                )
+            self.hall_reverse_minimum_samples = data[7]
+            self.update_combined_hall_centers()
         elif page == 14:
-            target = (
-                self.hall_reverse_centers_q16
-                if self.schema >= 4
-                else self.hall_centers_q16
-            )
             for raw in range(4, 7):
                 offset = 1 + (raw - 4) * 2
-                target[raw] = int.from_bytes(data[offset : offset + 2], "little")
+                self.hall_reverse_centers_q16[raw] = int.from_bytes(
+                    data[offset : offset + 2], "little"
+                )
             self.hall_valid_mask = data[7]
-            if self.schema >= 4:
-                self.update_combined_hall_centers()
+            self.update_combined_hall_centers()
         else:
             diagnostic = PulseDiagnostic(
                 slot=data[1],
@@ -619,12 +567,6 @@ def print_status(status: Status) -> None:
     print(f"pulse_step_d_ticks         {status.pulse_step_d_ticks}")
     print(f"pulse_step_q_ticks         {status.pulse_step_q_ticks}")
     print(f"last_pulse_di_counts       {status.last_pulse_di_counts}")
-    if status.schema < 4:
-        print(f"proportional_d_q16         {status.proportional_d_q16}")
-        print(f"proportional_q_q16         {status.proportional_q_q16}")
-        print(f"integral_per_cycle_q16     {status.integral_per_cycle_q16}")
-        print(f"gain_bus_voltage_mv        {status.gain_bus_voltage_mv}")
-        print(f"tuning_bandwidth_rad_s     {status.tuning_bandwidth_rad_s}")
     if status.pulse_diagnostics:
         print("pulse_grid")
         print("  slot  angle_deg  step_ticks  average_di  L_nWb/count")
@@ -648,31 +590,30 @@ def print_status(status: Status) -> None:
     print(f"sync_minimum_percent       {status.sync_minimum_percent}")
     hall_degrees = [round(value * 360 / 65_536, 2) for value in status.hall_centers_q16]
     print(f"hall_centers_degrees       {hall_degrees}")
-    if status.schema >= 4:
-        forward_degrees = [
-            round(value * 360 / 65_536, 2)
-            for value in status.hall_forward_centers_q16
-        ]
-        reverse_degrees = [
-            round(value * 360 / 65_536, 2)
-            for value in status.hall_reverse_centers_q16
-        ]
-        hysteresis_degrees = [
-            round(((forward - reverse + 32_768) % 65_536 - 32_768) * 360 / 65_536, 2)
-            for forward, reverse in zip(
-                status.hall_forward_centers_q16,
-                status.hall_reverse_centers_q16,
-                strict=True,
-            )
-        ]
-        print(f"hall_forward_degrees       {forward_degrees}")
-        print(f"hall_reverse_degrees       {reverse_degrees}")
-        print(f"hall_hysteresis_degrees    {hysteresis_degrees}")
-        print(
-            "hall_direction_samples     "
-            f"[{status.hall_forward_minimum_samples}, "
-            f"{status.hall_reverse_minimum_samples}]"
+    forward_degrees = [
+        round(value * 360 / 65_536, 2)
+        for value in status.hall_forward_centers_q16
+    ]
+    reverse_degrees = [
+        round(value * 360 / 65_536, 2)
+        for value in status.hall_reverse_centers_q16
+    ]
+    hysteresis_degrees = [
+        round(((forward - reverse + 32_768) % 65_536 - 32_768) * 360 / 65_536, 2)
+        for forward, reverse in zip(
+            status.hall_forward_centers_q16,
+            status.hall_reverse_centers_q16,
+            strict=True,
         )
+    ]
+    print(f"hall_forward_degrees       {forward_degrees}")
+    print(f"hall_reverse_degrees       {reverse_degrees}")
+    print(f"hall_hysteresis_degrees    {hysteresis_degrees}")
+    print(
+        "hall_direction_samples     "
+        f"[{status.hall_forward_minimum_samples}, "
+        f"{status.hall_reverse_minimum_samples}]"
+    )
     print(f"hall_valid_mask            0x{status.hall_valid_mask:02x}")
     print(f"hall_minimum_samples       {status.hall_minimum_samples}")
     if status.hall_valid_mask == 0x7E:
@@ -719,12 +660,19 @@ class Client:
         raise CalibrationError("timed out waiting for calibration telemetry")
 
     def receive_all_pages(self, timeout: float) -> Status:
-        return self.receive_until(
-            lambda status: status.schema != 0
-            and status.pages_seen
-            == set(range(STATUS_PAGE_COUNT if status.schema >= 4 else 15)),
+        status = self.receive_until(
+            lambda current: current.schema != 0
+            and (
+                current.schema != SCHEMA
+                or current.pages_seen == set(range(STATUS_PAGE_COUNT))
+            ),
             timeout,
         )
+        if status.schema != SCHEMA:
+            raise CalibrationError(
+                f"expected calibration telemetry schema {SCHEMA}, got {status.schema}"
+            )
+        return status
 
 
 def arm_with_retry(
@@ -766,8 +714,27 @@ def start_routine_with_retry(
     timeout: float,
     retry_interval: float = 0.1,
 ) -> Status:
-    page_zero_at_start = client.status.page_zero_updates
+    # Page 0 can leave before the firmware processes RUN or before the control
+    # loop consumes the request, so after a failed run of this routine the
+    # first page identical to the pre-RUN outcome cannot be attributed to the
+    # new run. The firmware handles RUN within milliseconds, so the second
+    # page 0 after the latest RUN is necessarily emitted after it was handled:
+    # an identical failure there is the new run failing the same way. RUN is
+    # not resent while waiting for that second page, which would restart the
+    # count. A real start passes through an active state or reports a new
+    # failure.
+    previous_failure = (
+        (client.status.routine, client.status.state, client.status.failure)
+        if client.status.routine == routine and client.status.state == failed_state
+        else None
+    )
+
+    def outcome(current: Status) -> tuple[int, int, int]:
+        return (current.routine, current.state, current.failure)
+
     deadline = time.monotonic() + timeout
+    page_zero_at_send = client.status.page_zero_updates
+    send = True
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -779,17 +746,27 @@ def start_routine_with_retry(
                 f"can_rx_fifo_overrun={status.can_rx_fifo_overrun}, "
                 f"can_command_queue_drop={status.can_command_queue_drop})"
             )
-        client.send(command_frame(tag, challenge))
+        if send:
+            page_zero_at_send = client.status.page_zero_updates
+            client.send(command_frame(tag, challenge))
         try:
             status = client.receive_until(
                 lambda current: (
-                    current.page_zero_updates != page_zero_at_start
+                    current.page_zero_updates != page_zero_at_send
                     and current.routine == routine
                     and current.state != complete_state
+                    and (
+                        outcome(current) != previous_failure
+                        or current.page_zero_updates - page_zero_at_send >= 2
+                    )
                 ),
                 min(retry_interval, remaining),
             )
         except CalibrationError:
+            send = not (
+                client.status.page_zero_updates != page_zero_at_send
+                and outcome(client.status) == previous_failure
+            )
             continue
         if status.state == failed_state:
             raise CalibrationError(
@@ -807,6 +784,17 @@ def submit_stop_safely(client: Client) -> bool:
     return True
 
 
+def stop_and_confirm(client: Client, timeout: float) -> Status:
+    """Sends STOP and waits for a later page 0 that reports outputs inactive."""
+    page_zero_before_stop = client.status.page_zero_updates
+    client.send(stop_frame())
+    return client.receive_until(
+        lambda status: status.page_zero_updates != page_zero_before_stop
+        and not status.output_active,
+        timeout,
+    )
+
+
 def run_routine(
     client: Client,
     initial: Status,
@@ -816,7 +804,7 @@ def run_routine(
     failed_state: int,
     timeout: float,
 ) -> Status:
-    if routine == 2 and initial.schema >= 4:
+    if routine == 2:
         initial.pulse_diagnostics.clear()
         initial.pulse_diagnostic_total = 0
     arm_with_retry(client, initial.challenge, 6.0)
@@ -847,7 +835,7 @@ def run_routine(
         if status.state == complete_state:
             status.pages_seen.clear()
             status = client.receive_all_pages(3.0)
-            if routine == 2 and status.schema >= 4:
+            if routine == 2:
                 if status.pulse_diagnostic_total == 0 or len(
                     status.pulse_diagnostics
                 ) < status.pulse_diagnostic_total:
@@ -878,18 +866,12 @@ def run(args: argparse.Namespace) -> int:
         )
         client = Client(bus, logger)
         if args.action == "stop":
-            client.send(stop_frame())
-            status = client.receive_until(lambda status: not status.output_active, 3.0)
-            print_status(status)
+            print_status(stop_and_confirm(client, 3.0))
         elif args.action == "status":
             print_status(client.receive_all_pages(args.timeout))
         else:
             initial = client.receive_all_pages(args.timeout)
             print_status(initial)
-            if initial.schema != SCHEMA:
-                raise CalibrationError(
-                    f"expected calibration telemetry schema {SCHEMA}, got {initial.schema}"
-                )
             if not args.yes:
                 print(
                     "\nNothing was energized. Add --yes only with the wheel elevated and "

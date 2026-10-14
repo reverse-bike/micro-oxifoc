@@ -1,10 +1,4 @@
-use crate::config::{BIKE_CONFIG, RIDE_PHASE_CURRENT_LIMIT_COUNTS};
-
-const fn adc_counts_from_microvolts(microvolts: u32) -> u16 {
-    ((microvolts as u64 * BIKE_CONFIG.sensors.adc_levels as u64
-        + BIKE_CONFIG.sensors.adc_reference_microvolts as u64 / 2)
-        / BIKE_CONFIG.sensors.adc_reference_microvolts as u64) as u16
-}
+use crate::config::{BIKE_CONFIG, RIDE_PHASE_CURRENT_LIMIT_COUNTS, adc_counts_from_microvolts};
 
 pub const PLAUSIBLE_LOW_ADC: u16 =
     adc_counts_from_microvolts(BIKE_CONFIG.throttle.plausible_minimum_microvolts);
@@ -123,44 +117,6 @@ impl Demand {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArmingGate {
-    armed: bool,
-}
-
-impl ArmingGate {
-    pub const fn new() -> Self {
-        Self { armed: false }
-    }
-
-    pub const fn armed(self) -> bool {
-        self.armed
-    }
-
-    pub fn update(
-        &mut self,
-        throttle: Observation,
-        brake_active: bool,
-        safety_ready: bool,
-    ) -> Option<Demand> {
-        if brake_active || !safety_ready || !throttle.is_valid() {
-            self.armed = false;
-            return None;
-        }
-        if throttle.is_at_rest() {
-            self.armed = true;
-            return None;
-        }
-        if self.armed { throttle.demand() } else { None }
-    }
-}
-
-impl Default for ArmingGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,33 +159,5 @@ mod tests {
             demand.negative_q_target(ride_limit + 1),
             -(ride_limit as i16)
         );
-    }
-
-    #[test]
-    fn boot_high_cannot_arm_until_throttle_returns_to_rest() {
-        let mut gate = ArmingGate::new();
-        let demand = Observation::from_raw(2_000);
-        assert_eq!(gate.update(demand, false, true), None);
-        assert!(!gate.armed());
-        assert_eq!(
-            gate.update(Observation::from_raw(REST_ADC), false, true),
-            None
-        );
-        assert!(gate.armed());
-        assert_eq!(gate.update(demand, false, true), demand.demand());
-    }
-
-    #[test]
-    fn brake_invalid_input_and_safety_loss_require_rearming_at_rest() {
-        for (observation, brake, ready) in [
-            (Observation::from_raw(2_000), true, true),
-            (Observation::invalid_acquisition(REST_ADC), false, true),
-            (Observation::from_raw(2_000), false, false),
-        ] {
-            let mut gate = ArmingGate { armed: true };
-            assert_eq!(gate.update(observation, brake, ready), None);
-            assert!(!gate.armed());
-            assert_eq!(gate.update(Observation::from_raw(2_000), false, true), None);
-        }
     }
 }

@@ -8,13 +8,12 @@ use oxifoc_f103::{
 };
 
 use crate::{
-    calibration::{inductance::PULSE_DIAGNOSTIC_COUNT, types::Failure},
+    calibration::inductance::PULSE_DIAGNOSTIC_COUNT,
     config, control,
     protocol::{self, Command, Status},
     transport,
 };
 
-const WATCHDOG_FEED_PERIOD_MS: u32 = 10;
 const TELEMETRY_PERIOD_MS: u32 = 50;
 
 pub struct CalibrationApp {
@@ -22,10 +21,7 @@ pub struct CalibrationApp {
     environment_monitor: environment::EnvironmentMonitor,
     offsets: peripherals::CurrentOffsets,
     control_started: bool,
-    watchdog_started: bool,
-    last_watchdog_feed_ms: u32,
-    last_watchdog_control_cycles: u32,
-    last_watchdog_injected_samples: u32,
+    watchdog: safety::MainLoopWatchdog,
     armed: bool,
     arm_deadline_ms: u32,
     telemetry_page: u8,
@@ -50,10 +46,7 @@ impl CalibrationApp {
                 phase_b: 0,
             },
             control_started: false,
-            watchdog_started: false,
-            last_watchdog_feed_ms: 0,
-            last_watchdog_control_cycles: 0,
-            last_watchdog_injected_samples: 0,
+            watchdog: safety::MainLoopWatchdog::new(),
             armed: false,
             arm_deadline_ms: 0,
             telemetry_page: 0,
@@ -89,11 +82,7 @@ impl CalibrationApp {
                 cp.SYST.enable_interrupt();
                 cp.SYST.enable_counter();
                 if self.control_started {
-                    let progress = control::snapshot();
-                    self.last_watchdog_control_cycles = progress.control_cycles;
-                    self.last_watchdog_injected_samples = progress.injected_samples;
-                    safety::start();
-                    self.watchdog_started = true;
+                    self.watchdog.start(control_progress());
                 }
                 // SAFETY: the resident bootloader enters with PRIMASK set and
                 // every unmasked interrupt now has its complete state.
@@ -112,7 +101,11 @@ impl CalibrationApp {
         if let Some(inputs) = self.input_monitor.as_mut() {
             inputs.service(now_ms);
         }
-        let local = sensors::latest();
+        let local = self
+            .input_monitor
+            .as_ref()
+            .map(InputMonitor::latest)
+            .unwrap_or_default();
         let bus_voltage_mv = if local.analog_valid {
             sensors::bus_voltage_mv(local.bus_voltage_adc)
         } else {
@@ -125,6 +118,7 @@ impl CalibrationApp {
                 bus_voltage_adc: local.bus_voltage_adc,
                 motor_temperature_adc: local.motor_temperature_adc,
                 controller_temperature_adc: local.controller_temperature_adc,
+                sampled_at_ms: local.sampled_at_ms,
             },
             0,
         );
@@ -135,14 +129,14 @@ impl CalibrationApp {
             && local.throttle.is_at_rest()
             && !local.brake_active
             && environment_limit.is_some()
-            && environment_reasons == 0
+            && config::environment_allows_calibration(environment_reasons)
             && (config::CALIBRATION_BUS_MINIMUM_MV..=config::CALIBRATION_BUS_MAXIMUM_MV)
                 .contains(&bus_voltage_mv);
         let hall_quiet = peripherals::hall_is_quiet(500_000);
         let motor_outputs_disabled = peripherals::motor_outputs_disabled();
         let control_snapshot = control::snapshot();
         if control_snapshot.active && !local_ready {
-            control::abort(Failure::LocalInterlock);
+            control::abort(control::Abort::LocalInterlock);
             self.armed = false;
         }
         if self.armed && !deadline_active(now_ms, self.arm_deadline_ms) {
@@ -172,7 +166,7 @@ impl CalibrationApp {
                 environment_reasons,
             );
         }
-        self.service_watchdog(now_ms);
+        self.watchdog.service(now_ms, control_progress);
     }
 
     fn process_command(
@@ -185,8 +179,9 @@ impl CalibrationApp {
     ) {
         match command {
             Command::Stop => {
+                control::cancel_request();
                 if control::snapshot().active {
-                    control::abort(Failure::Stopped);
+                    control::abort(control::Abort::Stopped);
                 }
                 self.armed = false;
                 if local_ready {
@@ -210,7 +205,7 @@ impl CalibrationApp {
             Command::RunResistance {
                 challenge: received,
             } => {
-                if self.start_ready(received, now_ms, local_ready, hall_quiet) {
+                if self.start_ready(received, local_ready, hall_quiet) {
                     let _ = control::request_resistance();
                 }
                 self.armed = false;
@@ -218,7 +213,7 @@ impl CalibrationApp {
             Command::RunInductance {
                 challenge: received,
             } => {
-                if self.start_ready(received, now_ms, local_ready, hall_quiet) {
+                if self.start_ready(received, local_ready, hall_quiet) {
                     let _ = control::request_inductance();
                 }
                 self.armed = false;
@@ -226,7 +221,7 @@ impl CalibrationApp {
             Command::RunFluxLinkage {
                 challenge: received,
             } => {
-                if self.start_ready(received, now_ms, local_ready, hall_quiet) {
+                if self.start_ready(received, local_ready, hall_quiet) {
                     let _ = control::request_flux_linkage();
                 }
                 self.armed = false;
@@ -234,7 +229,7 @@ impl CalibrationApp {
             Command::RunHall {
                 challenge: received,
             } => {
-                if self.start_ready(received, now_ms, local_ready, hall_quiet) {
+                if self.start_ready(received, local_ready, hall_quiet) {
                     let _ = control::request_hall();
                 }
                 self.armed = false;
@@ -242,18 +237,10 @@ impl CalibrationApp {
         }
     }
 
-    fn start_ready(
-        &self,
-        received_challenge: u16,
-        now_ms: u32,
-        local_ready: bool,
-        hall_quiet: bool,
-    ) -> bool {
-        self.armed
-            && deadline_active(now_ms, self.arm_deadline_ms)
-            && received_challenge == self.challenge
-            && local_ready
-            && hall_quiet
+    /// `service` disarms an expired window before commands are processed, so
+    /// `armed` already implies the arm deadline is active.
+    fn start_ready(&self, received_challenge: u16, local_ready: bool, hall_quiet: bool) -> bool {
+        self.armed && received_challenge == self.challenge && local_ready && hall_quiet
     }
 
     #[inline(never)]
@@ -332,30 +319,6 @@ impl CalibrationApp {
         }
         self.next_telemetry_ms = now_ms.wrapping_add(TELEMETRY_PERIOD_MS);
     }
-
-    fn service_watchdog(&mut self, now_ms: u32) {
-        if !self.watchdog_started
-            || now_ms.wrapping_sub(self.last_watchdog_feed_ms) < WATCHDOG_FEED_PERIOD_MS
-        {
-            return;
-        }
-        let progress = control::snapshot();
-        let latched_safe_off = progress.fault_flags != 0
-            && !progress.output_active
-            && peripherals::motor_outputs_disabled();
-        if safety::watchdog_progressed(
-            self.last_watchdog_control_cycles,
-            progress.control_cycles,
-            self.last_watchdog_injected_samples,
-            progress.injected_samples,
-            latched_safe_off,
-        ) {
-            safety::feed_main_loop();
-            self.last_watchdog_feed_ms = now_ms;
-            self.last_watchdog_control_cycles = progress.control_cycles;
-            self.last_watchdog_injected_samples = progress.injected_samples;
-        }
-    }
 }
 
 const fn deadline_active(now: u32, deadline: u32) -> bool {
@@ -365,4 +328,14 @@ const fn deadline_active(now: u32, deadline: u32) -> bool {
 
 const fn deadline_due(now: u32, deadline: u32) -> bool {
     deadline == now || deadline.wrapping_sub(now) >= 0x8000_0000
+}
+
+fn control_progress() -> safety::ControlProgress {
+    let snapshot = control::snapshot();
+    safety::ControlProgress {
+        control_cycles: snapshot.control_cycles,
+        injected_samples: snapshot.injected_samples,
+        fault_flags: snapshot.fault_flags,
+        output_active: snapshot.output_active,
+    }
 }

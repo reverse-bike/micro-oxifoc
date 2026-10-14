@@ -13,4 +13,4 @@ pub mod wheel;
 pub mod wheel_capture;
 
 #[cfg(feature = "board")]
-pub use analog::{InputMonitor, Snapshot, bus_voltage_mv, latest};
+pub use analog::{InputMonitor, Snapshot, bus_voltage_mv};

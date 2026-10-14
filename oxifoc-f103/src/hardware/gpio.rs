@@ -2,9 +2,9 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
+use super::system::RCC_APB2ENR;
 use crate::config::{DigitalOutput, GpioPin, GpioPort};
 
-const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
 const GPIOA_BASE: usize = 0x4001_0800;
 const GPIO_PORT_STRIDE: usize = 0x400;
 const CRL_OFFSET: usize = 0x00;

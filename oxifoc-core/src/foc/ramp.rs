@@ -1,5 +1,13 @@
 //! Cycle-counted slew limiting for a quadrature-current request.
 
+/// One-sided slew limit for a q-current request.
+///
+/// Only motion toward negative q is rate limited: the output steps down by
+/// `counts_per_step` every `cycles_per_step` calls until it reaches the
+/// request. Any request above the current output, including a positive one,
+/// is adopted immediately. Callers therefore express the torque that must be
+/// eased in as negative q, and rely on positive-going changes (torque
+/// reduction for negative q) taking effect at once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuadratureTargetRamp {
     target: i32,

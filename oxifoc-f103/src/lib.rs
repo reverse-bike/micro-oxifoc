@@ -18,5 +18,4 @@ pub mod app;
 
 #[cfg(feature = "board")]
 pub mod hardware;
-#[cfg(feature = "board")]
 pub mod transport;

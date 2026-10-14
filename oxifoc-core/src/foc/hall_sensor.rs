@@ -1,6 +1,5 @@
 //! Calibrated Hall sensor and electrical-angle estimator in Q0.32 turns.
 
-use crate::foc::numeric::Fixed;
 use crate::foc::phase::{PhaseEstimate, PhaseProvider, PhaseSource};
 use crate::foc::trig::Turns;
 
@@ -9,8 +8,6 @@ const STALE_SECTOR_MULTIPLE: u32 = 8;
 const RATE_LIMIT_MIN_ERPM: u32 = 500;
 const Q16_TURN_UNITS: u32 = 1 << 16;
 const HALF_MICROSECOND_NS: u32 = 500;
-const TAU_NUMERATOR: u32 = 710;
-const TAU_DENOMINATOR: u32 = 113;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HallGeometry {
@@ -106,13 +103,6 @@ impl HallGeometry {
         self.sector(raw).is_some()
     }
 
-    pub const fn calibrated_center(&self, raw: u8) -> u16 {
-        match self.sector(raw) {
-            Some(sector) => sector.boundary_q16.wrapping_add(sector.width_q16 / 2),
-            None => 0,
-        }
-    }
-
     const fn sector(&self, raw: u8) -> Option<HallSector> {
         if raw as usize >= self.sectors_by_raw.len() {
             return None;
@@ -127,6 +117,12 @@ impl HallGeometry {
 
     const fn signed_motion_direction(&self, angle_direction: i8) -> i8 {
         angle_direction.saturating_mul(self.positive_angle_direction)
+    }
+}
+
+impl HallSector {
+    const fn center_q16(&self) -> u16 {
+        self.boundary_q16.wrapping_add(self.width_q16 / 2)
     }
 }
 
@@ -149,10 +145,8 @@ pub struct HallSensor {
     direction: i8,
     next_interval_since_run_start: bool,
     rate_limited_angle: Turns,
-    unlimited_angle: Turns,
     control_period_ns: u32,
     control_step_q16: u32,
-    actuation_advance: Fixed,
     valid: bool,
 }
 
@@ -169,10 +163,8 @@ impl HallSensor {
             direction: 0,
             next_interval_since_run_start: false,
             rate_limited_angle: 0,
-            unlimited_angle: 0,
             control_period_ns: 0,
             control_step_q16: 0,
-            actuation_advance: Fixed::ZERO,
             valid: false,
         }
     }
@@ -182,7 +174,6 @@ impl HallSensor {
             self.valid = false;
             return Err(HallError::InvalidState);
         };
-        let center_q16 = sector.boundary_q16.wrapping_add(sector.width_q16 / 2);
         self.raw = raw;
         self.sector_boundary_q16 = sector.boundary_q16;
         self.measured_width_q16 = sector.width_q16;
@@ -191,10 +182,8 @@ impl HallSensor {
         self.measured_interval_us = 0;
         self.direction = 0;
         self.next_interval_since_run_start = false;
-        self.rate_limited_angle = u32::from(center_q16) << 16;
-        self.unlimited_angle = self.rate_limited_angle;
+        self.rate_limited_angle = u32::from(sector.center_q16()) << 16;
         self.control_step_q16 = 0;
-        self.actuation_advance = Fixed::ZERO;
         self.valid = true;
         Ok(())
     }
@@ -245,9 +234,7 @@ impl HallSensor {
             if previous_direction == direction && self.measured_interval_us != 0 {
                 (self.measured_interval_us, self.measured_width_q16)
             } else {
-                let previous_center_q16 = previous_sector
-                    .boundary_q16
-                    .wrapping_add(previous_sector.width_q16 / 2);
+                let previous_center_q16 = previous_sector.center_q16();
                 let partial_width = if direction < 0 {
                     previous_center_q16.wrapping_sub(boundary_q16)
                 } else {
@@ -351,43 +338,10 @@ impl HallSensor {
         self.entered_duration_us
     }
 
-    /// Unconstrained Hall interpolation target from the latest control
-    /// estimate. This remains separate from the angle actually supplied to
-    /// the current loop so transition corrections can be diagnosed.
-    pub const fn unlimited_angle(&self) -> Turns {
-        self.unlimited_angle
-    }
-
-    /// Signed electrical-angle travel expected during one control period,
-    /// expressed as Q16.16 radians for output-only actuation compensation.
-    pub const fn actuation_advance(&self) -> Fixed {
-        self.actuation_advance
-    }
-
+    /// Signed speed in the configured physical forward direction; see
+    /// [`Self::physical_direction`].
     pub fn electrical_rpm(&self) -> i32 {
-        if self.direction == 0 || self.measured_interval_us == 0 {
-            return 0;
-        }
-        let magnitude = self.electrical_rpm_magnitude();
-        if self.direction < 0 {
-            magnitude
-        } else {
-            -magnitude
-        }
-    }
-
-    /// Signed speed in the calibrated electrical-angle coordinate.
-    ///
-    /// [`Self::electrical_rpm`] follows the configured physical forward
-    /// direction for vehicle policy. Phase estimators instead need velocity
-    /// to carry the same sign as the Q0.32 angle they integrate.
-    pub fn angle_electrical_rpm(&self) -> i32 {
-        let magnitude = self.electrical_rpm_magnitude();
-        if self.direction < 0 {
-            -magnitude
-        } else {
-            magnitude
-        }
+        self.electrical_rpm_magnitude() * i32::from(self.physical_direction())
     }
 
     pub const fn physical_direction(&self) -> i8 {
@@ -411,6 +365,11 @@ impl HallSensor {
         sector_erpm(self.measured_width_q16, self.measured_interval_us)
     }
 
+    /// Signed speed in the calibrated electrical-angle coordinate.
+    ///
+    /// [`Self::electrical_rpm`] follows the configured physical forward
+    /// direction for vehicle policy. Phase estimators instead need velocity
+    /// to carry the same sign as the Q0.32 angle they integrate.
     fn angle_electrical_rpm_at(&self, edge_age_us: u32) -> i32 {
         let magnitude = if self.measured_interval_us == 0 {
             0
@@ -457,32 +416,20 @@ fn sector_erpm(width_q16: u16, interval_us: u32) -> i32 {
     (rpm_q8 / 256).min(i32::MAX as u32) as i32
 }
 
-impl PhaseProvider<Fixed> for HallSensor {
-    type Angle = Turns;
-
+impl PhaseProvider for HallSensor {
     fn source(&self) -> PhaseSource {
         PhaseSource::Hall
-    }
-
-    fn estimate(&self, elapsed_since_edge_us: u32) -> Option<PhaseEstimate<Turns>> {
-        self.angle(elapsed_since_edge_us)
-            .map(|angle| PhaseEstimate {
-                angle,
-                electrical_rpm: self.angle_electrical_rpm_at(elapsed_since_edge_us),
-                trustworthy: self.is_valid(),
-            })
     }
 
     fn estimate_for_control(
         &mut self,
         elapsed_since_edge_us: u32,
         control_period_ns: u32,
-    ) -> Option<PhaseEstimate<Turns>> {
+    ) -> Option<PhaseEstimate> {
         if control_period_ns != self.control_period_ns {
             self.refresh_control_rate(control_period_ns);
         }
         let target = self.angle(elapsed_since_edge_us)?;
-        self.unlimited_angle = target;
         let electrical_rpm = self.angle_electrical_rpm_at(elapsed_since_edge_us);
         if electrical_rpm.unsigned_abs() < RATE_LIMIT_MIN_ERPM {
             self.rate_limited_angle = target;
@@ -495,7 +442,8 @@ impl PhaseProvider<Fixed> for HallSensor {
         Some(PhaseEstimate {
             angle: self.rate_limited_angle,
             electrical_rpm,
-            trustworthy: self.is_valid(),
+            // `angle` returns `None` unless the sensor is valid.
+            trustworthy: true,
         })
     }
 }
@@ -505,7 +453,6 @@ impl HallSensor {
         self.control_period_ns = control_period_ns;
         if self.measured_interval_us == 0 || control_period_ns == 0 {
             self.control_step_q16 = 0;
-            self.actuation_advance = Fixed::ZERO;
             return;
         }
         let half_microseconds =
@@ -513,13 +460,6 @@ impl HallSensor {
         self.control_step_q16 = u32::from(self.measured_width_q16)
             .saturating_mul(half_microseconds)
             / self.measured_interval_us.saturating_mul(2).max(1);
-        let radians_q16 = self.control_step_q16.saturating_mul(TAU_NUMERATOR) / TAU_DENOMINATOR;
-        let magnitude = radians_q16.min(i32::MAX as u32) as i32;
-        self.actuation_advance = Fixed::from_bits(if self.direction < 0 {
-            magnitude.saturating_neg()
-        } else {
-            magnitude
-        });
     }
 
     fn maximum_control_step(&self) -> u32 {
@@ -565,10 +505,11 @@ mod tests {
         let halfway = hall.angle(500).unwrap();
         assert!(edge.wrapping_sub(halfway) > 0);
         assert!(hall.electrical_rpm() > 0);
-        assert!(hall.angle_electrical_rpm() < 0);
         assert_eq!(
-            hall.estimate(500).unwrap().electrical_rpm,
-            hall.angle_electrical_rpm()
+            hall.estimate_for_control(500, 62_500)
+                .unwrap()
+                .electrical_rpm,
+            -hall.electrical_rpm()
         );
         for raw in [2, 3, 1, 5] {
             hall.update_edge(raw, 1_000).unwrap();
@@ -590,7 +531,36 @@ mod tests {
                 > 0
         );
         assert!(hall.electrical_rpm() < 0);
-        assert!(hall.angle_electrical_rpm() > 0);
+        assert!(
+            hall.estimate_for_control(500, 62_500)
+                .unwrap()
+                .electrical_rpm
+                > 0
+        );
+    }
+
+    #[test]
+    fn physical_speed_follows_the_configured_positive_angle_direction() {
+        static POSITIVE_GEOMETRY: HallGeometry = HallGeometry::new(
+            [5, 1, 3, 2, 6, 4],
+            [5_699, 16_526, 26_499, 37_754, 49_151, 59_124],
+            1,
+        );
+        for (geometry, expected_sign) in [(&TEST_GEOMETRY, 1), (&POSITIVE_GEOMETRY, -1)] {
+            let mut hall = HallSensor::new(geometry);
+            hall.seed(5).unwrap();
+            hall.update_edge(4, 1_000).unwrap();
+            hall.update_edge(6, 1_000).unwrap();
+            assert_eq!(hall.angle_direction(), -1);
+            assert_eq!(hall.physical_direction(), expected_sign);
+            assert_eq!(hall.electrical_rpm().signum(), i32::from(expected_sign));
+            let angle_rpm = hall.estimate_for_control(0, 62_500).unwrap().electrical_rpm;
+            assert!(angle_rpm < 0);
+            assert_eq!(
+                hall.electrical_rpm(),
+                i32::from(hall.physical_direction()) * angle_rpm.abs()
+            );
+        }
     }
 
     #[test]
@@ -656,7 +626,6 @@ mod tests {
         let unlimited_step = unlimited.wrapping_sub(before) as i32;
 
         assert!(limited_step.unsigned_abs() < unlimited_step.unsigned_abs());
-        assert_eq!(hall.unlimited_angle(), unlimited);
     }
 
     #[test]
@@ -668,7 +637,7 @@ mod tests {
 
         let unlimited = hall.angle(50_000).unwrap();
         let limited = hall.estimate_for_control(50_000, 62_500).unwrap().angle;
-        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
+        let center = u32::from(TEST_GEOMETRY.sector(6).unwrap().center_q16()) << 16;
 
         assert_eq!(unlimited, center);
         assert_eq!(limited, unlimited);
@@ -685,7 +654,7 @@ mod tests {
             .entered_duration_us()
             .saturating_mul(STALE_SECTOR_MULTIPLE)
             .saturating_add(1);
-        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
+        let center = u32::from(TEST_GEOMETRY.sector(6).unwrap().center_q16()) << 16;
 
         assert_eq!(hall.angle(stale_after), Some(center));
     }
@@ -697,26 +666,13 @@ mod tests {
         hall.update_edge(4, 10_000).unwrap();
         hall.update_edge(6, 10_000).unwrap();
 
-        let center = u32::from(TEST_GEOMETRY.calibrated_center(6)) << 16;
+        let center = u32::from(TEST_GEOMETRY.sector(6).unwrap().center_q16()) << 16;
         let center_age = hall.entered_duration_us().saturating_mul(3);
 
         assert_eq!(hall.angle(center_age), Some(center));
         let estimate = hall.estimate_for_control(center_age, 62_500).unwrap();
         assert_eq!(estimate.angle, center);
         assert!(estimate.electrical_rpm.unsigned_abs() < RATE_LIMIT_MIN_ERPM);
-    }
-
-    #[test]
-    fn actuation_advance_follows_the_signed_angle_motion() {
-        let mut hall = tracker();
-        hall.seed(5).unwrap();
-        hall.update_edge(4, 1_000).unwrap();
-        hall.update_edge(6, 1_000).unwrap();
-
-        let _ = hall.estimate_for_control(0, 62_500).unwrap();
-        let advance = hall.actuation_advance();
-        assert!(advance.to_bits() < 0);
-        assert!((3_500..=5_000).contains(&advance.to_bits().unsigned_abs()));
     }
 
     #[test]
@@ -757,7 +713,7 @@ mod tests {
 
         hall.update_edge(1, 759).unwrap();
 
-        let center = u32::from(TEST_GEOMETRY.calibrated_center(1)) << 16;
+        let center = u32::from(TEST_GEOMETRY.sector(1).unwrap().center_q16()) << 16;
         assert_eq!(hall.angle_direction(), -1);
         assert_eq!(hall.sector_interval_us(), 0);
         assert_eq!(hall.electrical_rpm(), 0);
@@ -810,7 +766,7 @@ mod tests {
             TEST_GEOMETRY.boundaries_q16(),
             &[5_699, 16_526, 26_499, 37_754, 49_151, 59_124]
         );
-        assert_eq!(TEST_GEOMETRY.calibrated_center(5), 11_112);
+        assert_eq!(TEST_GEOMETRY.sector(5).unwrap().center_q16(), 11_112);
     }
 
     #[test]

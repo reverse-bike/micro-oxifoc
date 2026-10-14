@@ -5,6 +5,7 @@
 //! components are averaged. Taking the magnitude after component averaging
 //! preserves OxiFOC's load-angle-independent formulation.
 
+use crate::calibration::math::{integer_sqrt_u64, ramp_i16, ramp_i32, saturating_i64_to_i32};
 use crate::calibration::types::{Actuation, Failure};
 use crate::config::{FLUX_CURRENT_COUNTS, FLUX_TARGET_ERPM, PWM_HZ, PWM_PERIOD_TICKS};
 
@@ -436,39 +437,6 @@ fn hall_erpm_from_transition_count(transition_count: u16) -> i16 {
     // sample window: eRPM = transitions/s * 60/6. The first observed sequence
     // establishes the baseline and is not a transition within the window.
     transition_count.saturating_sub(1).saturating_mul(10) as i16
-}
-
-fn integer_sqrt_u64(mut radicand: u64) -> u64 {
-    let mut result = 0_u64;
-    let mut bit = 1_u64 << 62;
-    while bit > radicand {
-        bit >>= 2;
-    }
-    while bit != 0 {
-        if radicand >= result + bit {
-            radicand -= result + bit;
-            result = (result >> 1) + bit;
-        } else {
-            result >>= 1;
-        }
-        bit >>= 2;
-    }
-    result
-}
-
-fn ramp_i16(start: i16, end: i16, cycle: u32, duration: u32) -> i16 {
-    ramp_i32(i32::from(start), i32::from(end), cycle, duration) as i16
-}
-
-fn ramp_i32(start: i32, end: i32, cycle: u32, duration: u32) -> i32 {
-    let value = i64::from(start)
-        + (i64::from(end) - i64::from(start)) * i64::from(cycle.min(duration))
-            / i64::from(duration);
-    saturating_i64_to_i32(value)
-}
-
-fn saturating_i64_to_i32(value: i64) -> i32 {
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 #[cfg(test)]

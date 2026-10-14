@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.3
+
+- A hardware fault latched while no routine is running stops outputs without
+  overwriting the last routine's result, and only a routine that was actually
+  running records a safety loss.
+- `STOP` cancels a routine request the control interrupt has not yet taken,
+  so a stop that arrives just after `RUN*` can no longer let the routine
+  start.
+- Page 8 residual dead time and page 11 flux linkage saturate at their field
+  limits instead of wrapping, and page 2 reports the configured current scale.
+- The ride image's 58 V overvoltage cutoff does not block calibration, which
+  keeps its own 39--60 V bus window.
+- The host `stop` action waits for a page 0 received after `STOP` that reports
+  outputs inactive. A rerun after a failure ignores the first stale page 0 and
+  still reports an identical repeated failure. The host decodes schema 4 only.
+- Shares the board FOC controller, main-loop watchdog, and actuation advance
+  with the ride image, and the integer helpers with `oxifoc-core`.
+
 ## 0.3.2
 
 - Deferred flux-linkage result reduction until the bridge is off and split its

@@ -1,28 +1,15 @@
-//! Electrical-angle representation and trigonometry backends.
+//! Electrical-angle representation and fixed-point trigonometry.
 
-use super::numeric::{Fixed, Scalar};
+use super::numeric::Fixed;
 
 /// Q0.32 turns: one complete electrical revolution is `u32::MAX + 1`.
 pub type Turns = u32;
 
-pub trait SinCos<N: Scalar> {
-    type Angle: Copy;
-
-    fn sin_cos(angle: Self::Angle) -> (N, N);
-}
-
-/// Software integer CORDIC for Q0.32-turn angles.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CordicSinCos;
-
-impl SinCos<Fixed> for CordicSinCos {
-    type Angle = Turns;
-
-    #[inline]
-    fn sin_cos(angle: Self::Angle) -> (Fixed, Fixed) {
-        let (sin, cos) = sin_cos_q31(angle);
-        (Fixed::from_q31(sin), Fixed::from_q31(cos))
-    }
+/// Q16.16 sine and cosine of a Q0.32-turn angle by software integer CORDIC.
+#[inline]
+pub fn sin_cos(angle: Turns) -> (Fixed, Fixed) {
+    let (sin, cos) = sin_cos_q31(angle);
+    (Fixed::from_q31(sin), Fixed::from_q31(cos))
 }
 
 const CORDIC_GAIN_INV_Q30: i32 = 652_032_874;

@@ -1,27 +1,27 @@
 //! Clarke and Park transforms for the fixed-point control path.
 
-use super::numeric::Scalar;
+use super::numeric::Fixed;
 
 /// Convert two measured phase currents into the stationary αβ frame.
 #[inline]
-pub fn clarke<N: Scalar>(phase_a: N, phase_b: N) -> (N, N) {
-    (phase_a, (phase_a + phase_b + phase_b) * N::INV_SQRT_3)
+pub fn clarke(phase_a: Fixed, phase_b: Fixed) -> (Fixed, Fixed) {
+    (phase_a, (phase_a + phase_b + phase_b) * Fixed::INV_SQRT_3)
 }
 
 /// Convert a stationary αβ vector back to the three phase frame.
 #[inline]
-pub fn inverse_clarke<N: Scalar>(alpha: N, beta: N) -> (N, N, N) {
-    let scaled_beta = N::SQRT_3 * beta;
+pub fn inverse_clarke(alpha: Fixed, beta: Fixed) -> (Fixed, Fixed, Fixed) {
+    let scaled_beta = Fixed::SQRT_3 * beta;
     (
         alpha,
-        (-alpha + scaled_beta) * N::HALF,
-        (-alpha - scaled_beta) * N::HALF,
+        (-alpha + scaled_beta) * Fixed::HALF,
+        (-alpha - scaled_beta) * Fixed::HALF,
     )
 }
 
 /// Rotate a stationary αβ vector into the rotor-aligned dq frame.
 #[inline]
-pub fn park<N: Scalar>(alpha: N, beta: N, sin_theta: N, cos_theta: N) -> (N, N) {
+pub fn park(alpha: Fixed, beta: Fixed, sin_theta: Fixed, cos_theta: Fixed) -> (Fixed, Fixed) {
     (
         cos_theta * alpha + sin_theta * beta,
         cos_theta * beta - sin_theta * alpha,
@@ -30,7 +30,7 @@ pub fn park<N: Scalar>(alpha: N, beta: N, sin_theta: N, cos_theta: N) -> (N, N) 
 
 /// Rotate a rotor-aligned dq vector back into the stationary αβ frame.
 #[inline]
-pub fn inverse_park<N: Scalar>(d: N, q: N, sin_theta: N, cos_theta: N) -> (N, N) {
+pub fn inverse_park(d: Fixed, q: Fixed, sin_theta: Fixed, cos_theta: Fixed) -> (Fixed, Fixed) {
     (cos_theta * d - sin_theta * q, sin_theta * d + cos_theta * q)
 }
 

@@ -21,10 +21,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            . -> target
-            oxifoc-f103 -> oxifoc-f103/target
-            oxifoc-f103-calibration -> oxifoc-f103-calibration/target
+          workspaces: . -> target
 
       - name: Install just
         uses: taiki-e/install-action@just

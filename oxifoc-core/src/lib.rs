@@ -32,9 +32,7 @@ pub mod foc {
     pub mod trig;
 
     pub use control_types::{AlphaBeta, Dq, PwmDuty};
-    pub use controller::{
-        DecouplingModel, FixedDecoupling, FixedFocController, FocController, NoDecoupling,
-    };
-    pub use numeric::{Fixed, Scalar};
+    pub use controller::{DecouplingModel, FixedDecoupling, FocController, NoDecoupling};
+    pub use numeric::Fixed;
     pub use pi_controller::PIController;
 }

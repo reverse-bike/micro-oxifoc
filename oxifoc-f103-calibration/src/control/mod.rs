@@ -4,30 +4,22 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-use oxifoc_core::foc::{Dq, Fixed, FixedFocController, NoDecoupling, PIController};
+use oxifoc_core::foc::{Dq, Fixed};
+use oxifoc_f103::control::{BoardFocController, actuation_advance_from_erpm, board_foc_controller};
 use oxifoc_f103::{config as board_config, hardware::peripherals as hardware, safety};
 
 use crate::calibration::{
-    flux_linkage::{FluxLinkageCalibration, Observation as FluxObservation},
-    hall_calibration::HallCalibration,
-    inductance::{
-        InductanceCalibration, Observation as InductanceObservation, PULSE_DIAGNOSTIC_COUNT,
-        PulseDiagnostic,
-    },
-    resistance::{Point, ResistanceCalibration, Sample},
+    flux_linkage::Observation as FluxObservation,
+    inductance::{Observation as InductanceObservation, PULSE_DIAGNOSTIC_COUNT, PulseDiagnostic},
+    resistance::{Point, Sample},
+    sequence::{RoutineRequest, Sequences},
     types::{Actuation, Failure, Routine},
 };
 use crate::config as calibration_config;
 
 const CONTROL_BUDGET_CYCLES: u32 = board_config::SYSCLK_HZ / board_config::PWM_HZ;
 
-type CalibrationFocController = FixedFocController<
-    { board_config::FOC_DEAD_TIME_COMP_NUMERATOR },
-    { board_config::FOC_DEAD_TIME_COMP_DENOMINATOR },
-    NoDecoupling,
->;
-
-static REQUESTED_ROUTINE: AtomicU8 = AtomicU8::new(Routine::None as u8);
+static REQUESTED_ROUTINE: RoutineRequest = RoutineRequest::new();
 static ABORT_REASON: AtomicU8 = AtomicU8::new(Failure::None as u8);
 static BUS_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
 static CONTROL_CYCLES: AtomicU32 = AtomicU32::new(0);
@@ -80,12 +72,8 @@ pub struct Snapshot {
 }
 
 struct ControlState {
-    controller: CalibrationFocController,
-    routine: Routine,
-    resistance: ResistanceCalibration,
-    inductance: InductanceCalibration,
-    flux_linkage: FluxLinkageCalibration,
-    hall: HallCalibration,
+    controller: BoardFocController,
+    sequences: Sequences,
     offsets: hardware::CurrentOffsets,
     output_active: bool,
     voltage_limited: bool,
@@ -106,12 +94,8 @@ pub fn start(offsets: hardware::CurrentOffsets) {
     // SAFETY: TIM1_UP remains masked until start_tim1_control_loop returns.
     unsafe {
         (*CONTROL.0.get()).write(ControlState {
-            controller: calibration_controller(),
-            routine: Routine::None,
-            resistance: ResistanceCalibration::new(),
-            inductance: InductanceCalibration::new(),
-            flux_linkage: FluxLinkageCalibration::new(),
-            hall: HallCalibration::new(),
+            controller: board_foc_controller(),
+            sequences: Sequences::new(),
             offsets,
             output_active: false,
             voltage_limited: false,
@@ -137,7 +121,7 @@ pub fn request_resistance() -> bool {
     if snapshot.active || snapshot.fault_flags != 0 {
         return false;
     }
-    REQUESTED_ROUTINE.store(Routine::Resistance as u8, Ordering::Release);
+    REQUESTED_ROUTINE.request(Routine::Resistance);
     true
 }
 
@@ -146,7 +130,7 @@ pub fn request_inductance() -> bool {
     if snapshot.active || snapshot.fault_flags != 0 || snapshot.effective_uv_per_count == 0 {
         return false;
     }
-    REQUESTED_ROUTINE.store(Routine::Inductance as u8, Ordering::Release);
+    REQUESTED_ROUTINE.request(Routine::Inductance);
     true
 }
 
@@ -160,7 +144,7 @@ pub fn request_flux_linkage() -> bool {
     {
         return false;
     }
-    REQUESTED_ROUTINE.store(Routine::FluxLinkage as u8, Ordering::Release);
+    REQUESTED_ROUTINE.request(Routine::FluxLinkage);
     true
 }
 
@@ -169,17 +153,26 @@ pub fn request_hall() -> bool {
     if snapshot.active || snapshot.fault_flags != 0 {
         return false;
     }
-    REQUESTED_ROUTINE.store(Routine::Hall as u8, Ordering::Release);
+    REQUESTED_ROUTINE.request(Routine::Hall);
     true
 }
 
-pub fn abort(reason: Failure) {
-    let reason = if reason == Failure::None {
-        Failure::Stopped
-    } else {
-        reason
-    };
+/// Withdraws a routine start the control loop has not taken yet.
+pub fn cancel_request() {
+    let _ = REQUESTED_ROUTINE.cancel();
+}
+
+/// Requests that the control loop fail the active routine for `reason`.
+pub fn abort(reason: Abort) {
     ABORT_REASON.store(reason as u8, Ordering::Release);
+}
+
+/// Foreground reasons for ending a routine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Abort {
+    Stopped = Failure::Stopped as u8,
+    LocalInterlock = Failure::LocalInterlock as u8,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -193,15 +186,16 @@ pub fn snapshot() -> Snapshot {
         let state_ptr = unsafe { (*CONTROL.0.get()).as_ptr() };
         // SAFETY: foreground holds the critical section for this shared read.
         let state = unsafe { &*state_ptr };
-        let resistance = state.resistance.result();
-        let inductance = state.inductance.result();
-        let flux_linkage = state.flux_linkage.result();
-        let hall = state.hall.result();
+        let sequences = &state.sequences;
+        let resistance = sequences.resistance.result();
+        let inductance = sequences.inductance.result();
+        let flux_linkage = sequences.flux_linkage.result();
+        let hall = sequences.hall.result();
         Snapshot {
-            routine: state.routine,
-            state: sequence_state(state),
-            failure: sequence_failure(state),
-            active: sequence_active(state),
+            routine: sequences.routine,
+            state: sequences.state(),
+            failure: sequences.failure(),
+            active: sequences.active(),
             output_active: state.output_active,
             voltage_limited: state.voltage_limited,
             target_d_counts: state.target_d_counts,
@@ -212,7 +206,7 @@ pub fn snapshot() -> Snapshot {
             high: resistance.high,
             effective_uv_per_count: resistance.effective_uv_per_count,
             nominal_resistance_uohm: resistance.nominal_resistance_uohm,
-            sample_progress: sequence_progress(state),
+            sample_progress: sequences.progress(),
             inductance_d_nwb_per_count: inductance.inductance_d_nwb_per_count,
             inductance_q_nwb_per_count: inductance.inductance_q_nwb_per_count,
             residual_dead_time_uv: inductance.residual_dead_time_uv,
@@ -248,7 +242,13 @@ pub fn pulse_diagnostic(slot: u8) -> PulseDiagnostic {
         // the interrupt is masked for this single diagnostic copy.
         let state_ptr = unsafe { (*CONTROL.0.get()).as_ptr() };
         // SAFETY: the outer cell remains initialized for the application life.
-        unsafe { (&*state_ptr).inductance.result().pulse_diagnostics[usize::from(slot)] }
+        unsafe {
+            (&*state_ptr)
+                .sequences
+                .inductance
+                .result()
+                .pulse_diagnostics[usize::from(slot)]
+        }
     })
 }
 
@@ -303,7 +303,7 @@ fn control_cycle() {
 
     // Consume every request exactly once even if an abort or hardware fault
     // wins this cycle. Clearing a later fault must never revive an old start.
-    let requested_routine = take_requested_routine();
+    let requested_routine = REQUESTED_ROUTINE.take();
     if let Some(reason) = take_abort_reason() {
         fail_and_stop(state, reason);
         return;
@@ -315,34 +315,9 @@ fn control_cycle() {
     if requested_routine != Routine::None {
         state.controller.reset();
         state.maximum_phase_current_abs = 0;
-        match requested_routine {
-            Routine::Resistance => {
-                state.routine = Routine::Resistance;
-                state.resistance.start();
-            }
-            Routine::Inductance => {
-                state.routine = Routine::Inductance;
-                state
-                    .inductance
-                    .start(state.resistance.result().effective_uv_per_count);
-            }
-            Routine::FluxLinkage => {
-                let inductance = state.inductance.result();
-                state.routine = Routine::FluxLinkage;
-                state.flux_linkage.start(
-                    state.resistance.result().effective_uv_per_count,
-                    inductance.inductance_d_nwb_per_count,
-                    inductance.inductance_q_nwb_per_count,
-                );
-            }
-            Routine::Hall => {
-                state.routine = Routine::Hall;
-                state.hall.start();
-            }
-            Routine::None => {}
-        }
+        state.sequences.start(requested_routine);
     }
-    if !sequence_active(state) {
+    if !state.sequences.active() {
         stop_output(state);
         return;
     }
@@ -369,10 +344,12 @@ fn control_cycle() {
 
     let phase_a = Fixed::from_integer(i32::from(current.phase_a));
     let phase_b = Fixed::from_integer(i32::from(current.phase_b));
-    let actuation = sequence_actuation(state);
+    let actuation = state.sequences.actuation();
     state
         .controller
-        .set_actuation_advance(actuation_advance_from_erpm(sequence_electrical_rpm(state)));
+        .set_actuation_advance(actuation_advance_from_erpm(
+            state.sequences.electrical_rpm(),
+        ));
     let (measured, duties) = match actuation {
         Actuation::Off => {
             stop_output(state);
@@ -424,7 +401,7 @@ fn control_cycle() {
         bus_voltage_mv,
     );
 
-    if !sequence_active(state) {
+    if !state.sequences.active() {
         stop_output(state);
         return;
     }
@@ -436,16 +413,12 @@ fn control_cycle() {
     safety::record_control_checkpoint(safety::checkpoint::PWM_WRITTEN);
 }
 
+/// Fails the active routine, recording the safety loss once, and keeps the
+/// outputs stopped. An idle loop keeps every finished result unchanged.
 fn fail_and_stop(state: &mut ControlState, failure: Failure) {
-    match state.routine {
-        Routine::Inductance => state.inductance.fail(failure),
-        Routine::FluxLinkage => state.flux_linkage.fail(failure),
-        Routine::Hall => state.hall.fail(failure),
-        Routine::None | Routine::Resistance => {
-            state.resistance.fail(failure);
-        }
+    if state.sequences.fail_active(failure) {
+        safety::record_safety_loss(failure as u8);
     }
-    safety::record_safety_loss(failure as u8);
     stop_output(state);
 }
 
@@ -463,87 +436,8 @@ fn stop_output(state: &mut ControlState) {
 fn take_abort_reason() -> Option<Failure> {
     match ABORT_REASON.swap(Failure::None as u8, Ordering::AcqRel) {
         0 => None,
-        1 => Some(Failure::Stopped),
-        2 => Some(Failure::LocalInterlock),
-        3 => Some(Failure::CurrentSample),
-        4 => Some(Failure::PhaseOvercurrent),
-        5 => Some(Failure::HardwareFault),
-        6 => Some(Failure::PwmOutput),
-        7 => Some(Failure::ControlTiming),
-        8 => Some(Failure::CurrentDidNotSettle),
-        9 => Some(Failure::InvalidSlope),
-        10 => Some(Failure::BusVoltage),
-        11 => Some(Failure::MissingPrerequisite),
-        12 => Some(Failure::PulseResponse),
-        13 => Some(Failure::InductanceRange),
-        14 => Some(Failure::MotorNotResponding),
-        15 => Some(Failure::FluxRange),
-        _ => Some(Failure::HallStates),
-    }
-}
-
-fn take_requested_routine() -> Routine {
-    match REQUESTED_ROUTINE.swap(Routine::None as u8, Ordering::AcqRel) {
-        1 => Routine::Resistance,
-        2 => Routine::Inductance,
-        3 => Routine::FluxLinkage,
-        4 => Routine::Hall,
-        _ => Routine::None,
-    }
-}
-
-fn sequence_active(state: &ControlState) -> bool {
-    match state.routine {
-        Routine::Resistance => state.resistance.active(),
-        Routine::Inductance => state.inductance.active(),
-        Routine::FluxLinkage => state.flux_linkage.active(),
-        Routine::Hall => state.hall.active(),
-        Routine::None => false,
-    }
-}
-
-fn sequence_state(state: &ControlState) -> u8 {
-    match state.routine {
-        Routine::Resistance => state.resistance.state() as u8,
-        Routine::Inductance => state.inductance.state() as u8,
-        Routine::FluxLinkage => state.flux_linkage.state() as u8,
-        Routine::Hall => state.hall.state() as u8,
-        Routine::None => 0,
-    }
-}
-
-fn sequence_failure(state: &ControlState) -> Failure {
-    match state.routine {
-        Routine::Resistance => state.resistance.failure(),
-        Routine::Inductance => state.inductance.failure(),
-        Routine::FluxLinkage => state.flux_linkage.failure(),
-        Routine::Hall => state.hall.failure(),
-        Routine::None => Failure::None,
-    }
-}
-
-fn sequence_progress(state: &ControlState) -> u16 {
-    match state.routine {
-        Routine::Resistance => state.resistance.sample_progress(),
-        Routine::Inductance => state.inductance.pulse_progress(),
-        Routine::FluxLinkage => state.flux_linkage.progress(),
-        Routine::Hall => state.hall.progress(),
-        Routine::None => 0,
-    }
-}
-
-fn sequence_actuation(state: &ControlState) -> Actuation {
-    match state.routine {
-        Routine::Resistance if state.resistance.energizing() => Actuation::Current {
-            angle: 0,
-            direct_counts: state.resistance.target_counts(),
-            quadrature_counts: 0,
-        },
-        Routine::Resistance => Actuation::Off,
-        Routine::Inductance => state.inductance.actuation(),
-        Routine::FluxLinkage => state.flux_linkage.actuation(),
-        Routine::Hall => state.hall.actuation(),
-        Routine::None => Actuation::Off,
+        reason if reason == Abort::LocalInterlock as u8 => Some(Failure::LocalInterlock),
+        _ => Some(Failure::Stopped),
     }
 }
 
@@ -555,20 +449,21 @@ fn observe_sequence(
     applied_q_tick_bits: i32,
     bus_voltage_mv: u32,
 ) {
-    match state.routine {
-        Routine::Resistance => state.resistance.tick(Sample {
+    let sequences = &mut state.sequences;
+    match sequences.routine {
+        Routine::Resistance => sequences.resistance.tick(Sample {
             measured_d_counts,
             applied_d_tick_bits,
             bus_voltage_mv,
         }),
-        Routine::Inductance => state.inductance.observe(InductanceObservation {
+        Routine::Inductance => sequences.inductance.observe(InductanceObservation {
             measured_d_counts,
             applied_d_tick_bits,
             bus_voltage_mv,
         }),
         Routine::FluxLinkage => {
             let (hall_sequence, _, _) = hardware::hall_edge_snapshot();
-            state.flux_linkage.observe(FluxObservation {
+            sequences.flux_linkage.observe(FluxObservation {
                 measured_d_counts,
                 measured_q_counts,
                 applied_d_tick_bits,
@@ -577,33 +472,9 @@ fn observe_sequence(
                 hall_sequence,
             });
         }
-        Routine::Hall => state.hall.observe(hardware::live_hall_state()),
+        Routine::Hall => sequences.hall.observe(hardware::live_hall_state()),
         Routine::None => {}
     }
-}
-
-fn sequence_electrical_rpm(state: &ControlState) -> i32 {
-    match state.routine {
-        Routine::FluxLinkage => state.flux_linkage.electrical_rpm(),
-        Routine::None | Routine::Resistance | Routine::Inductance | Routine::Hall => 0,
-    }
-}
-
-fn actuation_advance_from_erpm(electrical_rpm: i32) -> Fixed {
-    Fixed::from_bits((electrical_rpm * 1_757) >> 12)
-}
-
-const fn calibration_controller() -> CalibrationFocController {
-    let pi = PIController::new(
-        board_config::CURRENT_PI_PROPORTIONAL_GAIN,
-        board_config::CURRENT_PI_INTEGRAL_GAIN_PER_CYCLE,
-    );
-    CalibrationFocController::new(
-        pi,
-        pi,
-        board_config::FOC_VECTOR_LIMIT_TICKS,
-        board_config::FOC_PHASE_LIMIT_TICKS,
-    )
 }
 
 fn saturating_i32_to_i16(value: i32) -> i16 {

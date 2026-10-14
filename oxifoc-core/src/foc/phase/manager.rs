@@ -12,7 +12,6 @@ use super::observer::signed_angle_difference;
 use super::{
     BackEmfObserver, PhaseEstimate, PhaseInput, PhaseProvider, PhaseSource, PhaseSourceError,
 };
-use crate::foc::trig::Turns;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObserverDiagnostics {
@@ -131,7 +130,7 @@ impl<H> PhaseManager<H> {
         result
     }
 
-    fn observer_estimate(&self) -> Option<PhaseEstimate<Turns>> {
+    fn observer_estimate(&self) -> Option<PhaseEstimate> {
         let observer = self.observer.as_ref()?;
         Some(PhaseEstimate {
             angle: observer.phase(),
@@ -140,15 +139,14 @@ impl<H> PhaseManager<H> {
         })
     }
 
-    fn select_estimate(
-        &mut self,
-        hall: Option<PhaseEstimate<Turns>>,
-    ) -> Option<PhaseEstimate<Turns>> {
-        if self.observer_seed_requested {
-            if let (Some(sensor), Some(observer)) = (hall, &mut self.observer) {
-                observer.reset();
-                observer.seed(sensor.angle, sensor.electrical_rpm);
-            }
+    fn select_estimate(&mut self, hall: Option<PhaseEstimate>) -> Option<PhaseEstimate> {
+        // A pending seed survives cycles without a Hall estimate so the first
+        // available Hall phase starts the observer epoch.
+        if self.observer_seed_requested
+            && let (Some(sensor), Some(observer)) = (hall, &mut self.observer)
+        {
+            observer.reset();
+            observer.seed(sensor.angle, sensor.electrical_rpm);
             self.observer_seed_requested = false;
         }
 
@@ -215,54 +213,17 @@ impl<H> PhaseManager<H> {
 
 impl<H> PhaseProvider for PhaseManager<H>
 where
-    H: PhaseProvider<Fixed, Angle = Turns>,
+    H: PhaseProvider,
 {
-    type Angle = Turns;
-
     fn source(&self) -> PhaseSource {
         self.source
-    }
-
-    fn estimate(&self, elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
-        let hall = self.hall.estimate(elapsed_since_observation_us);
-        match self.source {
-            PhaseSource::Hall => hall,
-            PhaseSource::Observer => self
-                .observer_estimate()
-                .filter(|estimate| estimate.trustworthy),
-            PhaseSource::HallToObserver {
-                blend_low_erpm,
-                blend_high_erpm,
-            } => match (hall, self.observer_estimate()) {
-                (Some(sensor), Some(observer)) if observer.trustworthy => {
-                    let blend = crossover_blend(
-                        sensor
-                            .electrical_rpm
-                            .unsigned_abs()
-                            .max(observer.electrical_rpm.unsigned_abs()),
-                        blend_low_erpm,
-                        blend_high_erpm,
-                    );
-                    if blend == Fixed::ZERO {
-                        Some(sensor)
-                    } else if blend == Fixed::ONE {
-                        Some(observer)
-                    } else {
-                        Some(blend_estimates(sensor, observer, blend))
-                    }
-                }
-                (Some(sensor), _) => Some(sensor),
-                (None, Some(observer)) if observer.trustworthy => Some(observer),
-                _ => None,
-            },
-        }
     }
 
     fn estimate_for_control(
         &mut self,
         elapsed_since_observation_us: u32,
         control_period_ns: u32,
-    ) -> Option<PhaseEstimate<Turns>> {
+    ) -> Option<PhaseEstimate> {
         let hall = self
             .hall
             .estimate_for_control(elapsed_since_observation_us, control_period_ns);
@@ -274,14 +235,6 @@ where
         if let Some(observer) = &mut self.observer {
             observer.update(input);
         }
-    }
-
-    fn injection(&self) -> crate::foc::Dq {
-        self.hall.injection()
-    }
-
-    fn request_source(&mut self, source: PhaseSource) -> bool {
-        self.set_source(source).is_ok()
     }
 }
 
@@ -314,11 +267,7 @@ fn ratio_u32_q16(numerator: u32, denominator: u32) -> Fixed {
     )
 }
 
-fn blend_estimates(
-    sensor: PhaseEstimate<Turns>,
-    observer: PhaseEstimate<Turns>,
-    blend: Fixed,
-) -> PhaseEstimate<Turns> {
+fn blend_estimates(sensor: PhaseEstimate, observer: PhaseEstimate, blend: Fixed) -> PhaseEstimate {
     let angle_error = signed_angle_difference(observer.angle, sensor.angle);
     let blended_angle = sensor
         .angle
@@ -344,6 +293,7 @@ fn scale_i32(value: i32, scale: Fixed) -> i32 {
 mod tests {
     use super::*;
     use crate::foc::AlphaBeta;
+    use crate::foc::trig::Turns;
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct TestHall {
@@ -353,13 +303,15 @@ mod tests {
     }
 
     impl PhaseProvider for TestHall {
-        type Angle = Turns;
-
         fn source(&self) -> PhaseSource {
             PhaseSource::Hall
         }
 
-        fn estimate(&self, _elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
+        fn estimate_for_control(
+            &mut self,
+            _elapsed_since_observation_us: u32,
+            _control_period_ns: u32,
+        ) -> Option<PhaseEstimate> {
             self.valid.then_some(PhaseEstimate {
                 angle: self.angle,
                 electrical_rpm: self.electrical_rpm,
@@ -490,6 +442,24 @@ mod tests {
         let _ = manager.estimate_for_control(0, 62_500);
         assert_eq!(manager.observer().unwrap().phase(), hall.angle);
         assert!((manager.observer().unwrap().electrical_rpm() + 5_000).unsigned_abs() < 2);
+    }
+
+    #[test]
+    fn requested_seed_waits_for_an_available_hall_estimate() {
+        let hall = TestHall {
+            angle: 0x3000_0000,
+            electrical_rpm: 4_500,
+            valid: false,
+        };
+        let mut manager = PhaseManager::with_hall(hall);
+        manager.set_observer(observer());
+        manager.request_observer_seed();
+        assert_eq!(manager.estimate_for_control(0, 62_500), None);
+        assert_eq!(manager.observer().unwrap().phase(), 0);
+
+        manager.hall_mut().valid = true;
+        let _ = manager.estimate_for_control(0, 62_500);
+        assert_eq!(manager.observer().unwrap().phase(), hall.angle);
     }
 
     #[test]

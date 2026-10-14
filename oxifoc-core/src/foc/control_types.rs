@@ -1,21 +1,21 @@
-//! Frame and PWM values shared by every numeric backend.
+//! Frame and PWM values shared by the fixed-point control path.
 
-use super::numeric::{Fixed, Scalar};
+use super::numeric::Fixed;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AlphaBeta<N: Scalar = Fixed> {
-    pub alpha: N,
-    pub beta: N,
+pub struct AlphaBeta {
+    pub alpha: Fixed,
+    pub beta: Fixed,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Dq<N: Scalar = Fixed> {
-    pub d: N,
-    pub q: N,
+pub struct Dq {
+    pub d: Fixed,
+    pub q: Fixed,
 }
 
-impl<N: Scalar> Dq<N> {
-    pub const fn new(d: N, q: N) -> Self {
+impl Dq {
+    pub const fn new(d: Fixed, q: Fixed) -> Self {
         Self { d, q }
     }
 }

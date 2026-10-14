@@ -42,6 +42,7 @@ impl RideCan {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeTelemetry {
+    pub inputs: sensors::Snapshot,
     pub vehicle_speed_tenths_kph: u16,
     pub distance_counter: u32,
     pub cadence: sensors::cadence::Observation,
@@ -50,13 +51,20 @@ pub struct RuntimeTelemetry {
     pub transient_budget_ms: u16,
     pub derating_reasons: u8,
     pub ride_stage: u8,
+    pub fault_lockout: bool,
 }
 
 impl RideCan {
     #[inline(never)]
     #[optimize(size)]
-    pub fn service(&mut self, now_ms: u32, runtime: RuntimeTelemetry) {
+    /// `runtime` is evaluated only when a telemetry slot is due.
+    pub fn service(&mut self, now_ms: u32, runtime: impl FnOnce() -> RuntimeTelemetry) {
+        let next = self.next_telemetry_ms;
+        if next != now_ms && next.wrapping_sub(now_ms) < 0x8000_0000 {
+            return;
+        }
         let RuntimeTelemetry {
+            inputs,
             vehicle_speed_tenths_kph,
             distance_counter,
             cadence,
@@ -65,15 +73,11 @@ impl RideCan {
             transient_budget_ms,
             derating_reasons,
             ride_stage,
-        } = runtime;
-        let next = self.next_telemetry_ms;
-        if next != now_ms && next.wrapping_sub(now_ms) < 0x8000_0000 {
-            return;
-        }
+            fault_lockout,
+        } = runtime();
         self.next_telemetry_ms = now_ms.wrapping_add(50);
         let slot = self.telemetry_slot;
         self.telemetry_slot = protocol::next_telemetry_slot(slot);
-        let inputs = sensors::latest();
         let control = foc::diagnostic_snapshot();
         let fault_page = self.stock_fault_page;
         let controller_temperature = inputs.analog_valid.then(|| {
@@ -154,6 +158,7 @@ impl RideCan {
                 }),
                 5 => protocol::control_fault_telemetry(protocol::ControlFaultTelemetry {
                     fault_flags: control.fault_flags,
+                    fault_lockout,
                     safety_events: control.safety_events.min(u32::from(u16::MAX)) as u16,
                     last_safety_loss_reason: control.last_safety_loss_reason,
                 }),

@@ -1,15 +1,13 @@
 //! Poll-free bxCAN transport for the required stock-bike interface.
 
 use crate::config::BIKE_CONFIG;
-use crate::hardware::{gpio, peripherals};
+use crate::hardware::gpio;
+use crate::hardware::system::{RCC_APB1ENR, RCC_APB1RSTR, remap_afio, set_interrupt_priority};
 use crate::protocol::Frame;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
-const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
-const RCC_APB1RSTR: *mut u32 = 0x4002_1010 as *mut u32;
-const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
-const AFIO_MAPR: *mut u32 = 0x4001_0004 as *mut u32;
+const RCC_APB1ENR_CANEN: u32 = 1 << 25;
 
 const CAN_BASE: usize = 0x4000_6400;
 const CAN_MCR: *mut u32 = CAN_BASE as *mut u32;
@@ -39,7 +37,12 @@ const CAN_RESET_ACK: u32 = 1;
 const CAN_FIFO_PENDING_INTERRUPT: u32 = 1 << 1;
 const CAN_FIFO_RELEASE: u32 = 1 << 5;
 const CAN_FIFO_OVERRUN: u32 = 1 << 4;
-static TRANSMIT_LOCKED: AtomicBool = AtomicBool::new(false);
+/// NVIC priority of the FIFO0 receive interrupt, the only interrupt that
+/// transmits. It is below Hall capture, hardware break, and the FOC update.
+pub const RECEIVE_INTERRUPT_PRIORITY: u8 = 0x40;
+
+// BASEPRI 0 disables masking, so a zero priority could not guard transmit.
+const _: () = assert!(RECEIVE_INTERRUPT_PRIORITY != 0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterConfig {
@@ -53,19 +56,22 @@ impl BxCan {
     pub fn initialize(filters: FilterConfig) -> bool {
         // SAFETY: one-time peripheral setup before CAN IRQ is unmasked.
         unsafe {
-            write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | 1);
-            write_volatile(RCC_APB1ENR, read_volatile(RCC_APB1ENR) | (1 << 25));
-            write_volatile(RCC_APB1RSTR, read_volatile(RCC_APB1RSTR) | (1 << 25));
-            write_volatile(RCC_APB1RSTR, read_volatile(RCC_APB1RSTR) & !(1 << 25));
+            write_volatile(RCC_APB1ENR, read_volatile(RCC_APB1ENR) | RCC_APB1ENR_CANEN);
+            write_volatile(
+                RCC_APB1RSTR,
+                read_volatile(RCC_APB1RSTR) | RCC_APB1ENR_CANEN,
+            );
+            write_volatile(
+                RCC_APB1RSTR,
+                read_volatile(RCC_APB1RSTR) & !RCC_APB1ENR_CANEN,
+            );
 
             gpio::configure(BIKE_CONFIG.pins.can.rx, gpio::FLOATING_INPUT);
             gpio::configure(BIKE_CONFIG.pins.can.tx, gpio::ALTERNATE_PUSH_PULL_50MHZ);
             gpio::configure_output(BIKE_CONFIG.pins.can.transceiver_enable, true);
-            write_volatile(
-                AFIO_MAPR,
-                (read_volatile(AFIO_MAPR) & !((0b111 << 24) | (0b11 << 13)))
-                    | (0b100 << 24)
-                    | crate::config::can_remap_bits(),
+            remap_afio(
+                crate::config::AFIO_MAPR_CAN_REMAP_MASK,
+                crate::config::can_remap_bits(),
             );
 
             write_volatile(CAN_MCR, CAN_RESET_REQUEST);
@@ -106,7 +112,7 @@ impl BxCan {
             if !wait_msr(CAN_RESET_ACK, false) {
                 return false;
             }
-            peripherals::configure_can_interrupt_priority();
+            set_interrupt_priority(20, RECEIVE_INTERRUPT_PRIORITY);
             cortex_m::peripheral::NVIC::unmask(stm32f1::stm32f103::Interrupt::USB_LP_CAN_RX0);
         }
         true
@@ -119,27 +125,22 @@ pub fn transmit(frame: Frame) -> bool {
 
 impl BxCan {
     pub fn transmit(frame: Frame) -> bool {
-        if TRANSMIT_LOCKED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
+        // Raising BASEPRI to the receive-interrupt priority across selection
+        // and fill keeps the RX interrupt and foreground telemetry from
+        // selecting the same mailbox, so neither caller's frame is dropped by
+        // contention, while TIM1 update/break and Hall capture still preempt.
+        // BASEPRI_MAX only ever raises the mask, so a caller already running
+        // under a stricter BASEPRI keeps it, and the previous value is
+        // restored afterwards. Inside the receive interrupt the raise is a
+        // no-op because execution is already at that priority.
+        let previous_basepri = cortex_m::register::basepri::read();
+        cortex_m::register::basepri_max::write(RECEIVE_INTERRUPT_PRIORITY);
+        compiler_fence(Ordering::SeqCst);
         // SAFETY: mailbox ownership is claimed by setting TXRQ only after all
-        // fields are written. The nonblocking software lock prevents the RX
-        // interrupt and foreground telemetry from selecting the same mailbox.
-        let transmitted = unsafe {
-            let empty = read_volatile(CAN_TSR) >> 26;
-            let mailbox = if empty & 1 != 0 {
-                Some(0)
-            } else if empty & 2 != 0 {
-                Some(1)
-            } else if empty & 4 != 0 {
-                Some(2)
-            } else {
-                None
-            };
-            if let Some(mailbox) = mailbox {
+        // fields are written, and no other transmitter can preempt this
+        // section while BASEPRI masks the receive interrupt.
+        let sent = unsafe {
+            if let Some(mailbox) = super::first_empty_mailbox(read_volatile(CAN_TSR)) {
                 let base = CAN_BASE + 0x180 + mailbox * 0x10;
                 write_volatile(base as *mut u32, u32::from(frame.id) << 21);
                 write_volatile((base + 4) as *mut u32, u32::from(frame.len));
@@ -167,8 +168,11 @@ impl BxCan {
                 false
             }
         };
-        TRANSMIT_LOCKED.store(false, Ordering::Release);
-        transmitted
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: restores the mask that was active on entry, which is never
+        // lower than the caller's own masking requirement.
+        unsafe { cortex_m::register::basepri::write(previous_basepri) };
+        sent
     }
 }
 

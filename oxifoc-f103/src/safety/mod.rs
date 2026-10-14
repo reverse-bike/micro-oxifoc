@@ -9,6 +9,17 @@ pub mod reset_flag {
     pub const LOW_POWER: u8 = 1 << 5;
 }
 
+/// Bits of the internal fault mask reported on project telemetry page 12.
+pub mod fault_flag {
+    pub const HARDWARE_BREAK: u32 = 1;
+    pub const PWM_RANGE: u32 = 1 << 1;
+    pub const HALL_CAPTURE: u32 = 1 << 2;
+    pub const CONTROL_TIMING: u32 = 1 << 3;
+    /// Telemetry-only: repeated power-stage faults stopped acknowledgement
+    /// until the next reset.
+    pub const RETRY_LOCKOUT: u32 = 1 << 7;
+}
+
 pub mod fatal_reason {
     pub const NONE: u8 = 0;
     pub const PANIC: u8 = 1;
@@ -132,6 +143,98 @@ pub const fn watchdog_progressed(
         && (injected_samples != previous_injected_samples || latched_safe_off)
 }
 
+/// Interval between foreground independent-watchdog refresh attempts.
+#[cfg(any(feature = "board", test))]
+pub const MAIN_LOOP_FEED_PERIOD_MS: u32 = 10;
+
+/// Control-interrupt progress observed by the foreground watchdog service.
+#[cfg(any(feature = "board", test))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlProgress {
+    pub control_cycles: u32,
+    pub injected_samples: u32,
+    pub fault_flags: u32,
+    pub output_active: bool,
+}
+
+/// Foreground half of the independent watchdog. It refreshes only after the
+/// control interrupt has visibly progressed since the previous refresh.
+#[cfg(any(feature = "board", test))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MainLoopWatchdog {
+    started: bool,
+    last_feed_ms: u32,
+    last_control_cycles: u32,
+    last_injected_samples: u32,
+}
+
+#[cfg(any(feature = "board", test))]
+impl MainLoopWatchdog {
+    pub const fn new() -> Self {
+        Self {
+            started: false,
+            last_feed_ms: 0,
+            last_control_cycles: 0,
+            last_injected_samples: 0,
+        }
+    }
+
+    const fn arm(&mut self, progress: ControlProgress) {
+        self.started = true;
+        self.last_control_cycles = progress.control_cycles;
+        self.last_injected_samples = progress.injected_samples;
+    }
+
+    /// Returns whether the watchdog may be refreshed at `now_ms`. Progress is
+    /// sampled only once a refresh is due; a latched fault counts as progress
+    /// only while outputs are confirmed off.
+    fn poll(
+        &mut self,
+        now_ms: u32,
+        progress: impl FnOnce() -> ControlProgress,
+        motor_outputs_disabled: impl FnOnce() -> bool,
+    ) -> bool {
+        if !self.started || now_ms.wrapping_sub(self.last_feed_ms) < MAIN_LOOP_FEED_PERIOD_MS {
+            return false;
+        }
+        let progress = progress();
+        let latched_safe_off =
+            progress.fault_flags != 0 && !progress.output_active && motor_outputs_disabled();
+        if !watchdog_progressed(
+            self.last_control_cycles,
+            progress.control_cycles,
+            self.last_injected_samples,
+            progress.injected_samples,
+            latched_safe_off,
+        ) {
+            return false;
+        }
+        self.last_feed_ms = now_ms;
+        self.last_control_cycles = progress.control_cycles;
+        self.last_injected_samples = progress.injected_samples;
+        true
+    }
+}
+
+#[cfg(feature = "board")]
+impl MainLoopWatchdog {
+    /// Starts both hardware watchdogs from the current control progress.
+    pub fn start(&mut self, progress: ControlProgress) {
+        self.arm(progress);
+        start();
+    }
+
+    pub fn service(&mut self, now_ms: u32, progress: impl FnOnce() -> ControlProgress) {
+        if self.poll(
+            now_ms,
+            progress,
+            crate::hardware::peripherals::motor_outputs_disabled,
+        ) {
+            feed_main_loop();
+        }
+    }
+}
+
 #[cfg(feature = "board")]
 mod runtime;
 #[cfg(feature = "board")]
@@ -183,6 +286,48 @@ mod tests {
         assert!(!watchdog_progressed(100, 101, 200, 200, false));
         assert!(watchdog_progressed(100, 101, 200, 200, true));
         assert!(!watchdog_progressed(100, 100, 200, 201, true));
+    }
+
+    #[test]
+    fn main_loop_watchdog_feeds_only_on_period_and_progress() {
+        let progress = |control_cycles, injected_samples| ControlProgress {
+            control_cycles,
+            injected_samples,
+            ..ControlProgress::default()
+        };
+        let mut watchdog = MainLoopWatchdog::new();
+        assert!(!watchdog.poll(100, || progress(1, 1), || true));
+
+        watchdog.arm(progress(10, 20));
+        assert!(!watchdog.poll(MAIN_LOOP_FEED_PERIOD_MS - 1, || progress(11, 21), || true));
+        assert!(watchdog.poll(MAIN_LOOP_FEED_PERIOD_MS, || progress(11, 21), || true));
+        let next = 2 * MAIN_LOOP_FEED_PERIOD_MS;
+        assert!(!watchdog.poll(next, || progress(12, 21), || true));
+        assert!(!watchdog.poll(
+            next,
+            || ControlProgress {
+                fault_flags: 1,
+                output_active: true,
+                ..progress(12, 21)
+            },
+            || true,
+        ));
+        assert!(!watchdog.poll(
+            next,
+            || ControlProgress {
+                fault_flags: 1,
+                ..progress(12, 21)
+            },
+            || false,
+        ));
+        assert!(watchdog.poll(
+            next,
+            || ControlProgress {
+                fault_flags: 1,
+                ..progress(12, 21)
+            },
+            || true,
+        ));
     }
 
     #[test]

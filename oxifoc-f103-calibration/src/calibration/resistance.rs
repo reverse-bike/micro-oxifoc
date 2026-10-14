@@ -6,6 +6,7 @@
 //! offsets. Conversion to physical resistance remains explicitly dependent on
 //! the nominal current-sensor scale.
 
+use super::math::{div_round, saturating_i64_to_i16, settled};
 use super::types::Failure;
 use crate::config::{
     NOMINAL_CURRENT_MA_PER_COUNT, PWM_HZ, PWM_PERIOD_TICKS, RESISTANCE_CURRENT_HIGH_COUNTS,
@@ -131,7 +132,6 @@ pub struct ResistanceCalibration {
     low_accumulator: Accumulator,
     high_accumulator: Accumulator,
     result: Result,
-    pending_failure: Failure,
 }
 
 impl ResistanceCalibration {
@@ -170,7 +170,6 @@ impl ResistanceCalibration {
                 effective_uv_per_count: 0,
                 nominal_resistance_uohm: 0,
             },
-            pending_failure: Failure::None,
         }
     }
 
@@ -182,7 +181,6 @@ impl ResistanceCalibration {
     pub fn fail(&mut self, failure: Failure) {
         self.state = State::Failed;
         self.failure = failure;
-        self.pending_failure = Failure::None;
         self.cycle_in_state = 0;
     }
 
@@ -280,14 +278,13 @@ impl ResistanceCalibration {
                 self.state = State::FinalizeSlope;
             }
             State::FinalizeSlope => {
-                self.pending_failure = self.calculate_result();
-                if self.pending_failure == Failure::None {
+                let failure = self.calculate_result();
+                if failure == Failure::None {
                     self.state = State::Complete;
                 } else {
                     self.state = State::Failed;
-                    self.failure = self.pending_failure;
+                    self.failure = failure;
                 }
-                self.pending_failure = Failure::None;
             }
         }
     }
@@ -339,23 +336,6 @@ fn ramp(start: i16, end: i16, cycle: u32) -> i16 {
     let start = i32::from(start);
     let span = i32::from(end) - start;
     (start + span * step as i32 / RAMP_STEPS as i32) as i16
-}
-
-fn settled(measured: i16, target: i16) -> bool {
-    let tolerance = i32::from(target).unsigned_abs().saturating_mul(3) / 10;
-    (i32::from(measured) - i32::from(target)).unsigned_abs() <= tolerance.max(2)
-}
-
-fn div_round(value: i64, divisor: i64) -> i64 {
-    if value < 0 {
-        (value - divisor / 2) / divisor
-    } else {
-        (value + divisor / 2) / divisor
-    }
-}
-
-fn saturating_i64_to_i16(value: i64) -> i16 {
-    value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
 }
 
 #[cfg(test)]

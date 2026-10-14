@@ -38,11 +38,13 @@ src/
 ├── app.rs                 foreground ride application and owned state
 ├── config.rs              physical BikeConfig and derived F103 constants
 ├── control/
+│   ├── mod.rs             shared board controller, ride driver and ceilings
 │   ├── foc.rs             TIM1 current-control interrupt
 │   └── ride.rs            local ride state machine
 ├── hardware/
 │   ├── gpio.rs            pin-map-driven STM32F103 GPIO access
-│   └── peripherals.rs     clocks and raw STM32F103 peripheral access
+│   ├── peripherals.rs     clocks and raw STM32F103 peripheral access
+│   └── system.rs          shared RCC/AFIO/NVIC access and remaps
 ├── protocol/mod.rs        pure stock/project CAN frame encoding
 ├── sensors/
 │   ├── analog.rs          ADC/DMA input acquisition
@@ -135,7 +137,10 @@ for this controller family.
   the completed CC4-triggered injected ADC sample and runs FOC.
 - ADC1 channel 11 and ADC2 channel 12 sample phase A/B current. Phase C is
   reconstructed as `-(A+B)`, and current offsets are calibrated with the
-  motor PWM outputs disabled.
+  motor PWM outputs disabled. While undriven, the offsets track slow drift
+  only within 128 counts (12.8 A) of that boot calibration. Undriven samples
+  outside that window for a sustained 100 ms mark current sensing invalid,
+  which blocks a new ride until they have settled for the same duration.
 - TIM2 captures both polarities of the remapped XOR Hall input at 1 MHz. Ride
   control uses the four-run bidirectional calibration consensus
   `[5484, 15416, 26478, 38207, 49768, 60875]`. Below 500 eRPM,
@@ -184,6 +189,14 @@ acquisition, current trip, Hall loss, or another safety loss disarms the ride
 path until a fresh valid rest sample is observed. A latched hardware fault is
 acknowledged only in a throttle-rest pass, after ride authority is revoked,
 and only while PB12 is inactive; that pass cannot energize the motor.
+Three consecutive power-stage faults (a hardware break or PWM-range latch, or a
+software phase-overcurrent trip) without reaching normal Hall tracking in
+between stop acknowledgement and arming until the next reset. At most one
+fault counts per arming attempt, however long it stays latched: a software trip
+and the hardware break from the same event count once, and counting resumes
+only after the ride re-arms from throttle rest. Page 12 reports that lockout as
+fault-mask bit `0x80`. Hall-capture and control-timing faults remain
+acknowledgeable at throttle rest and do not count.
 
 The stock cadence sensor is active-low PB9 with a pull-up. Its 1 kHz tracker
 requires four matching samples per edge and three complete pulses before it
@@ -194,7 +207,7 @@ qualified low widths feeds the recovered stock `41074 / width_ms + 67` command
 curve, whose 0--2,500 range is normalized to 0--100 percent and saturates at a
 16 ms low width. Throttle travel is independently normalized to 0--100
 percent; the larger of throttle and cadence becomes the ride demand applied to
-the unchanged phase-current ceiling.
+the thermally derated phase-current ceiling.
 
 Cadence and throttle share one ride owner: either can sustain an active run,
 throttle can take over without a stop, and brake or any local protection
@@ -216,12 +229,33 @@ through the no-edge interval at zero speed; the ordinary edge deadline resumes
 as soon as progress recovers to the starting position. The software phase-
 current guard trips above 1,344 counts (134.4 A) on A, B, or reconstructed C,
 preserving about a 1.49-times margin over commanded phase
-current. The local 39 V undervoltage debounce and controller/motor thermal
-envelopes can only reduce the battery-current envelope. Its continuous limit
-is 431 projected counts, approximately 44 A at the BMS, while a full transient
-budget permits 640 projected counts, approximately 65 A. Current above the
-continuous limit consumes a budget equivalent to seven seconds at the full
-transient limit. Operation below the continuous limit restores that budget at
+current. The local 39 V undervoltage debounce can only reduce the
+battery-current envelope. The bus voltage is checked on every 1 ms ride pass
+but counted only on fresh 10 ms analog conversions, so one noisy conversion
+cannot trip it. Three consecutive conversions above 58 V (30 ms) revoke ride
+authority and report derating-reason bit `0x08`; it clears only after the bus
+has stayed at or below 57 V for at least as many conversions, and the ride then
+re-arms from throttle rest. The bus capacitance and the bounded regeneration
+current limit how far the bus can rise within that window. The 58 V cutoff leaves
+about 3.4 V above a fully charged 13S pack (54.6 V) for regenerative and
+measurement transients while staying below the calibration image's 60 V
+operating ceiling. Controller and motor temperatures scale both the
+phase-current ceiling and the battery-current envelope by the same fraction:
+full at or below the derating start temperature, zero at the stop temperature,
+and linear between them. The derated phase ceiling travels with each ride lease
+to the control interrupt, which uses it every cycle as the radius of the
+complete dq current command, so field-weakening d current and q current
+together stay inside it. Field weakening is limited to half of the derated
+ceiling, or its configured 200-count maximum if that is smaller, so a hot
+controller at speed keeps at least √3/2 of the ceiling for torque-producing q
+current instead of spending it on d current alone. A zero phase ceiling
+removes ride authority, and the current envelope itself commands no current at
+a zero radius. The
+measured overcurrent trips stay at their fixed thresholds. The continuous
+battery limit is 431 projected counts, approximately 44 A at the BMS, while a
+full transient budget permits 640 projected counts, approximately 65 A. Current
+above the continuous limit consumes a budget equivalent to seven seconds at the
+full transient limit. Operation below the continuous limit restores that budget at
 one-quarter rate; after exhaustion, the continuous limit remains active until
 recovery is complete. Budget accounting uses locally measured terminal power
 `Vd * Id + Vq * Iq`; it does not require BMS communication. The current limiter
@@ -231,7 +265,7 @@ DC-side clamp from a 2 ms low-pass of applied dq voltage using
 input. Field weakening begins only when high-speed motoring voltage exceeds
 1,209 ticks, ramps negative d toward 200 counts in 50 ms, and releases over
 200 ms once headroom returns. The d-priority current circle leaves 856 counts
-of q authority at that ceiling. The measured dq vector and each reconstructed
+of q authority at that ceiling when thermal derating is inactive. The measured dq vector and each reconstructed
 physical phase have independent overcurrent checks. The 1,273-tick voltage-
 vector ceiling preserves the requested dq direction, and the 1,103-tick
 centered PWM window reproduces the reviewed F103 modulation envelope. The PI
@@ -300,7 +334,7 @@ tools. Byte 3 contains the overflow above 255; new readers add the two bytes to
 recover effective DC limits through 510 counts. The 640-count transient state
 therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
-remains exact. Page 11 bytes 1--2 report how many milliseconds of equivalent
+remains exact. Bit `0x08` reports an active bus overvoltage cutoff. Page 11 bytes 1--2 report how many milliseconds of equivalent
 full-transient excess remain. Firmware-version page 18 reports telemetry
 schema 15.
 

@@ -72,7 +72,6 @@ pub struct PinMap {
     pub motor_temperature: AdcInput,
     pub bus_voltage: AdcInput,
     pub auxiliary_analog: AdcInput,
-    pub controller_temperature_adc_channel: u8,
     pub brake: GpioPin,
     pub wheel_speed: GpioPin,
     pub cadence: GpioPin,
@@ -95,6 +94,11 @@ pub struct SensorConfig {
     pub adc_levels: u32,
     pub phase_current_milliamps_per_adc_count: u32,
     pub bus_voltage_nanovolts_per_adc_count: u32,
+    /// Largest undriven phase-current offset drift from the boot calibration.
+    pub current_offset_tolerance_milliamps: u32,
+    /// Sustained out-of-tolerance undriven samples for this long invalidate
+    /// current sensing until they have decayed for the same duration.
+    pub current_offset_fault_milliseconds: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +147,14 @@ pub struct BatteryConfig {
     pub maximum_regen_milliamps: u32,
     pub minimum_bus_voltage_millivolts: u32,
     pub undervoltage_debounce_milliseconds: u32,
+    pub maximum_bus_voltage_millivolts: u32,
+    /// Counted in fresh bus-voltage conversions, so it must be a multiple of
+    /// `ANALOG_SAMPLE_PERIOD_MS`. A few conversions reject single-sample ADC
+    /// noise; the bus capacitance limits how fast regeneration with the
+    /// bounded regen current can raise the bus within that window.
+    pub overvoltage_debounce_milliseconds: u32,
+    /// Overvoltage clears only after the bus falls this far below its maximum.
+    pub overvoltage_hysteresis_millivolts: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +175,9 @@ pub struct RideConfig {
     pub minimum_running_hall_timeout_milliseconds: u32,
     pub maximum_running_hall_timeout_milliseconds: u32,
     pub maximum_entry_electrical_rpm: u32,
+    /// Consecutive hardware-break, PWM-range, or phase-overcurrent faults
+    /// without reaching normal tracking before acknowledgement stops until reset.
+    pub consecutive_fault_limit: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,6 +255,8 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
         adc_levels: 4_096,
         phase_current_milliamps_per_adc_count: 100,
         bus_voltage_nanovolts_per_adc_count: 18_530_273,
+        current_offset_tolerance_milliamps: 12_800,
+        current_offset_fault_milliseconds: 100,
     },
     inverter: InverterConfig {
         pwm_frequency_hz: 16_000,
@@ -275,6 +292,9 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
         maximum_regen_milliamps: 4_000,
         minimum_bus_voltage_millivolts: 39_000,
         undervoltage_debounce_milliseconds: 1_000,
+        maximum_bus_voltage_millivolts: 58_000,
+        overvoltage_debounce_milliseconds: 30,
+        overvoltage_hysteresis_millivolts: 1_000,
     },
     thermal: ThermalConfig {
         controller_derate_start_celsius: 70,
@@ -291,6 +311,7 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
         minimum_running_hall_timeout_milliseconds: 100,
         maximum_running_hall_timeout_milliseconds: 500,
         maximum_entry_electrical_rpm: 2_500,
+        consecutive_fault_limit: 3,
     },
     throttle: ThrottleConfig {
         plausible_minimum_microvolts: 201_416,
@@ -369,7 +390,6 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
             pin: GpioPin::new(PA, 5),
             channel: 5,
         },
-        controller_temperature_adc_channel: 16,
         brake: GpioPin::new(PC, 4),
         wheel_speed: GpioPin::new(PB, 4),
         cadence: GpioPin::new(PB, 9),
@@ -388,8 +408,16 @@ const fn current_counts_from_milliamps(milliamps: u32) -> u16 {
     (milliamps / BIKE_CONFIG.sensors.phase_current_milliamps_per_adc_count) as u16
 }
 
+/// Rounds an electrical angle in `0..360_000` millidegrees to Q16 turns.
 const fn hall_boundary_q16(millidegrees: u32) -> u16 {
+    assert!(millidegrees < 360_000);
     ((millidegrees as u64 * 65_536 + 180_000) / 360_000) as u16
+}
+
+pub const fn adc_counts_from_microvolts(microvolts: u32) -> u16 {
+    ((microvolts as u64 * BIKE_CONFIG.sensors.adc_levels as u64
+        + BIKE_CONFIG.sensors.adc_reference_microvolts as u64 / 2)
+        / BIKE_CONFIG.sensors.adc_reference_microvolts as u64) as u16
 }
 
 const fn adc_pin_matches(input: AdcInput) -> bool {
@@ -401,10 +429,6 @@ const fn adc_pin_matches(input: AdcInput) -> bool {
     }
 }
 
-const fn pins_equal(a: GpioPin, b: GpioPin) -> bool {
-    a.port as u8 == b.port as u8 && a.number == b.number
-}
-
 const fn pins_are_valid_and_unique(pins: &[GpioPin]) -> bool {
     let mut outer = 0;
     while outer < pins.len() {
@@ -413,7 +437,7 @@ const fn pins_are_valid_and_unique(pins: &[GpioPin]) -> bool {
         }
         let mut inner = outer + 1;
         while inner < pins.len() {
-            if pins_equal(pins[outer], pins[inner]) {
+            if pins[outer].is(pins[inner].port, pins[inner].number) {
                 return false;
             }
             inner += 1;
@@ -427,6 +451,21 @@ const fn pin_triplet_is(pins: [GpioPin; 3], expected: [(GpioPort, u8); 3]) -> bo
     pins[0].is(expected[0].0, expected[0].1)
         && pins[1].is(expected[1].0, expected[1].1)
         && pins[2].is(expected[2].0, expected[2].1)
+}
+
+pub const AFIO_MAPR_TIM1_REMAP_MASK: u32 = 0b11 << 6;
+pub const AFIO_MAPR_TIM2_REMAP_MASK: u32 = 0b11 << 8;
+pub const AFIO_MAPR_TIM3_REMAP_MASK: u32 = 0b11 << 10;
+pub const AFIO_MAPR_CAN_REMAP_MASK: u32 = 0b11 << 13;
+pub const AFIO_MAPR_SWJ_CFG_MASK: u32 = 0b111 << 24;
+/// JTAG-DP and SW-DP disabled, releasing PA13, PA14, PA15, PB3, and PB4 for
+/// the CAN transceiver enable, Hall, and wheel inputs.
+pub const AFIO_MAPR_SWJ_CFG_DISABLED: u32 = 0b100 << 24;
+
+/// AFIO MAPR value that replaces one remap field. SWJ_CFG is write-only and
+/// reads back undefined, so every write restates the debug-port selection.
+pub const fn afio_mapr_with_remap(current: u32, field_mask: u32, field_bits: u32) -> u32 {
+    (current & !(field_mask | AFIO_MAPR_SWJ_CFG_MASK)) | field_bits | AFIO_MAPR_SWJ_CFG_DISABLED
 }
 
 /// AFIO MAPR TIM1_REMAP field selected by the configured six-switch bridge.
@@ -504,13 +543,16 @@ pub const SYSCLK_HZ: u32 = 72_000_000;
 pub const APPLICATION_FLASH_ORIGIN: u32 = 0x0800_3800;
 pub const PCLK1_HZ: u32 = 36_000_000;
 pub const APB1_TIMER_HZ: u32 = 72_000_000;
+pub const APB2_TIMER_HZ: u32 = 72_000_000;
 pub const ADC_HZ: u32 = 12_000_000;
+/// Regular-sequence (throttle, bus voltage, temperature) refresh period.
+pub const ANALOG_SAMPLE_PERIOD_MS: u32 = 10;
 
 pub const PWM_HZ: u32 = BIKE_CONFIG.inverter.pwm_frequency_hz;
-pub const PWM_ARR: u16 = (APB1_TIMER_HZ / (2 * PWM_HZ)) as u16;
+pub const PWM_ARR: u16 = (APB2_TIMER_HZ / (2 * PWM_HZ)) as u16;
 pub const PWM_NEUTRAL: u16 = PWM_ARR / 2;
 pub const PWM_DEAD_TIME_TICKS: u8 =
-    ((BIKE_CONFIG.inverter.dead_time_nanoseconds as u64 * (APB1_TIMER_HZ / 2) as u64 + 500_000_000)
+    ((BIKE_CONFIG.inverter.dead_time_nanoseconds as u64 * (APB2_TIMER_HZ / 2) as u64 + 500_000_000)
         / 1_000_000_000) as u8;
 pub const PWM_SAMPLE_CC4: u16 = PWM_ARR - 2;
 pub const FOC_DEAD_TIME_COMP_NUMERATOR: i32 = (BIKE_CONFIG.inverter.dead_time_nanoseconds as u64
@@ -519,13 +561,10 @@ pub const FOC_DEAD_TIME_COMP_NUMERATOR: i32 = (BIKE_CONFIG.inverter.dead_time_na
     * PWM_ARR as u64
     / 1_000) as i32;
 pub const FOC_DEAD_TIME_COMP_DENOMINATOR: i32 = 3_000_000;
-pub const FOC_DEAD_TIME_COMP_TICKS: Fixed =
-    Fixed::ratio(FOC_DEAD_TIME_COMP_NUMERATOR, FOC_DEAD_TIME_COMP_DENOMINATOR);
-// The S310 application uses a 1,273-tick voltage circle and approximately
-// 22..2,227 timer compares with this same 2,250-tick PWM period.
+/// Largest compare displacement from [`PWM_NEUTRAL`]. The modulator clamps to
+/// it and the PWM writer rejects any compare beyond it.
 pub const FOC_PHASE_LIMIT_TICKS: u16 =
     ((PWM_ARR as u32 * BIKE_CONFIG.inverter.duty_deviation_per_mille as u32 + 500) / 1_000) as u16;
-pub const FOC_HARD_PHASE_LIMIT_TICKS: u16 = FOC_PHASE_LIMIT_TICKS;
 pub const FOC_VECTOR_LIMIT_TICKS: Fixed = Fixed::from_integer(
     (PWM_ARR as i32 * BIKE_CONFIG.inverter.voltage_utilization_per_mille as i32) / 1_000,
 );
@@ -562,6 +601,8 @@ pub const DC_LINK_CURRENT_FILTER_SHIFT: u8 = DC_LINK_CURRENT_FILTER_CYCLES.ilog2
 
 pub const HALL_TIMER_HZ: u32 = 1_000_000;
 pub const HALL_TIMER_PRESCALER: u16 = (APB1_TIMER_HZ / HALL_TIMER_HZ - 1) as u16;
+pub const WHEEL_TIMER_HZ: u32 = 1_000_000;
+pub const WHEEL_TIMER_PRESCALER: u16 = (APB1_TIMER_HZ / WHEEL_TIMER_HZ - 1) as u16;
 pub static HALL_GEOMETRY: HallGeometry = HallGeometry::new(
     BIKE_CONFIG.motor.hall_sequence,
     [
@@ -609,6 +650,10 @@ pub const PHASE_CURRENT_TRIP_COUNTS: u16 = current_counts_from_milliamps(
 );
 pub const RIDE_PHASE_CURRENT_LIMIT_COUNTS: u16 =
     current_counts_from_milliamps(BIKE_CONFIG.current_control.phase_current_limit_milliamps);
+pub const CURRENT_OFFSET_TOLERANCE_COUNTS: u16 =
+    current_counts_from_milliamps(BIKE_CONFIG.sensors.current_offset_tolerance_milliamps);
+pub const CURRENT_OFFSET_FAULT_SAMPLES: u16 =
+    (BIKE_CONFIG.sensors.current_offset_fault_milliseconds * PWM_HZ / 1_000) as u16;
 pub const FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS: u16 =
     current_counts_from_milliamps(BIKE_CONFIG.field_weakening.maximum_current_milliamps);
 pub const FIELD_WEAKENING_MINIMUM_ERPM: u32 = BIKE_CONFIG.field_weakening.minimum_electrical_rpm;
@@ -644,13 +689,15 @@ pub const RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR: u16 =
     BIKE_CONFIG.battery.transient_recovery_ratio;
 pub const RIDE_DC_BUS_REGEN_LIMIT_COUNTS: u16 =
     current_counts_from_milliamps(BIKE_CONFIG.battery.maximum_regen_milliamps);
-pub const VBUS_UV_PER_COUNT: u32 = BIKE_CONFIG.sensors.bus_voltage_nanovolts_per_adc_count / 1_000;
 pub const VBUS_MILLIVOLTS_Q10_PER_COUNT: u32 = ((BIKE_CONFIG
     .sensors
     .bus_voltage_nanovolts_per_adc_count as u64
     * 1_024
     + 500_000)
     / 1_000_000) as u32;
+/// Highest bus voltage the 12-bit divider ADC can report.
+pub const VBUS_MAXIMUM_MV: u32 =
+    ((BIKE_CONFIG.sensors.adc_levels - 1) * VBUS_MILLIVOLTS_Q10_PER_COUNT) >> 10;
 
 const _: () = assert!(BIKE_CONFIG.sensors.adc_reference_microvolts > 0);
 const _: () = assert!(BIKE_CONFIG.sensors.adc_levels == 4_096);
@@ -690,6 +737,18 @@ const _: () = assert!(BIKE_CONFIG.field_weakening.voltage_threshold_per_mille < 
 const _: () = assert!(BIKE_CONFIG.field_weakening.ramp_in_milliseconds > 0);
 const _: () = assert!(BIKE_CONFIG.field_weakening.ramp_out_milliseconds > 0);
 const _: () = assert!(BIKE_CONFIG.battery.undervoltage_debounce_milliseconds > 0);
+const _: () = assert!(BIKE_CONFIG.battery.overvoltage_debounce_milliseconds > 0);
+const _: () = assert!(
+    BIKE_CONFIG.battery.maximum_bus_voltage_millivolts
+        > BIKE_CONFIG.current_control.tuning_bus_voltage_millivolts
+);
+const _: () = assert!(BIKE_CONFIG.battery.maximum_bus_voltage_millivolts < VBUS_MAXIMUM_MV);
+const _: () = assert!(
+    BIKE_CONFIG.battery.maximum_bus_voltage_millivolts
+        - BIKE_CONFIG.battery.overvoltage_hysteresis_millivolts
+        > BIKE_CONFIG.battery.minimum_bus_voltage_millivolts
+);
+const _: () = assert!(BIKE_CONFIG.ride.consecutive_fault_limit > 0);
 const _: () = assert!(
     BIKE_CONFIG.thermal.controller_derate_start_celsius
         < BIKE_CONFIG.thermal.controller_stop_celsius
@@ -749,7 +808,6 @@ const _: () = assert!(CAN_SJW_TQ <= 4);
 const _: () = assert!(CAN_PRESCALER >= 1 && CAN_PRESCALER <= 1_024);
 const _: () = assert!(BIKE_CONFIG.ride.command_lease_milliseconds > 0);
 const _: () = assert!(BIKE_CONFIG.ride.brake_debounce_milliseconds > 0);
-const _: () = assert!(BIKE_CONFIG.pins.controller_temperature_adc_channel == 16);
 const _: () = assert!(adc_pin_matches(BIKE_CONFIG.pins.phase_current[0]));
 const _: () = assert!(adc_pin_matches(BIKE_CONFIG.pins.phase_current[1]));
 const _: () = assert!(adc_pin_matches(BIKE_CONFIG.pins.throttle));
@@ -786,6 +844,12 @@ const _: () = assert!(pins_are_valid_and_unique(&[
     BIKE_CONFIG.pins.can.transceiver_enable.pin,
 ]));
 const _: () = assert!(RIDE_PHASE_CURRENT_LIMIT_COUNTS < PHASE_CURRENT_TRIP_COUNTS);
+const _: () = assert!(CURRENT_OFFSET_TOLERANCE_COUNTS > 0);
+const _: () = assert!(CURRENT_OFFSET_TOLERANCE_COUNTS < RIDE_PHASE_CURRENT_LIMIT_COUNTS);
+const _: () = assert!(CURRENT_OFFSET_FAULT_SAMPLES > 0);
+const _: () = assert!(
+    BIKE_CONFIG.sensors.current_offset_fault_milliseconds * PWM_HZ / 1_000 <= u16::MAX as u32
+);
 const _: () = assert!(
     BIKE_CONFIG
         .current_control
@@ -834,9 +898,10 @@ const _: () = assert!(RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS < RIDE_DC_BUS_TRANSIEN
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR > 0);
 const _: () =
     assert!((PHASE_CURRENT_TRIP_COUNTS as u32) * 5 >= (RIDE_PHASE_CURRENT_LIMIT_COUNTS as u32) * 7);
-const _: () = assert!(FOC_PHASE_LIMIT_TICKS <= FOC_HARD_PHASE_LIMIT_TICKS);
 const _: () = assert!(TARGET_RAMP_CYCLES_PER_STEP > 0);
-const _: () = assert!(APB1_TIMER_HZ.is_multiple_of(2 * PWM_HZ));
+const _: () = assert!(APB2_TIMER_HZ.is_multiple_of(2 * PWM_HZ));
+const _: () = assert!(APB1_TIMER_HZ.is_multiple_of(HALL_TIMER_HZ));
+const _: () = assert!(APB1_TIMER_HZ.is_multiple_of(WHEEL_TIMER_HZ));
 const _: () = assert!(PWM_HZ.is_multiple_of(1_000));
 const _: () = assert!(PWM_ARR > 0);
 const _: () = assert!(PWM_DEAD_TIME_TICKS <= 127);
@@ -850,18 +915,18 @@ const _: () = assert!(
 const _: () = assert!(DC_LINK_CURRENT_FILTER_CYCLES.is_power_of_two());
 const _: () = assert!(OBSERVER_BLEND_LOW_ERPM > 0);
 const _: () = assert!(OBSERVER_BLEND_HIGH_ERPM > OBSERVER_BLEND_LOW_ERPM);
-const _: () = assert!(PWM_NEUTRAL + FOC_HARD_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
+const _: () = assert!(PWM_NEUTRAL + FOC_PHASE_LIMIT_TICKS < PWM_SAMPLE_CC4);
 const _: () = assert!(PWM_SAMPLE_CC4 < PWM_ARR);
-const _: () = assert!(PCLK1_HZ.is_multiple_of(
-    CAN_BITRATE * CAN_PRESCALER as u32 * (1 + CAN_BS1_TQ as u32 + CAN_BS2_TQ as u32)
-));
+const _: () = assert!(
+    PCLK1_HZ == CAN_BITRATE * CAN_PRESCALER as u32 * (1 + CAN_BS1_TQ as u32 + CAN_BS2_TQ as u32)
+);
 
 pub const THROTTLE_ADC_CHANNEL: u8 = BIKE_CONFIG.pins.throttle.channel;
 pub const MOTOR_TEMPERATURE_ADC_CHANNEL: u8 = BIKE_CONFIG.pins.motor_temperature.channel;
 pub const VBUS_ADC_CHANNEL: u8 = BIKE_CONFIG.pins.bus_voltage.channel;
 pub const UNUSED_TORQUE_ADC_CHANNEL: u8 = BIKE_CONFIG.pins.auxiliary_analog.channel;
-pub const CONTROLLER_TEMPERATURE_ADC_CHANNEL: u8 =
-    BIKE_CONFIG.pins.controller_temperature_adc_channel;
+/// The STM32F103 internal temperature sensor is fixed to ADC1 channel 16.
+pub const CONTROLLER_TEMPERATURE_ADC_CHANNEL: u8 = 16;
 pub const REGULAR_ADC_CHANNELS: [u8; 5] = [
     MOTOR_TEMPERATURE_ADC_CHANNEL,
     THROTTLE_ADC_CHANNEL,
@@ -889,19 +954,31 @@ pub const fn sample_injected_on_timer_update(timer_counting_down: bool) -> bool 
 
 /// Q16.16 phase volts represented by one commanded PWM timer tick.
 pub const fn observer_volts_per_pwm_tick_bits(bus_voltage_mv: u32) -> i32 {
-    // Reduce 65536/1000 by eight before multiplying. The board ADC cannot
-    // report above 75.9 V, so this exact u32 form cannot overflow.
-    let bounded_mv = if bus_voltage_mv > 75_900 {
-        75_900
+    // Reduce 65536/1000 by eight before multiplying. Bounding to the ADC's
+    // full-scale reading keeps this exact u32 form from overflowing.
+    let bounded_mv = if bus_voltage_mv > VBUS_MAXIMUM_MV {
+        VBUS_MAXIMUM_MV
     } else {
         bus_voltage_mv
     };
     (bounded_mv * 8_192 / (PWM_ARR as u32 * 125)) as i32
 }
 
-pub const CAN_RIDE_TUNING_ID: u16 = 0x2f1;
-pub const CAN_STOP_CALIBRATION_ID: u16 = 0x2f2;
 pub const CAN_FOC_STATUS_ID: u16 = 0x2f7;
+
+pub const ADC_SMPR1_OFFSET: usize = 0x0c;
+pub const ADC_SMPR2_OFFSET: usize = 0x10;
+
+/// ADC register offset and bit shift of a channel's 3-bit sample-time field.
+/// SMPR2 holds channels 0--9 and SMPR1 holds channels 10--17.
+pub const fn adc_sample_time_field(channel: u8) -> (usize, u32) {
+    assert!(channel <= 17);
+    if channel < 10 {
+        (ADC_SMPR2_OFFSET, channel as u32 * 3)
+    } else {
+        (ADC_SMPR1_OFFSET, (channel as u32 - 10) * 3)
+    }
+}
 
 pub const fn regular_adc_sequence_register_1() -> u32 {
     (REGULAR_ADC_CHANNELS.len() as u32 - 1) << 20
@@ -915,86 +992,60 @@ pub const fn regular_adc_sequence_register_3() -> u32 {
         | ((REGULAR_ADC_CHANNELS[4] as u32) << 20)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CanTiming {
-    pub prescaler: u16,
-    pub bs1_tq: u8,
-    pub bs2_tq: u8,
-    pub sjw_tq: u8,
-}
-
-impl CanTiming {
-    pub const CONFIGURED: Self = Self {
-        prescaler: CAN_PRESCALER,
-        bs1_tq: CAN_BS1_TQ,
-        bs2_tq: CAN_BS2_TQ,
-        sjw_tq: CAN_SJW_TQ,
-    };
-
-    pub const fn bitrate(self, peripheral_clock_hz: u32) -> u32 {
-        peripheral_clock_hz / self.prescaler as u32 / (1 + self.bs1_tq as u32 + self.bs2_tq as u32)
-    }
-}
-
-/// Prerequisites for energising the inverter. Every field starts false, so a
-/// reset, malformed CAN frame, or incomplete commissioning leaves PA2 high
-/// (power stage disabled).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SafetyInterlock {
-    pub current_offsets_valid: bool,
-    pub hall_calibration_valid: bool,
-    pub command_fresh: bool,
-    pub break_active: bool,
-    pub software_fault_active: bool,
-}
-
-impl SafetyInterlock {
-    #[inline]
-    pub const fn may_enable_power_stage(self) -> bool {
-        self.current_offsets_valid
-            && self.hall_calibration_valid
-            && self.command_fresh
-            && !self.break_active
-            && !self.software_fault_active
-    }
-
-    #[inline]
-    pub fn note_command_timeout(&mut self) {
-        self.command_fresh = false;
-    }
-
-    #[inline]
-    pub fn note_break(&mut self) {
-        self.break_active = true;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxifoc_core::foc::{
-        AlphaBeta,
-        svpwm::space_vector_pwm_ticks,
-        transforms::inverse_park,
-        trig::{CordicSinCos, SinCos},
+        AlphaBeta, svpwm::space_vector_pwm_ticks, transforms::inverse_park, trig::sin_cos,
     };
 
     #[test]
-    fn can_timing_matches_the_recovered_bus() {
-        assert_eq!(CanTiming::CONFIGURED.bitrate(PCLK1_HZ), CAN_BITRATE);
+    fn current_offset_supervision_derives_from_the_pwm_rate() {
+        assert_eq!(CURRENT_OFFSET_TOLERANCE_COUNTS, 128);
+        assert_eq!(
+            u32::from(CURRENT_OFFSET_FAULT_SAMPLES),
+            BIKE_CONFIG.sensors.current_offset_fault_milliseconds * PWM_HZ / 1_000
+        );
     }
 
     #[test]
-    fn interlock_defaults_to_safe() {
-        let mut interlock = SafetyInterlock {
-            current_offsets_valid: true,
-            hall_calibration_valid: true,
-            command_fresh: true,
-            ..SafetyInterlock::default()
-        };
-        assert!(interlock.may_enable_power_stage());
-        interlock.note_break();
-        assert!(!interlock.may_enable_power_stage());
+    fn timer_values_derive_from_their_bus_clocks() {
+        assert_eq!(PWM_ARR, 2_250);
+        assert_eq!(PWM_DEAD_TIME_TICKS, 25);
+        assert_eq!(HALL_TIMER_PRESCALER, 71);
+        assert_eq!(WHEEL_TIMER_PRESCALER, 71);
+    }
+
+    #[test]
+    fn adc_sample_time_field_selects_the_register_holding_the_channel() {
+        assert_eq!(adc_sample_time_field(0), (ADC_SMPR2_OFFSET, 0));
+        assert_eq!(adc_sample_time_field(5), (ADC_SMPR2_OFFSET, 15));
+        assert_eq!(adc_sample_time_field(8), (ADC_SMPR2_OFFSET, 24));
+        assert_eq!(adc_sample_time_field(9), (ADC_SMPR2_OFFSET, 27));
+        assert_eq!(adc_sample_time_field(10), (ADC_SMPR1_OFFSET, 0));
+        assert_eq!(adc_sample_time_field(11), (ADC_SMPR1_OFFSET, 3));
+        assert_eq!(adc_sample_time_field(13), (ADC_SMPR1_OFFSET, 9));
+        assert_eq!(adc_sample_time_field(15), (ADC_SMPR1_OFFSET, 15));
+        assert_eq!(adc_sample_time_field(16), (ADC_SMPR1_OFFSET, 18));
+        assert_eq!(adc_sample_time_field(17), (ADC_SMPR1_OFFSET, 21));
+    }
+
+    #[test]
+    fn afio_remap_always_rewrites_the_write_only_debug_port_field() {
+        const TIM2_FIELD: u32 = 0b11 << 8;
+        for undefined_readback in [0, 0b001 << 24, 0b010 << 24, 0b111 << 24, u32::MAX] {
+            let mapr = afio_mapr_with_remap(undefined_readback, TIM2_FIELD, 0b11 << 8);
+            assert_eq!(mapr & AFIO_MAPR_SWJ_CFG_MASK, AFIO_MAPR_SWJ_CFG_DISABLED);
+            assert_eq!(mapr & TIM2_FIELD, 0b11 << 8);
+            assert_eq!(
+                mapr & !(AFIO_MAPR_SWJ_CFG_MASK | TIM2_FIELD),
+                undefined_readback & !(AFIO_MAPR_SWJ_CFG_MASK | TIM2_FIELD)
+            );
+        }
+        assert_eq!(
+            afio_mapr_with_remap(0b11 << 6, 0b11 << 6, 0) & (0b11 << 6),
+            0
+        );
     }
 
     #[test]
@@ -1035,7 +1086,7 @@ mod tests {
     fn voltage_envelope_matches_the_stock_f103_circle() {
         let mut maximum_span = 0;
         for step in 0..4_096_u32 {
-            let (sin, cos) = CordicSinCos::sin_cos(step << 20);
+            let (sin, cos) = sin_cos(step << 20);
             let (alpha, beta) = inverse_park(FOC_VECTOR_LIMIT_TICKS, Fixed::ZERO, sin, cos);
             let duty = space_vector_pwm_ticks(
                 AlphaBeta { alpha, beta },
@@ -1050,7 +1101,7 @@ mod tests {
             assert!(
                 compares
                     .into_iter()
-                    .all(|compare| compare.abs_diff(PWM_NEUTRAL) <= FOC_HARD_PHASE_LIMIT_TICKS)
+                    .all(|compare| compare.abs_diff(PWM_NEUTRAL) <= FOC_PHASE_LIMIT_TICKS)
             );
         }
         assert!(maximum_span >= FOC_PHASE_LIMIT_TICKS.saturating_mul(2).saturating_sub(2));

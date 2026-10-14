@@ -3,25 +3,25 @@
 use core::marker::PhantomData;
 
 use super::control_types::{AlphaBeta, Dq, PwmDuty};
-use super::numeric::{Fixed, Scalar};
+use super::numeric::{Fixed, saturating_i64_to_i32};
 use super::pi_controller::PIController;
-use super::svpwm::{SvpwmTickModulator, TickModulator};
+use super::svpwm::space_vector_pwm_ticks;
 use super::transforms::{clarke, inverse_park, park};
-use super::trig::{CordicSinCos, SinCos};
+use super::trig::{Turns, sin_cos};
 
 /// Compile-time motor model used for reference-current dq decoupling and
 /// permanent-magnet back-EMF feedforward.
-pub trait DecouplingModel<N: Scalar> {
-    fn feedforward(electrical_rpm: i32, target: Dq<N>, volts_per_pwm_tick: N) -> Dq<N>;
+pub trait DecouplingModel {
+    fn feedforward(electrical_rpm: i32, target: Dq, volts_per_pwm_tick: Fixed) -> Dq;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoDecoupling;
 
-impl<N: Scalar> DecouplingModel<N> for NoDecoupling {
+impl DecouplingModel for NoDecoupling {
     #[inline]
-    fn feedforward(_electrical_rpm: i32, _target: Dq<N>, _volts_per_pwm_tick: N) -> Dq<N> {
-        Dq::new(N::ZERO, N::ZERO)
+    fn feedforward(_electrical_rpm: i32, _target: Dq, _volts_per_pwm_tick: Fixed) -> Dq {
+        Dq::default()
     }
 }
 
@@ -37,11 +37,11 @@ impl<
     const LD_FLUX_PER_COUNT_BITS: i32,
     const LQ_FLUX_PER_COUNT_BITS: i32,
     const FLUX_LINKAGE_MWB_BITS: i32,
-> DecouplingModel<Fixed>
+> DecouplingModel
     for FixedDecoupling<LD_FLUX_PER_COUNT_BITS, LQ_FLUX_PER_COUNT_BITS, FLUX_LINKAGE_MWB_BITS>
 {
     #[inline]
-    fn feedforward(electrical_rpm: i32, target: Dq<Fixed>, volts_per_pwm_tick: Fixed) -> Dq<Fixed> {
+    fn feedforward(electrical_rpm: i32, target: Dq, volts_per_pwm_tick: Fixed) -> Dq {
         let volts_per_tick_bits = volts_per_pwm_tick.to_bits();
         // 512 Q16.16 V/tick corresponds to 17.6 V across a 2,250-tick PWM
         // period, well below this controller's undervoltage cutoff. It also
@@ -66,124 +66,148 @@ impl<
             ((6_863_i64 * i64::from(LQ_FLUX_PER_COUNT_BITS) + 128_000) / 256_000) as i32;
         let flux_scale_q8 =
             ((6_863_i64 * i64::from(FLUX_LINKAGE_MWB_BITS) + 128_000) / 256_000) as i32;
+        let speed = i64::from(electrical_rpm);
         let inductive_ticks = |counts: i32, scale_q8: i32| {
-            electrical_rpm * counts * scale_q8 / volts_per_tick_bits / 256
+            feedforward_ticks(
+                (speed * i64::from(counts)).saturating_mul(i64::from(scale_q8)),
+                volts_per_tick_bits,
+            )
         };
-        let direct_ticks = inductive_ticks(quadrature_counts, lq_scale_q8).saturating_neg();
+        let direct_ticks = -inductive_ticks(quadrature_counts, lq_scale_q8);
         let quadrature_ticks = inductive_ticks(direct_counts, ld_scale_q8)
-            + electrical_rpm * flux_scale_q8 / volts_per_tick_bits / 256;
+            + feedforward_ticks(speed * i64::from(flux_scale_q8), volts_per_tick_bits);
         Dq::new(
-            Fixed::from_bits(direct_ticks << 16),
-            Fixed::from_bits(quadrature_ticks << 16),
+            Fixed::from_integer(saturating_i64_to_i32(direct_ticks)),
+            Fixed::from_integer(saturating_i64_to_i32(quadrature_ticks)),
         )
     }
 }
 
-pub struct FocController<
-    N: Scalar = Fixed,
-    T: SinCos<N> = CordicSinCos,
-    M: TickModulator<N> = SvpwmTickModulator,
-    D: DecouplingModel<N> = NoDecoupling,
-    const DEAD_TIME_NUMERATOR: i32 = 0,
-    const DEAD_TIME_DENOMINATOR: i32 = 1,
-> {
-    direct: PIController<N>,
-    quadrature: PIController<N>,
-    vector_limit_ticks: N,
-    phase_limit_ticks: u16,
-    requested_voltage: Dq<N>,
-    feedforward_voltage: Dq<N>,
-    applied_voltage: Dq<N>,
-    applied_stationary: AlphaBeta<N>,
-    measured_stationary: AlphaBeta<N>,
-    voltage_limited: bool,
-    actuation_advance: N,
-    backend: PhantomData<(T, M, D)>,
+/// Truncates a Q8 speed-flux product to whole PWM ticks, matching
+/// `product / volts_per_tick_bits / 256` without a 64-bit divide.
+///
+/// Truncating the Q8 shift on the magnitude first is exact for integer
+/// division. A shifted magnitude beyond `u32` is reported as `u32::MAX`
+/// ticks; for every scale up to 2 V per tick (2^17 Q16.16 bits) the true
+/// result already exceeds the Q16.16 whole-tick range, so the caller's
+/// saturation is unchanged.
+#[inline]
+fn feedforward_ticks(product_q8: i64, volts_per_tick_bits: i32) -> i64 {
+    let magnitude = product_q8.unsigned_abs() >> 8;
+    let ticks = match u32::try_from(magnitude) {
+        Ok(magnitude) => magnitude / volts_per_tick_bits as u32,
+        Err(_) => u32::MAX,
+    };
+    if product_q8 < 0 {
+        -i64::from(ticks)
+    } else {
+        i64::from(ticks)
+    }
 }
 
-pub type FixedFocController<
+/// Synchronous dq current controller.
+///
+/// `DEAD_TIME_NUMERATOR / DEAD_TIME_DENOMINATOR` is the dead-time
+/// compensation in phase-voltage ticks. An enabled ratio with a zero
+/// denominator is rejected when the controller is built:
+///
+/// ```compile_fail
+/// use oxifoc_core::foc::{Fixed, FocController, PIController};
+///
+/// let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
+/// let _ = FocController::<9, 0>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
+/// ```
+pub struct FocController<
     const DEAD_TIME_NUMERATOR: i32 = 0,
     const DEAD_TIME_DENOMINATOR: i32 = 1,
-    D = NoDecoupling,
-> = FocController<
-    Fixed,
-    CordicSinCos,
-    SvpwmTickModulator,
-    D,
-    DEAD_TIME_NUMERATOR,
-    DEAD_TIME_DENOMINATOR,
->;
+    D: DecouplingModel = NoDecoupling,
+> {
+    direct: PIController,
+    quadrature: PIController,
+    vector_limit_ticks: Fixed,
+    phase_limit_ticks: u16,
+    requested_voltage: Dq,
+    feedforward_voltage: Dq,
+    applied_voltage: Dq,
+    applied_stationary: AlphaBeta,
+    measured_stationary: AlphaBeta,
+    voltage_limited: bool,
+    actuation_advance: Fixed,
+    decoupling: PhantomData<D>,
+}
 
-impl<N, T, M, D, const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32>
-    FocController<N, T, M, D, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR>
-where
-    N: Scalar,
-    T: SinCos<N>,
-    M: TickModulator<N>,
-    D: DecouplingModel<N>,
+impl<const DEAD_TIME_NUMERATOR: i32, const DEAD_TIME_DENOMINATOR: i32, D: DecouplingModel>
+    FocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, D>
 {
+    const DEAD_TIME_RATIO_VALID: () = assert!(
+        DEAD_TIME_NUMERATOR == 0 || DEAD_TIME_DENOMINATOR != 0,
+        "enabled dead-time compensation requires a nonzero denominator"
+    );
+
     pub const fn new(
-        direct: PIController<N>,
-        quadrature: PIController<N>,
-        vector_limit_ticks: N,
+        direct: PIController,
+        quadrature: PIController,
+        vector_limit_ticks: Fixed,
         phase_limit_ticks: u16,
     ) -> Self {
+        let () = Self::DEAD_TIME_RATIO_VALID;
         Self {
             direct,
             quadrature,
             vector_limit_ticks,
             phase_limit_ticks,
-            requested_voltage: Dq::new(N::ZERO, N::ZERO),
-            feedforward_voltage: Dq::new(N::ZERO, N::ZERO),
-            applied_voltage: Dq::new(N::ZERO, N::ZERO),
+            requested_voltage: Dq::new(Fixed::ZERO, Fixed::ZERO),
+            feedforward_voltage: Dq::new(Fixed::ZERO, Fixed::ZERO),
+            applied_voltage: Dq::new(Fixed::ZERO, Fixed::ZERO),
             applied_stationary: AlphaBeta {
-                alpha: N::ZERO,
-                beta: N::ZERO,
+                alpha: Fixed::ZERO,
+                beta: Fixed::ZERO,
             },
             measured_stationary: AlphaBeta {
-                alpha: N::ZERO,
-                beta: N::ZERO,
+                alpha: Fixed::ZERO,
+                beta: Fixed::ZERO,
             },
             voltage_limited: false,
-            actuation_advance: N::ZERO,
-            backend: PhantomData,
+            actuation_advance: Fixed::ZERO,
+            decoupling: PhantomData,
         }
     }
 
     pub fn reset(&mut self) {
         self.direct.reset();
         self.quadrature.reset();
-        self.requested_voltage = Dq::new(N::ZERO, N::ZERO);
-        self.feedforward_voltage = Dq::new(N::ZERO, N::ZERO);
-        self.applied_voltage = Dq::new(N::ZERO, N::ZERO);
+        self.requested_voltage = Dq::new(Fixed::ZERO, Fixed::ZERO);
+        self.feedforward_voltage = Dq::new(Fixed::ZERO, Fixed::ZERO);
+        self.applied_voltage = Dq::new(Fixed::ZERO, Fixed::ZERO);
         self.applied_stationary = AlphaBeta {
-            alpha: N::ZERO,
-            beta: N::ZERO,
+            alpha: Fixed::ZERO,
+            beta: Fixed::ZERO,
         };
         self.measured_stationary = AlphaBeta {
-            alpha: N::ZERO,
-            beta: N::ZERO,
+            alpha: Fixed::ZERO,
+            beta: Fixed::ZERO,
         };
         self.voltage_limited = false;
+        self.actuation_advance = Fixed::ZERO;
     }
 
-    pub const fn applied_voltage(&self) -> Dq<N> {
+    pub const fn applied_voltage(&self) -> Dq {
         self.applied_voltage
     }
 
-    pub const fn requested_voltage(&self) -> Dq<N> {
+    pub const fn requested_voltage(&self) -> Dq {
         self.requested_voltage
     }
 
-    pub const fn feedforward_voltage(&self) -> Dq<N> {
+    pub const fn feedforward_voltage(&self) -> Dq {
         self.feedforward_voltage
     }
 
-    pub const fn applied_stationary(&self) -> AlphaBeta<N> {
+    pub const fn applied_stationary(&self) -> AlphaBeta {
         self.applied_stationary
     }
 
-    pub const fn measured_stationary(&self) -> AlphaBeta<N> {
+    pub const fn measured_stationary(&self) -> AlphaBeta {
         self.measured_stationary
     }
 
@@ -192,13 +216,14 @@ where
     }
 
     /// OxiFOC's `t_dead * f_pwm` factor after conversion to the modulator's
-    /// phase-voltage tick domain. A zero numerator disables compensation;
-    /// enabled specializations require a nonzero denominator.
-    pub fn dead_time_comp_ticks(&self) -> N {
+    /// phase-voltage tick domain. A zero numerator disables compensation.
+    /// Both operands are compile-time constants and the denominator is
+    /// checked when the controller is built, so this folds to a constant.
+    pub fn dead_time_comp_ticks(&self) -> Fixed {
         if DEAD_TIME_NUMERATOR == 0 {
-            N::ZERO
+            Fixed::ZERO
         } else {
-            N::from_ratio(DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR)
+            Fixed::ratio(DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR)
         }
     }
 
@@ -206,49 +231,29 @@ where
     /// PWM command taking effect. The correction is applied only to the
     /// output voltage frame; the sampled current remains transformed at the
     /// measurement angle.
-    pub fn set_actuation_advance(&mut self, advance: N) {
-        self.actuation_advance = advance.clamp(-N::HALF, N::HALF);
+    pub fn set_actuation_advance(&mut self, advance: Fixed) {
+        self.actuation_advance = advance.clamp(-Fixed::HALF, Fixed::HALF);
     }
 
-    pub const fn actuation_advance(&self) -> N {
+    pub const fn actuation_advance(&self) -> Fixed {
         self.actuation_advance
     }
 
     pub fn step(
         &mut self,
-        phase_a: N,
-        phase_b: N,
-        electrical_angle: T::Angle,
-        target: Dq<N>,
+        phase_a: Fixed,
+        phase_b: Fixed,
+        electrical_angle: Turns,
+        target: Dq,
         pwm_neutral: u16,
-    ) -> (Dq<N>, PwmDuty) {
-        self.step_with_injection(
-            phase_a,
-            phase_b,
-            electrical_angle,
-            target,
-            Dq::new(N::ZERO, N::ZERO),
-            pwm_neutral,
-        )
-    }
-
-    pub fn step_with_injection(
-        &mut self,
-        phase_a: N,
-        phase_b: N,
-        electrical_angle: T::Angle,
-        target: Dq<N>,
-        voltage_injection: Dq<N>,
-        pwm_neutral: u16,
-    ) -> (Dq<N>, PwmDuty) {
-        self.step_with_velocity_and_injection(
+    ) -> (Dq, PwmDuty) {
+        self.step_with_velocity(
             phase_a,
             phase_b,
             electrical_angle,
             0,
             target,
-            voltage_injection,
-            N::ONE,
+            Fixed::ONE,
             pwm_neutral,
         )
     }
@@ -259,24 +264,24 @@ where
     /// precisely timed voltage pulses without advancing either PI integrator.
     pub fn step_direct_voltage(
         &mut self,
-        phase_a: N,
-        phase_b: N,
-        electrical_angle: T::Angle,
-        voltage: Dq<N>,
+        phase_a: Fixed,
+        phase_b: Fixed,
+        electrical_angle: Turns,
+        voltage: Dq,
         pwm_neutral: u16,
-    ) -> (Dq<N>, PwmDuty) {
-        let (sin, cos) = T::sin_cos(electrical_angle);
+    ) -> (Dq, PwmDuty) {
+        let (sin, cos) = sin_cos(electrical_angle);
         let (alpha, beta) = clarke(phase_a, phase_b);
         self.measured_stationary = AlphaBeta { alpha, beta };
         let (measured_d, measured_q) = park(alpha, beta, sin, cos);
         let measured = Dq::new(measured_d, measured_q);
         self.requested_voltage = voltage;
-        self.feedforward_voltage = Dq::new(N::ZERO, N::ZERO);
+        self.feedforward_voltage = Dq::new(Fixed::ZERO, Fixed::ZERO);
         let (applied_d, applied_q, voltage_scale) =
-            N::limit_vector(voltage.d, voltage.q, self.vector_limit_ticks);
+            Fixed::limit_vector(voltage.d, voltage.q, self.vector_limit_ticks);
         let applied = Dq::new(applied_d, applied_q);
         self.applied_voltage = applied;
-        self.voltage_limited = voltage_scale != N::ONE;
+        self.voltage_limited = voltage_scale != Fixed::ONE;
         let (voltage_alpha, voltage_beta) = inverse_park(applied.d, applied.q, sin, cos);
         let (voltage_alpha, voltage_beta) =
             self.apply_actuation_advance(voltage_alpha, voltage_beta);
@@ -286,7 +291,7 @@ where
         };
         let (modulated_alpha, modulated_beta) =
             self.apply_dead_time_comp(voltage_alpha, voltage_beta, phase_a, phase_b);
-        let duties = M::to_duties(
+        let duties = space_vector_pwm_ticks(
             AlphaBeta {
                 alpha: modulated_alpha,
                 beta: modulated_beta,
@@ -298,18 +303,17 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn step_with_velocity_and_injection(
+    pub fn step_with_velocity(
         &mut self,
-        phase_a: N,
-        phase_b: N,
-        electrical_angle: T::Angle,
+        phase_a: Fixed,
+        phase_b: Fixed,
+        electrical_angle: Turns,
         electrical_rpm: i32,
-        target: Dq<N>,
-        voltage_injection: Dq<N>,
-        volts_per_pwm_tick: N,
+        target: Dq,
+        volts_per_pwm_tick: Fixed,
         pwm_neutral: u16,
-    ) -> (Dq<N>, PwmDuty) {
-        let (sin, cos) = T::sin_cos(electrical_angle);
+    ) -> (Dq, PwmDuty) {
+        let (sin, cos) = sin_cos(electrical_angle);
         let (alpha, beta) = clarke(phase_a, phase_b);
         self.measured_stationary = AlphaBeta { alpha, beta };
         let (measured_d, measured_q) = park(alpha, beta, sin, cos);
@@ -318,23 +322,23 @@ where
         let quadrature_update = self.quadrature.prepare_update(target.q, measured.q);
         let feedforward = D::feedforward(electrical_rpm, target, volts_per_pwm_tick);
         let requested = Dq::new(
-            direct_update.raw_output + feedforward.d + voltage_injection.d,
-            quadrature_update.raw_output + feedforward.q + voltage_injection.q,
+            direct_update.raw_output + feedforward.d,
+            quadrature_update.raw_output + feedforward.q,
         );
         self.requested_voltage = requested;
         self.feedforward_voltage = feedforward;
         let (applied_d, applied_q, voltage_scale) =
-            N::limit_vector(requested.d, requested.q, self.vector_limit_ticks);
+            Fixed::limit_vector(requested.d, requested.q, self.vector_limit_ticks);
         let applied = Dq::new(applied_d, applied_q);
         self.applied_voltage = applied;
-        self.voltage_limited = voltage_scale != N::ONE;
+        self.voltage_limited = voltage_scale != Fixed::ONE;
         self.direct.apply_back_calculation(
             direct_update,
-            direct_update.raw_output * (voltage_scale - N::ONE),
+            direct_update.raw_output * (voltage_scale - Fixed::ONE),
         );
         self.quadrature.apply_back_calculation(
             quadrature_update,
-            quadrature_update.raw_output * (voltage_scale - N::ONE),
+            quadrature_update.raw_output * (voltage_scale - Fixed::ONE),
         );
         let (voltage_alpha, voltage_beta) = inverse_park(applied.d, applied.q, sin, cos);
         let (voltage_alpha, voltage_beta) =
@@ -345,7 +349,7 @@ where
         };
         let (modulated_alpha, modulated_beta) =
             self.apply_dead_time_comp(voltage_alpha, voltage_beta, phase_a, phase_b);
-        let duties = M::to_duties(
+        let duties = space_vector_pwm_ticks(
             AlphaBeta {
                 alpha: modulated_alpha,
                 beta: modulated_beta,
@@ -357,21 +361,27 @@ where
     }
 
     #[inline]
-    fn apply_actuation_advance(&self, alpha: N, beta: N) -> (N, N) {
+    fn apply_actuation_advance(&self, alpha: Fixed, beta: Fixed) -> (Fixed, Fixed) {
         let advance = self.actuation_advance;
-        if advance == N::ZERO {
+        if advance == Fixed::ZERO {
             return (alpha, beta);
         }
         let advance_squared = advance * advance;
-        let sin = advance - advance_squared * advance * N::from_ratio(1, 6);
-        let cos = N::ONE - advance_squared * N::HALF;
+        let sin = advance - advance_squared * advance * Fixed::ratio(1, 6);
+        let cos = Fixed::ONE - advance_squared * Fixed::HALF;
         (alpha * cos - beta * sin, alpha * sin + beta * cos)
     }
 
     #[inline]
-    fn apply_dead_time_comp(&self, alpha: N, beta: N, phase_a: N, phase_b: N) -> (N, N) {
+    fn apply_dead_time_comp(
+        &self,
+        alpha: Fixed,
+        beta: Fixed,
+        phase_a: Fixed,
+        phase_b: Fixed,
+    ) -> (Fixed, Fixed) {
         let factor = self.dead_time_comp_ticks();
-        if factor == N::ZERO {
+        if factor == Fixed::ZERO {
             return (alpha, beta);
         }
 
@@ -379,27 +389,22 @@ where
         // Using the two measured phases directly avoids reconstructing values
         // the Clarke transform received earlier in this same control step.
         let phase_c = -(phase_a + phase_b);
-        let signs = (u8::from(phase_a >= N::ZERO) << 2)
-            | (u8::from(phase_b >= N::ZERO) << 1)
-            | u8::from(phase_c >= N::ZERO);
-        let alpha_step = factor * N::TWO_THIRDS;
-        let beta_step = factor * N::TWO_INV_SQRT_3;
+        let signs = (u8::from(phase_a >= Fixed::ZERO) << 2)
+            | (u8::from(phase_b >= Fixed::ZERO) << 1)
+            | u8::from(phase_c >= Fixed::ZERO);
+        let alpha_step = factor * Fixed::TWO_THIRDS;
+        let beta_step = factor * Fixed::TWO_INV_SQRT_3;
         let (comp_alpha, comp_beta) = match signs {
-            4 => (alpha_step + alpha_step, N::ZERO),
+            4 => (alpha_step + alpha_step, Fixed::ZERO),
             6 => (alpha_step, beta_step),
             2 => (-alpha_step, beta_step),
-            3 => (-(alpha_step + alpha_step), N::ZERO),
+            3 => (-(alpha_step + alpha_step), Fixed::ZERO),
             1 => (-alpha_step, -beta_step),
             5 => (alpha_step, -beta_step),
-            _ => (N::ZERO, N::ZERO),
+            _ => (Fixed::ZERO, Fixed::ZERO),
         };
         (alpha + comp_alpha, beta + comp_beta)
     }
-}
-
-pub fn limit_voltage<N: Scalar>(voltage: Dq<N>, limit_ticks: N) -> Dq<N> {
-    let (direct, quadrature, _) = N::limit_vector(voltage.d, voltage.q, limit_ticks);
-    Dq::new(direct, quadrature)
 }
 
 #[cfg(test)]
@@ -410,6 +415,11 @@ mod tests {
     fn fixed_controller() -> FocController {
         let pi = PIController::new(Fixed::ratio(512, 1_024), Fixed::ratio(605, 16_384));
         FocController::new(pi, pi, Fixed::from_integer(1_250), 1_085)
+    }
+
+    fn limit_voltage(voltage: Dq, limit_ticks: Fixed) -> Dq {
+        let (direct, quadrature, _) = Fixed::limit_vector(voltage.d, voltage.q, limit_ticks);
+        Dq::new(direct, quadrature)
     }
 
     #[test]
@@ -537,9 +547,17 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_the_actuation_advance() {
+        let mut controller = fixed_controller();
+        controller.set_actuation_advance(Fixed::ratio(1, 10));
+        controller.reset();
+        assert_eq!(controller.actuation_advance(), Fixed::ZERO);
+    }
+
+    #[test]
     fn dead_time_compensation_follows_all_six_phase_current_sign_regions() {
         let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
-        let controller = FixedFocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
+        let controller = FocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
         let alpha_step = Fixed::from_integer(9) * Fixed::TWO_THIRDS;
         let beta_step = Fixed::from_integer(9) * Fixed::TWO_INV_SQRT_3;
         for (phase_a, phase_b, expected_alpha, expected_beta) in [
@@ -564,8 +582,7 @@ mod tests {
     fn dead_time_compensation_changes_only_the_modulator_command() {
         let mut plain = fixed_controller();
         let pi = PIController::new(Fixed::ratio(512, 1_024), Fixed::ratio(605, 16_384));
-        let mut compensated =
-            FixedFocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
+        let mut compensated = FocController::<9, 1>::new(pi, pi, Fixed::from_integer(1_250), 1_085);
         let input = (
             Fixed::from_integer(100),
             Fixed::from_integer(-60),
@@ -606,21 +623,64 @@ mod tests {
     }
 
     #[test]
+    fn fixed_decoupling_matches_a_wide_reference_beyond_i32_products() {
+        const LD: i32 = 409;
+        const LQ: i32 = 409;
+        const FLUX: i32 = 799_539;
+        type Motor = FixedDecoupling<LD, LQ, FLUX>;
+        let scale_q8 = |bits: i32| (6_863_i128 * i128::from(bits) + 128_000) / 256_000;
+        let ticks = |product: i128, volts_per_tick_bits: i32| {
+            product / i128::from(volts_per_tick_bits) / 256
+        };
+        let volts_per_tick = Fixed::ratio(523, 22_500);
+        let volts_bits = volts_per_tick.to_bits();
+        for electrical_rpm in [-120_000, -101_000, 101_000, 120_000] {
+            let target = Dq::new(Fixed::from_integer(-200), Fixed::from_integer(838));
+            let output = Motor::feedforward(electrical_rpm, target, volts_per_tick);
+            let speed = i128::from(electrical_rpm);
+            let expected_d = -ticks(speed * 838 * scale_q8(LQ), volts_bits);
+            let expected_q = ticks(speed * -200 * scale_q8(LD), volts_bits)
+                + ticks(speed * scale_q8(FLUX), volts_bits);
+            assert_eq!(i128::from(output.d.integer()), expected_d);
+            assert_eq!(i128::from(output.q.integer()), expected_q);
+        }
+    }
+
+    #[test]
+    fn fixed_decoupling_saturates_at_extreme_speed() {
+        type Motor = FixedDecoupling<409, 409, 799_539>;
+        let output = Motor::feedforward(
+            i32::MAX,
+            Dq::new(Fixed::ZERO, Fixed::from_integer(30_000)),
+            Fixed::from_bits(512),
+        );
+        assert_eq!(output.d, Fixed::from_bits(i32::MIN));
+        assert_eq!(output.q, Fixed::from_bits(i32::MAX));
+
+        let reverse = Motor::feedforward(
+            i32::MIN,
+            Dq::new(Fixed::ZERO, Fixed::from_integer(30_000)),
+            Fixed::from_bits(512),
+        );
+        assert_eq!(reverse.d, Fixed::from_bits(i32::MAX));
+        assert_eq!(reverse.q, Fixed::from_bits(i32::MIN));
+    }
+
+    #[test]
     fn no_decoupling_contributes_zero_voltage_at_speed() {
         let proportional = PIController::new(Fixed::ONE, Fixed::ZERO);
-        let mut controller: FixedFocController = FixedFocController::new(
+        let mut controller: FocController = FocController::new(
             proportional,
             proportional,
             Fixed::from_integer(1_273),
             1_103,
         );
-        let _ = controller.step_with_velocity_and_injection(
+        let _ = controller.step_with_velocity(
             Fixed::ZERO,
             Fixed::ZERO,
             0,
             -31_000,
             Dq::new(Fixed::from_integer(11), Fixed::from_integer(-17)),
-            Dq::default(),
             Fixed::ratio(523, 22_500),
             1_125,
         );
@@ -634,24 +694,22 @@ mod tests {
 
     struct SaturatingFeedforward;
 
-    impl DecouplingModel<Fixed> for SaturatingFeedforward {
-        fn feedforward(_electrical_rpm: i32, _target: Dq<Fixed>, _volts_per_tick: Fixed) -> Dq {
+    impl DecouplingModel for SaturatingFeedforward {
+        fn feedforward(_electrical_rpm: i32, _target: Dq, _volts_per_tick: Fixed) -> Dq {
             Dq::new(Fixed::from_integer(100), Fixed::ZERO)
         }
     }
 
     #[test]
     fn feedforward_is_inside_the_circle_but_outside_pi_anti_windup() {
-        type Controller =
-            FocController<Fixed, CordicSinCos, SvpwmTickModulator, SaturatingFeedforward>;
+        type Controller = FocController<0, 1, SaturatingFeedforward>;
         let pi = PIController::new(Fixed::ZERO, Fixed::ZERO);
         let mut controller = Controller::new(pi, pi, Fixed::from_integer(50), 100);
-        let _ = controller.step_with_velocity_and_injection(
+        let _ = controller.step_with_velocity(
             Fixed::ZERO,
             Fixed::ZERO,
             0,
             1_000,
-            Dq::default(),
             Dq::default(),
             Fixed::ONE,
             100,

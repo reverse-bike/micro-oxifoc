@@ -3,22 +3,19 @@
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
-use crate::config::BIKE_CONFIG;
+use crate::config::{ANALOG_SAMPLE_PERIOD_MS, BIKE_CONFIG, adc_sample_time_field};
 use crate::hardware::gpio;
+use crate::hardware::system::RCC_AHBENR;
 
 use super::inputs::DebouncedActiveLow;
 use super::throttle::Observation;
 
-const RCC_AHBENR: *mut u32 = 0x4002_1014 as *mut u32;
 const RCC_AHBENR_DMA1EN: u32 = 1;
 
 const ADC1_BASE: usize = 0x4001_2400;
 const ADC_CR1: *mut u32 = (ADC1_BASE + 0x04) as *mut u32;
 const ADC_CR2: *mut u32 = (ADC1_BASE + 0x08) as *mut u32;
-const ADC_SMPR1: *mut u32 = (ADC1_BASE + 0x0c) as *mut u32;
-const ADC_SMPR2: *mut u32 = (ADC1_BASE + 0x10) as *mut u32;
 const ADC_SQR1: *mut u32 = (ADC1_BASE + 0x2c) as *mut u32;
 const ADC_SQR3: *mut u32 = (ADC1_BASE + 0x34) as *mut u32;
 const ADC_DR: *mut u32 = (ADC1_BASE + 0x4c) as *mut u32;
@@ -48,7 +45,6 @@ const DMA_TRANSFER_COMPLETE: u32 = 1 << 1;
 const DMA_CLEAR_CHANNEL_1: u32 = 0x0f;
 
 const SAMPLE_COUNT: usize = crate::config::REGULAR_ADC_CHANNELS.len();
-const ANALOG_SAMPLE_PERIOD_MS: u32 = 10;
 const BRAKE_DEBOUNCE_SAMPLES: u8 = BIKE_CONFIG.ride.brake_debounce_milliseconds;
 const INITIAL_SCAN_WAIT: u32 = 100_000;
 
@@ -60,24 +56,6 @@ struct DmaBuffer(UnsafeCell<[u16; SAMPLE_COUNT]>);
 unsafe impl Sync for DmaBuffer {}
 
 static DMA_SAMPLES: DmaBuffer = DmaBuffer(UnsafeCell::new([0; SAMPLE_COUNT]));
-
-static LATEST_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-static LATEST_VALID: AtomicBool = AtomicBool::new(false);
-static LATEST_BRAKE: AtomicBool = AtomicBool::new(false);
-static LATEST_THROTTLE: AtomicU16 = AtomicU16::new(0);
-static LATEST_BUS_VOLTAGE: AtomicU16 = AtomicU16::new(0);
-static LATEST_MOTOR_TEMPERATURE: AtomicU16 = AtomicU16::new(0);
-static LATEST_CONTROLLER_TEMPERATURE: AtomicU16 = AtomicU16::new(0);
-static LATEST_SAMPLED_AT_MS: AtomicU32 = AtomicU32::new(0);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AnalogReadings {
-    valid: bool,
-    motor_temperature: u16,
-    throttle: u16,
-    bus_voltage: u16,
-    controller_temperature: u16,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -104,11 +82,14 @@ impl Default for Snapshot {
     }
 }
 
+/// Foreground-owned input sampling. Its snapshot is read only by the
+/// foreground loop that services it.
 pub struct InputMonitor {
     adc_initialized: bool,
     brake: DebouncedActiveLow,
     last_digital_ms: u32,
     last_analog_ms: u32,
+    latest: Snapshot,
 }
 
 impl InputMonitor {
@@ -120,6 +101,7 @@ impl InputMonitor {
             brake: DebouncedActiveLow::new(BRAKE_DEBOUNCE_SAMPLES),
             last_digital_ms: now_ms.wrapping_sub(1),
             last_analog_ms: now_ms.wrapping_sub(ANALOG_SAMPLE_PERIOD_MS),
+            latest: Snapshot::default(),
         };
         monitor.service(now_ms);
         monitor
@@ -127,59 +109,51 @@ impl InputMonitor {
 
     pub fn service(&mut self, now_ms: u32) {
         if now_ms != self.last_digital_ms {
-            self.brake.update(brake_pin_is_low());
-            LATEST_BRAKE.store(self.brake.active(), Ordering::Relaxed);
+            self.latest.brake_active = self.brake.update(brake_pin_is_low());
             self.last_digital_ms = now_ms;
         }
         if now_ms.wrapping_sub(self.last_analog_ms) >= ANALOG_SAMPLE_PERIOD_MS {
-            publish(sample_analog(self.adc_initialized), now_ms);
+            self.sample_analog(now_ms);
             self.last_analog_ms = now_ms;
         }
     }
-}
 
-pub fn latest() -> Snapshot {
-    loop {
-        let before = LATEST_SEQUENCE.load(Ordering::Acquire);
-        if before & 1 != 0 {
-            spin_loop();
-            continue;
+    pub const fn latest(&self) -> Snapshot {
+        self.latest
+    }
+
+    fn sample_analog(&mut self, now_ms: u32) {
+        let latest = &mut self.latest;
+        latest.sampled_at_ms = now_ms;
+        // SAFETY: channel 1 remains configured for the fixed aligned buffer.
+        let dma_ready = self.adc_initialized
+            && unsafe {
+                read_volatile(DMA_ISR) & DMA_TRANSFER_COMPLETE != 0
+                    && read_volatile(DMA_CCR1) & DMA_CHANNEL_ENABLE != 0
+            };
+        latest.analog_valid = dma_ready;
+        if !dma_ready {
+            latest.throttle = Observation::INVALID_ZERO;
+            latest.bus_voltage_adc = 0;
+            latest.motor_temperature_adc = 0;
+            latest.controller_temperature_adc = 0;
+            return;
         }
-        let valid = LATEST_VALID.load(Ordering::Relaxed);
-        let raw = LATEST_THROTTLE.load(Ordering::Relaxed);
-        let snapshot = Snapshot {
-            analog_valid: valid,
-            brake_active: LATEST_BRAKE.load(Ordering::Relaxed),
-            throttle: if valid {
-                Observation::from_raw(raw)
-            } else {
-                Observation::invalid_acquisition(raw)
-            },
-            bus_voltage_adc: LATEST_BUS_VOLTAGE.load(Ordering::Relaxed),
-            motor_temperature_adc: LATEST_MOTOR_TEMPERATURE.load(Ordering::Relaxed),
-            controller_temperature_adc: LATEST_CONTROLLER_TEMPERATURE.load(Ordering::Relaxed),
-            sampled_at_ms: LATEST_SAMPLED_AT_MS.load(Ordering::Relaxed),
-        };
-        let after = LATEST_SEQUENCE.load(Ordering::Acquire);
-        if before == after {
-            return snapshot;
+        // SAFETY: the DMA buffer is aligned and only written by DMA1 channel
+        // 1 in right-aligned 12-bit regular-sequence order.
+        unsafe {
+            write_volatile(DMA_IFCR, DMA_TRANSFER_COMPLETE);
+            let samples = DMA_SAMPLES.0.get().cast::<u16>();
+            latest.motor_temperature_adc = read_volatile(samples);
+            latest.throttle = Observation::from_raw(read_volatile(samples.add(1)));
+            latest.bus_voltage_adc = read_volatile(samples.add(2));
+            latest.controller_temperature_adc = read_volatile(samples.add(4));
         }
     }
 }
 
 pub fn bus_voltage_mv(raw: u16) -> u32 {
     super::environment::bus_voltage_mv(raw)
-}
-
-fn publish(readings: AnalogReadings, now_ms: u32) {
-    LATEST_SEQUENCE.fetch_add(1, Ordering::AcqRel);
-    LATEST_THROTTLE.store(readings.throttle, Ordering::Relaxed);
-    LATEST_BUS_VOLTAGE.store(readings.bus_voltage, Ordering::Relaxed);
-    LATEST_MOTOR_TEMPERATURE.store(readings.motor_temperature, Ordering::Relaxed);
-    LATEST_CONTROLLER_TEMPERATURE.store(readings.controller_temperature, Ordering::Relaxed);
-    LATEST_SAMPLED_AT_MS.store(now_ms, Ordering::Relaxed);
-    LATEST_VALID.store(readings.valid, Ordering::Relaxed);
-    LATEST_SEQUENCE.fetch_add(1, Ordering::Release);
 }
 
 fn configure_input_pins() {
@@ -219,31 +193,9 @@ fn configure_regular_adc_dma() -> bool {
         );
 
         write_volatile(ADC_CR1, read_volatile(ADC_CR1) | ADC_SCAN_MODE);
-        set_sample_time(
-            ADC_SMPR1,
-            u32::from(crate::config::MOTOR_TEMPERATURE_ADC_CHANNEL - 10),
-            ADC_SAMPLE_TIME_239_5,
-        );
-        set_sample_time(
-            ADC_SMPR1,
-            u32::from(crate::config::THROTTLE_ADC_CHANNEL - 10),
-            ADC_SAMPLE_TIME_239_5,
-        );
-        set_sample_time(
-            ADC_SMPR1,
-            u32::from(crate::config::CONTROLLER_TEMPERATURE_ADC_CHANNEL - 10),
-            ADC_SAMPLE_TIME_239_5,
-        );
-        set_sample_time(
-            ADC_SMPR2,
-            u32::from(crate::config::VBUS_ADC_CHANNEL),
-            ADC_SAMPLE_TIME_239_5,
-        );
-        set_sample_time(
-            ADC_SMPR2,
-            u32::from(crate::config::UNUSED_TORQUE_ADC_CHANNEL),
-            ADC_SAMPLE_TIME_239_5,
-        );
+        for channel in crate::config::REGULAR_ADC_CHANNELS {
+            set_sample_time(channel, ADC_SAMPLE_TIME_239_5);
+        }
         write_volatile(ADC_SQR1, crate::config::regular_adc_sequence_register_1());
         write_volatile(ADC_SQR3, crate::config::regular_adc_sequence_register_3());
         write_volatile(
@@ -267,49 +219,13 @@ fn configure_regular_adc_dma() -> bool {
     false
 }
 
-unsafe fn set_sample_time(register: *mut u32, channel_index: u32, sample_time: u32) {
-    let shift = channel_index * 3;
-    // SAFETY: caller provides ADC1 SMPR1/2 and a field index within it.
+unsafe fn set_sample_time(channel: u8, sample_time: u32) {
+    let (offset, shift) = adc_sample_time_field(channel);
+    let register = (ADC1_BASE + offset) as *mut u32;
+    // SAFETY: the offset and shift select this channel's ADC1 SMPR field.
     unsafe {
         let value = read_volatile(register);
         write_volatile(register, (value & !(7 << shift)) | (sample_time << shift));
-    }
-}
-
-fn sample_analog(initialized: bool) -> AnalogReadings {
-    if !initialized {
-        return AnalogReadings::default();
-    }
-    // SAFETY: channel 1 remains configured for the fixed aligned buffer.
-    unsafe {
-        if read_volatile(DMA_ISR) & DMA_TRANSFER_COMPLETE == 0
-            || read_volatile(DMA_CCR1) & DMA_CHANNEL_ENABLE == 0
-        {
-            return AnalogReadings::default();
-        }
-        write_volatile(DMA_IFCR, DMA_TRANSFER_COMPLETE);
-        let samples = DMA_SAMPLES.0.get().cast::<u16>();
-        let motor_temperature = read_volatile(samples);
-        let throttle = read_volatile(samples.add(1));
-        let bus_voltage = read_volatile(samples.add(2));
-        let unused_torque = read_volatile(samples.add(3));
-        let controller_temperature = read_volatile(samples.add(4));
-        let valid = [
-            motor_temperature,
-            throttle,
-            bus_voltage,
-            unused_torque,
-            controller_temperature,
-        ]
-        .into_iter()
-        .all(|sample| sample <= 4_095);
-        AnalogReadings {
-            valid,
-            motor_temperature,
-            throttle,
-            bus_voltage,
-            controller_temperature,
-        }
     }
 }
 

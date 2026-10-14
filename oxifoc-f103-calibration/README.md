@@ -41,7 +41,8 @@ Calibration is disabled after every reset. It requires:
 - matching per-boot challenge in separate `ARMC` and routine-specific `RUNR`,
   `RUNL`, `RUNF`, or `RUNH` CAN frames.
 
-`STOP` is accepted without an arm challenge. Hardware BKIN remains active and
+`STOP` is accepted without an arm challenge and also cancels a routine request
+that the control interrupt has not yet taken. Hardware BKIN remains active and
 the calibration software limit is 600 phase-current counts, well below the
 observed comparator threshold. An exact updater reset on `0x67F` is an
 unconditional recovery path: its CAN interrupt first forces the gate driver and

@@ -1,5 +1,11 @@
 //! Minimal stock-bike CAN wire contract.
 
+use crate::config::CAN_FOC_STATUS_ID;
+use crate::sensors::environment::{
+    CONTROLLER_DERATE_START_DECI_C, CONTROLLER_STOP_DECI_C, MOTOR_DERATE_START_DECI_C,
+    MOTOR_STOP_DECI_C, derating, stopped,
+};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     pub id: u16,
@@ -33,7 +39,7 @@ pub const fn is_updater_reset(frame: Frame) -> bool {
 }
 
 pub const fn headlight_command(frame: Frame) -> Option<bool> {
-    if frame.id == 0x300 {
+    if frame.id == 0x300 && frame.len >= 3 {
         Some(frame.data[2] != 0)
     } else {
         None
@@ -154,14 +160,15 @@ fn stock_fault_word(snapshot: StockTelemetry) -> u16 {
         }
         1 => {
             if let Some(temperature) = snapshot.controller_temperature_deci_c {
-                word |= u16::from(temperature >= 700) << 6;
-                word |= u16::from(temperature >= 800) << 7;
+                word |= u16::from(derating(temperature, CONTROLLER_DERATE_START_DECI_C)) << 6;
+                word |= u16::from(stopped(temperature, CONTROLLER_STOP_DECI_C)) << 7;
             }
         }
         2 => {
             if let Some(temperature) = snapshot.motor_temperature_deci_c {
-                word |= u16::from(temperature > 1_000 && temperature < 1_300) << 6;
-                word |= u16::from(temperature >= 1_300) << 7;
+                let stop = stopped(temperature, MOTOR_STOP_DECI_C);
+                word |= u16::from(derating(temperature, MOTOR_DERATE_START_DECI_C) && !stop) << 6;
+                word |= u16::from(stop) << 7;
             }
         }
         _ => {}
@@ -245,6 +252,7 @@ pub struct ControlOutputTelemetry {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlFaultTelemetry {
     pub fault_flags: u32,
+    pub fault_lockout: bool,
     pub safety_events: u16,
     pub last_safety_loss_reason: u8,
 }
@@ -317,7 +325,7 @@ pub fn passive_input_telemetry(page_index: u8, snapshot: PassiveInputTelemetry) 
             | (u8::from(snapshot.cadence_pin_low) << 6)
             | (u8::from(snapshot.cadence_raw_pin_low) << 7);
         Frame::new(
-            0x2f7,
+            CAN_FOC_STATUS_ID,
             8,
             [
                 8,
@@ -340,7 +348,7 @@ pub fn passive_input_telemetry(page_index: u8, snapshot: PassiveInputTelemetry) 
             .saturating_sub(u16::from(u8::MAX))
             .min(u16::from(u8::MAX)) as u8;
         Frame::new(
-            0x2f7,
+            CAN_FOC_STATUS_ID,
             8,
             [
                 9,
@@ -367,7 +375,7 @@ pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
         .min(u32::from(u16::MAX))
         .to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             6,
@@ -394,7 +402,7 @@ pub fn control_live_telemetry(snapshot: ControlLiveTelemetry) -> Frame {
     let direct = snapshot.measured_d_counts.to_le_bytes();
     let quadrature = snapshot.measured_q_counts.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             10,
@@ -416,7 +424,7 @@ pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
     let direct = snapshot.applied_d_ticks.to_le_bytes();
     let quadrature = snapshot.applied_q_ticks.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             11,
@@ -432,12 +440,18 @@ pub fn control_output_telemetry(snapshot: ControlOutputTelemetry) -> Frame {
 }
 
 /// Page 12: the complete internal hardware/software fault mask, saturated
-/// safety-loss count, and most recent loss reason.
+/// safety-loss count, and most recent loss reason. The mask also carries the
+/// ride retry lockout as `fault_flag::RETRY_LOCKOUT`.
 pub fn control_fault_telemetry(snapshot: ControlFaultTelemetry) -> Frame {
-    let faults = snapshot.fault_flags.to_le_bytes();
+    let lockout = if snapshot.fault_lockout {
+        crate::safety::fault_flag::RETRY_LOCKOUT
+    } else {
+        0
+    };
+    let faults = (snapshot.fault_flags | lockout).to_le_bytes();
     let safety_events = snapshot.safety_events.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             12,
@@ -458,7 +472,7 @@ pub fn control_peak_telemetry(snapshot: ControlPeakTelemetry) -> Frame {
     let phase = snapshot.maximum_phase_current_abs.to_le_bytes();
     let direct = snapshot.maximum_direct_current_abs.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [13, phase[0], phase[1], direct[0], direct[1], 0, 0, 0],
     )
@@ -474,7 +488,7 @@ pub fn field_weakening_telemetry(snapshot: FieldWeakeningTelemetry) -> Frame {
     let direct = snapshot.requested_d_ticks.to_le_bytes();
     let quadrature = snapshot.requested_q_ticks.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             14,
@@ -497,7 +511,7 @@ pub fn observer_status_telemetry(snapshot: ObserverStatusTelemetry) -> Frame {
     let rpm = snapshot.electrical_rpm.to_le_bytes();
     let hall_error = snapshot.hall_error_q16.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             19,
@@ -519,7 +533,7 @@ pub fn observer_model_telemetry(snapshot: ObserverModelTelemetry) -> Frame {
     let bemf = snapshot.bemf_q_mv.to_le_bytes();
     let phase_error = snapshot.phase_error_q16.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             20,
@@ -542,7 +556,7 @@ pub fn reset_summary_telemetry(snapshot: ResetSummaryTelemetry) -> Frame {
     let last = snapshot.last_control_cycles.to_le_bytes();
     let maximum = snapshot.maximum_control_cycles.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             22,
@@ -566,7 +580,7 @@ pub fn crash_context_telemetry(snapshot: CrashContextTelemetry) -> Frame {
     let pc = snapshot.program_counter.to_le_bytes();
     let lr = snapshot.link_register.to_le_bytes();
     Frame::new(
-        0x2f7,
+        CAN_FOC_STATUS_ID,
         8,
         [
             23,
@@ -600,7 +614,7 @@ pub fn pwm_failure_telemetry(page: u8, words: [u32; 4]) -> Frame {
             25, header[0], ccer_a[2], ccer_a[3], b_c[0], b_c[1], b_c[2], b_c[3],
         ]
     };
-    Frame::new(0x2f7, 8, data)
+    Frame::new(CAN_FOC_STATUS_ID, 8, data)
 }
 
 /// Page 18 identifies the exact crate version and project telemetry schema in
@@ -615,7 +629,7 @@ pub fn firmware_version_telemetry() -> Frame {
         data[index + 2] = version[index];
         index += 1;
     }
-    Frame::new(0x2f7, 8, data)
+    Frame::new(CAN_FOC_STATUS_ID, 8, data)
 }
 
 #[cfg(test)]
@@ -660,7 +674,9 @@ mod tests {
             }),
             None
         );
-        assert_eq!(headlight_command(Frame { len: 2, ..enabled }), Some(true));
+        assert_eq!(headlight_command(Frame { len: 3, ..enabled }), Some(true));
+        assert_eq!(headlight_command(Frame { len: 2, ..enabled }), None);
+        assert_eq!(headlight_command(Frame { len: 0, ..enabled }), None);
     }
 
     #[test]
@@ -772,6 +788,34 @@ mod tests {
     }
 
     #[test]
+    fn stock_temperature_fault_bits_follow_the_configured_derating_envelope() {
+        let thermal = crate::config::BIKE_CONFIG.thermal;
+        let controller_start = thermal.controller_derate_start_celsius * 10;
+        let controller_stop = thermal.controller_stop_celsius * 10;
+        let motor_start = thermal.motor_derate_start_celsius * 10;
+        let motor_stop = thermal.motor_stop_celsius * 10;
+        let fault_bits = |fault_page, controller, motor| {
+            let snapshot = StockTelemetry {
+                fault_page,
+                controller_temperature_deci_c: Some(controller),
+                motor_temperature_deci_c: Some(motor),
+                ..StockTelemetry::default()
+            };
+            telemetry_slot(1, snapshot)[1].unwrap().data[6] & 0xc0
+        };
+
+        assert_eq!(fault_bits(1, controller_start, 0), 0);
+        assert_eq!(fault_bits(1, controller_start + 1, 0), 0x40);
+        assert_eq!(fault_bits(1, controller_stop - 1, 0), 0x40);
+        assert_eq!(fault_bits(1, controller_stop, 0), 0xc0);
+
+        assert_eq!(fault_bits(2, 0, motor_start), 0);
+        assert_eq!(fault_bits(2, 0, motor_start + 1), 0x40);
+        assert_eq!(fault_bits(2, 0, motor_stop - 1), 0x40);
+        assert_eq!(fault_bits(2, 0, motor_stop), 0x80);
+    }
+
+    #[test]
     fn passive_input_pages_use_the_established_field_locations() {
         let snapshot = PassiveInputTelemetry {
             analog_valid: true,
@@ -864,12 +908,22 @@ mod tests {
 
         let faults = ControlFaultTelemetry {
             fault_flags: 0x1234_5678,
+            fault_lockout: false,
             safety_events: 0xabcd,
             last_safety_loss_reason: 7,
         };
         assert_eq!(
             control_fault_telemetry(faults).data,
             [12, 0x78, 0x56, 0x34, 0x12, 0xcd, 0xab, 7]
+        );
+        let locked = ControlFaultTelemetry {
+            fault_flags: crate::safety::fault_flag::HARDWARE_BREAK,
+            fault_lockout: true,
+            ..faults
+        };
+        assert_eq!(
+            control_fault_telemetry(locked).data,
+            [12, 0x81, 0, 0, 0, 0xcd, 0xab, 7]
         );
 
         let peaks = ControlPeakTelemetry {

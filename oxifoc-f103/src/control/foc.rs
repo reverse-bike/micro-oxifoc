@@ -4,15 +4,18 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
+use super::{
+    RideFocDriver, actuation_advance_from_erpm, apply_ride_current_ceilings, ride_foc_driver,
+};
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
 use oxifoc_core::foc::{
-    Dq, Fixed, FixedFocController, NoDecoupling, PIController, Scalar,
+    Dq, Fixed,
     hall_sensor::HallSensor,
     offset_tracker::CurrentOffsetTracker,
     phase::{BackEmfObserver, ObserverDiagnostics, PhaseEstimate, PhaseManager, PhaseSource},
     ramp::QuadratureTargetRamp,
 };
-use oxifoc_core::motor::foc_driver::{CurrentLimits, FieldWeakening, FocDriver, StepError};
+use oxifoc_core::motor::foc_driver::StepError;
 
 const CONTROL_HALL_VALID: u32 = 1;
 const CONTROL_CURRENT_VALID: u32 = 1 << 1;
@@ -22,21 +25,9 @@ const HALL_RECOVERY_STABLE_CYCLES: u8 = 5;
 const CONTROL_BUDGET_CYCLES: u32 = crate::config::SYSCLK_HZ / crate::config::PWM_HZ;
 const CONTROL_PERIOD_NS: u32 = 1_000_000_000 / crate::config::PWM_HZ;
 
-type RideDecoupling = NoDecoupling;
-type RideFocController = FixedFocController<
-    { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
-    { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
-    RideDecoupling,
->;
-type RideFocDriver = FocDriver<
-    PhaseManager<HallSensor>,
-    { crate::config::FOC_DEAD_TIME_COMP_NUMERATOR },
-    { crate::config::FOC_DEAD_TIME_COMP_DENOMINATOR },
-    RideDecoupling,
->;
-
 static TARGET_Q_COUNTS: AtomicI32 = AtomicI32::new(0);
 static DC_CURRENT_LIMIT_COUNTS: AtomicU32 = AtomicU32::new(0);
+static PHASE_CURRENT_LIMIT_COUNTS: AtomicU32 = AtomicU32::new(0);
 static CONTROL_CYCLE: AtomicU32 = AtomicU32::new(0);
 static COMMAND_DEADLINE: AtomicU32 = AtomicU32::new(0);
 static COMMAND_SAFETY_EPOCH: AtomicU32 = AtomicU32::new(0);
@@ -76,6 +67,7 @@ pub struct Snapshot {
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
     pub safety_events: u32,
+    pub phase_current_trips: u32,
     pub hall_sequence: u32,
     pub hall_interval_us: u32,
     pub hall_progress: i32,
@@ -146,6 +138,7 @@ struct RuntimeSnapshotRaw {
     measured_current: Dq,
     applied_voltage: Dq,
     safety_events: u32,
+    phase_current_trips: u32,
     hall_sequence: u32,
     hall_interval_us: u32,
     hall_progress: i32,
@@ -197,7 +190,12 @@ pub fn start(offsets: CurrentOffsets) {
                 crate::config::TARGET_RAMP_COUNTS_PER_STEP,
             ),
             offsets,
-            offset_tracker: CurrentOffsetTracker::new(offsets.phase_a, offsets.phase_b),
+            offset_tracker: CurrentOffsetTracker::new(
+                offsets.phase_a,
+                offsets.phase_b,
+                crate::config::CURRENT_OFFSET_TOLERANCE_COUNTS,
+                crate::config::CURRENT_OFFSET_FAULT_SAMPLES,
+            ),
             hardware_hall_sequence: 0,
             hall_recovery_raw: 0,
             hall_recovery_cycles: 0,
@@ -230,6 +228,7 @@ pub fn set_bus_voltage_mv(bus_voltage_mv: u32) {
 pub fn authorize_ride_target(
     target_q_counts: i16,
     dc_current_limit_counts: u16,
+    phase_current_limit_counts: u16,
     lifetime_cycles: u32,
     safety_epoch: u32,
 ) {
@@ -244,6 +243,10 @@ pub fn authorize_ride_target(
         u32::from(dc_current_limit_counts.min(crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)),
         Ordering::Relaxed,
     );
+    PHASE_CURRENT_LIMIT_COUNTS.store(
+        u32::from(phase_current_limit_counts.min(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS)),
+        Ordering::Relaxed,
+    );
     COMMAND_SAFETY_EPOCH.store(safety_epoch, Ordering::Relaxed);
     let now = CONTROL_CYCLE.load(Ordering::Relaxed);
     COMMAND_DEADLINE.store(now.wrapping_add(lifetime_cycles), Ordering::Release);
@@ -254,6 +257,7 @@ pub fn revoke_ride_authority() {
     COMMAND_ENABLED.store(false, Ordering::Release);
     TARGET_Q_COUNTS.store(0, Ordering::Relaxed);
     DC_CURRENT_LIMIT_COUNTS.store(0, Ordering::Relaxed);
+    PHASE_CURRENT_LIMIT_COUNTS.store(0, Ordering::Relaxed);
     COMMAND_DEADLINE.store(CONTROL_CYCLE.load(Ordering::Relaxed), Ordering::Release);
 }
 
@@ -282,6 +286,7 @@ pub fn snapshot() -> Snapshot {
                 measured_current: diagnostics.measured_current,
                 applied_voltage: diagnostics.applied_voltage,
                 safety_events: diagnostics.safety_events,
+                phase_current_trips: diagnostics.phase_current_trips,
                 hall_sequence: diagnostics.hall_sequence,
                 hall_interval_us: diagnostics.hall_interval_us,
                 hall_progress: diagnostics.hall_progress,
@@ -302,6 +307,7 @@ pub fn snapshot() -> Snapshot {
         applied_d_ticks: fixed_to_i16(raw.applied_voltage.d),
         applied_q_ticks: fixed_to_i16(raw.applied_voltage.q),
         safety_events: raw.safety_events,
+        phase_current_trips: raw.phase_current_trips,
         hall_sequence: raw.hall_sequence,
         hall_interval_us: raw.hall_interval_us,
         hall_progress: raw.hall_progress,
@@ -457,7 +463,12 @@ fn control_cycle() {
     let current = match hardware::read_phase_currents(state.offsets) {
         Ok(sample) => {
             state.diagnostics.injected_samples = state.diagnostics.injected_samples.wrapping_add(1);
-            publish_flag(&mut state.diagnostics, CONTROL_CURRENT_VALID, true);
+            // Sustained undriven offset deviation blocks a new ride lease.
+            publish_flag(
+                &mut state.diagnostics,
+                CONTROL_CURRENT_VALID,
+                state.offset_tracker.offsets_valid(),
+            );
             crate::safety::record_control_checkpoint(crate::safety::checkpoint::CURRENT_SAMPLED);
             sample
         }
@@ -601,12 +612,10 @@ fn control_cycle() {
     let dc_current_limit = DC_CURRENT_LIMIT_COUNTS
         .load(Ordering::Relaxed)
         .min(u32::from(u16::MAX)) as u16;
-    state.driver.set_bus_limits(
-        Some(Fixed::from_integer(i32::from(dc_current_limit))),
-        Some(Fixed::from_integer(i32::from(
-            crate::config::RIDE_DC_BUS_REGEN_LIMIT_COUNTS,
-        ))),
-    );
+    let phase_current_limit = PHASE_CURRENT_LIMIT_COUNTS
+        .load(Ordering::Relaxed)
+        .min(u32::from(u16::MAX)) as u16;
+    apply_ride_current_ceilings(&mut state.driver, dc_current_limit, phase_current_limit);
     let requested_q = state
         .target_ramp
         .next(TARGET_Q_COUNTS.load(Ordering::Relaxed));
@@ -677,57 +686,6 @@ fn fixed_to_scaled_i32(value: Fixed, scale: i32) -> i32 {
 
 fn saturating_i32_to_i16(value: i32) -> i16 {
     value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
-}
-
-fn actuation_advance_from_erpm(electrical_rpm: i32) -> Fixed {
-    // Q16.16 radians per control period. 1757/4096 approximates
-    // 2*pi*65536/(60*16000) to 0.006%, with no division in the ISR.
-    let bits = (electrical_rpm * 1_757) >> 12;
-    Fixed::from_bits(bits)
-}
-
-const fn ride_foc_controller() -> RideFocController {
-    let pi = PIController::new(
-        crate::config::CURRENT_PI_PROPORTIONAL_GAIN,
-        crate::config::CURRENT_PI_INTEGRAL_GAIN_PER_CYCLE,
-    );
-    RideFocController::new(
-        pi,
-        pi,
-        crate::config::FOC_VECTOR_LIMIT_TICKS,
-        crate::config::FOC_PHASE_LIMIT_TICKS,
-    )
-}
-
-const fn ride_foc_driver(phase: PhaseManager<HallSensor>) -> RideFocDriver {
-    RideFocDriver::new(
-        ride_foc_controller(),
-        phase,
-        ride_current_limits(),
-        crate::config::PWM_ARR,
-        crate::config::DC_LINK_CURRENT_FILTER_SHIFT,
-    )
-    .with_observer_scales(Fixed::ZERO, crate::config::PHASE_CURRENT_AMPS_PER_ADC_COUNT)
-    .with_field_weakening(FieldWeakening::new(
-        Fixed::from_integer(crate::config::FIELD_WEAKENING_MAXIMUM_CURRENT_COUNTS as i32),
-        crate::config::FIELD_WEAKENING_MINIMUM_ERPM,
-        crate::config::FIELD_WEAKENING_VOLTAGE_THRESHOLD_TICKS,
-        crate::config::FIELD_WEAKENING_RAMP_IN_PER_CYCLE,
-        crate::config::FIELD_WEAKENING_RAMP_OUT_PER_CYCLE,
-    ))
-}
-
-const fn ride_current_limits() -> CurrentLimits {
-    CurrentLimits::new(
-        Fixed::from_integer(crate::config::RIDE_PHASE_CURRENT_LIMIT_COUNTS as i32),
-        Fixed::from_integer(crate::config::PHASE_CURRENT_TRIP_COUNTS as i32),
-        Some(Fixed::from_integer(
-            crate::config::RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS as i32,
-        )),
-        Some(Fixed::from_integer(
-            crate::config::RIDE_DC_BUS_REGEN_LIMIT_COUNTS as i32,
-        )),
-    )
 }
 
 fn update_max(target: &mut u32, value: u32) -> bool {

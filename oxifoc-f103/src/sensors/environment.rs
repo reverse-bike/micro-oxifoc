@@ -1,8 +1,9 @@
 //! Local voltage and temperature conversion plus the ride-current envelope.
 
 use crate::config::{
-    BIKE_CONFIG, PWM_ARR, RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_DURATION_MS,
-    RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS, RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR,
+    ANALOG_SAMPLE_PERIOD_MS, BIKE_CONFIG, PWM_ARR, RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS,
+    RIDE_DC_BUS_TRANSIENT_DURATION_MS, RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS,
+    RIDE_DC_BUS_TRANSIENT_RECOVERY_DIVISOR, RIDE_PHASE_CURRENT_LIMIT_COUNTS,
     VBUS_MILLIVOLTS_Q10_PER_COUNT,
 };
 
@@ -10,11 +11,21 @@ pub const UPDATE_PERIOD_MS: u32 = 50;
 pub const DC_BUS_UNDERVOLTAGE_MV: u32 = BIKE_CONFIG.battery.minimum_bus_voltage_millivolts;
 pub const DC_BUS_UNDERVOLTAGE_SAMPLES: u8 =
     (BIKE_CONFIG.battery.undervoltage_debounce_milliseconds / UPDATE_PERIOD_MS) as u8;
-const CONTROLLER_DERATE_START_DECI_C: i16 =
+pub const DC_BUS_OVERVOLTAGE_MV: u32 = BIKE_CONFIG.battery.maximum_bus_voltage_millivolts;
+pub const DC_BUS_OVERVOLTAGE_HYSTERESIS_MV: u32 =
+    BIKE_CONFIG.battery.overvoltage_hysteresis_millivolts;
+/// Overvoltage is checked on every 1 ms ride pass rather than the 50 ms
+/// envelope period, but counts only fresh bus-voltage conversions, so one
+/// sample is one analog sample period.
+pub const DC_BUS_OVERVOLTAGE_SAMPLES: u8 =
+    (BIKE_CONFIG.battery.overvoltage_debounce_milliseconds / ANALOG_SAMPLE_PERIOD_MS) as u8;
+/// Q16 thermal fraction granting the full current ceiling.
+pub const THERMAL_FRACTION_ONE: u32 = 1 << 16;
+pub const CONTROLLER_DERATE_START_DECI_C: i16 =
     BIKE_CONFIG.thermal.controller_derate_start_celsius * 10;
-const CONTROLLER_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.controller_stop_celsius * 10;
-const MOTOR_DERATE_START_DECI_C: i16 = BIKE_CONFIG.thermal.motor_derate_start_celsius * 10;
-const MOTOR_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.motor_stop_celsius * 10;
+pub const CONTROLLER_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.controller_stop_celsius * 10;
+pub const MOTOR_DERATE_START_DECI_C: i16 = BIKE_CONFIG.thermal.motor_derate_start_celsius * 10;
+pub const MOTOR_STOP_DECI_C: i16 = BIKE_CONFIG.thermal.motor_stop_celsius * 10;
 const TRANSIENT_BUDGET_SAMPLES: u16 = (RIDE_DC_BUS_TRANSIENT_DURATION_MS / UPDATE_PERIOD_MS) as u16;
 const TRANSIENT_BUDGET_CAPACITY: u16 = (RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
     - RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS)
@@ -27,6 +38,17 @@ const _: () = assert!(
         .undervoltage_debounce_milliseconds
         .is_multiple_of(UPDATE_PERIOD_MS)
 );
+const _: () = assert!(
+    BIKE_CONFIG
+        .battery
+        .overvoltage_debounce_milliseconds
+        .is_multiple_of(ANALOG_SAMPLE_PERIOD_MS)
+);
+const _: () = assert!(
+    BIKE_CONFIG.battery.overvoltage_debounce_milliseconds / ANALOG_SAMPLE_PERIOD_MS > 0
+        && BIKE_CONFIG.battery.overvoltage_debounce_milliseconds / ANALOG_SAMPLE_PERIOD_MS
+            <= u8::MAX as u32
+);
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS <= u16::MAX as u32);
 const _: () = assert!(TRANSIENT_BUDGET_CAPACITY > 0);
 
@@ -34,6 +56,7 @@ pub mod reason {
     pub const CONTROLLER_TEMPERATURE: u8 = 1;
     pub const MOTOR_TEMPERATURE: u8 = 1 << 1;
     pub const DC_BUS_TRANSIENT_RECOVERY: u8 = 1 << 2;
+    pub const DC_BUS_OVERVOLTAGE: u8 = 1 << 3;
     pub const DC_BUS_UNDERVOLTAGE: u8 = 1 << 5;
     pub const LOCAL_DATA_MISSING: u8 = 1 << 6;
 }
@@ -44,14 +67,21 @@ pub struct RawLocalSensors {
     pub bus_voltage_adc: u16,
     pub motor_temperature_adc: u16,
     pub controller_temperature_adc: u16,
+    /// Time the analog conversion was captured; a repeated timestamp is the
+    /// same conversion observed again.
+    pub sampled_at_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EnvironmentMonitor {
     undervoltage_count: u8,
     undervoltage_active: bool,
+    overvoltage_count: u8,
+    overvoltage_active: bool,
+    last_overvoltage_sample_ms: u32,
     last_update_ms: u32,
     latest_limit: Option<u16>,
+    phase_current_limit: u16,
     derating_reasons: u8,
     transient_budget: u16,
     transient_recovery_active: bool,
@@ -62,8 +92,12 @@ impl EnvironmentMonitor {
         Self {
             undervoltage_count: 0,
             undervoltage_active: false,
+            overvoltage_count: 0,
+            overvoltage_active: false,
+            last_overvoltage_sample_ms: now_ms.wrapping_sub(1),
             last_update_ms: now_ms.wrapping_sub(UPDATE_PERIOD_MS),
             latest_limit: None,
+            phase_current_limit: 0,
             derating_reasons: reason::LOCAL_DATA_MISSING,
             transient_budget: TRANSIENT_BUDGET_CAPACITY,
             transient_recovery_active: false,
@@ -78,46 +112,52 @@ impl EnvironmentMonitor {
         sensors: RawLocalSensors,
         projected_dc_current_counts: u16,
     ) -> Option<u16> {
+        let bus_voltage = bus_voltage_mv(sensors.bus_voltage_adc);
+        if sensors.valid && sensors.sampled_at_ms != self.last_overvoltage_sample_ms {
+            self.last_overvoltage_sample_ms = sensors.sampled_at_ms;
+            self.update_overvoltage(bus_voltage);
+        }
         if now_ms.wrapping_sub(self.last_update_ms) < UPDATE_PERIOD_MS {
-            return self.latest_limit;
+            return self.limit();
         }
         self.last_update_ms = now_ms;
+        self.latest_limit = None;
+        self.phase_current_limit = 0;
+        self.derating_reasons = reason::LOCAL_DATA_MISSING;
         if !sensors.valid {
-            self.latest_limit = None;
-            self.derating_reasons = reason::LOCAL_DATA_MISSING;
             return None;
         }
 
-        let bus_voltage = bus_voltage_mv(sensors.bus_voltage_adc);
         self.update_undervoltage(bus_voltage);
-        let Some(motor_temperature) = motor_temperature_deci_c(sensors.motor_temperature_adc)
-        else {
-            self.latest_limit = None;
-            self.derating_reasons = reason::LOCAL_DATA_MISSING;
-            return None;
-        };
+        let motor_temperature = motor_temperature_deci_c(sensors.motor_temperature_adc)?;
         let controller_temperature =
             controller_temperature_deci_c(sensors.controller_temperature_adc);
         let mut reasons = 0;
-        if controller_temperature > CONTROLLER_DERATE_START_DECI_C {
+        if derating(controller_temperature, CONTROLLER_DERATE_START_DECI_C) {
             reasons |= reason::CONTROLLER_TEMPERATURE;
         }
-        if motor_temperature > MOTOR_DERATE_START_DECI_C {
+        if derating(motor_temperature, MOTOR_DERATE_START_DECI_C) {
             reasons |= reason::MOTOR_TEMPERATURE;
         }
         let transient_limit = self.update_transient_limit(projected_dc_current_counts);
         if self.transient_recovery_active {
             reasons |= reason::DC_BUS_TRANSIENT_RECOVERY;
         }
-        let mut limit = transient_limit.min(thermal_limit_counts(
+        let thermal_fraction = thermal_fraction_q16(
             controller_temperature,
             CONTROLLER_DERATE_START_DECI_C,
             CONTROLLER_STOP_DECI_C,
-        ));
-        limit = limit.min(thermal_limit_counts(
+        )
+        .min(thermal_fraction_q16(
             motor_temperature,
             MOTOR_DERATE_START_DECI_C,
             MOTOR_STOP_DECI_C,
+        ));
+        self.phase_current_limit =
+            scale_by_thermal_fraction(RIDE_PHASE_CURRENT_LIMIT_COUNTS, thermal_fraction);
+        let mut limit = transient_limit.min(scale_by_thermal_fraction(
+            RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS,
+            thermal_fraction,
         ));
         if self.undervoltage_active {
             limit = 0;
@@ -125,15 +165,37 @@ impl EnvironmentMonitor {
         }
         self.derating_reasons = reasons;
         self.latest_limit = Some(limit);
-        self.latest_limit
+        self.limit()
+    }
+
+    /// Overvoltage is applied on every 1 ms pass over the 50 ms envelope.
+    fn limit(&self) -> Option<u16> {
+        if self.overvoltage_active {
+            self.latest_limit.map(|_| 0)
+        } else {
+            self.latest_limit
+        }
     }
 
     pub const fn undervoltage_active(&self) -> bool {
         self.undervoltage_active
     }
 
+    pub const fn overvoltage_active(&self) -> bool {
+        self.overvoltage_active
+    }
+
+    /// Thermally derated phase-current ceiling in current counts.
+    pub const fn phase_current_limit_counts(&self) -> u16 {
+        self.phase_current_limit
+    }
+
     pub const fn derating_reasons(&self) -> u8 {
-        self.derating_reasons
+        if self.overvoltage_active {
+            self.derating_reasons | reason::DC_BUS_OVERVOLTAGE
+        } else {
+            self.derating_reasons
+        }
     }
 
     /// Remaining time at the full transient-minus-continuous current excess.
@@ -167,6 +229,24 @@ impl EnvironmentMonitor {
             RIDE_DC_BUS_CONTINUOUS_LIMIT_COUNTS
         } else {
             RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS
+        }
+    }
+
+    fn update_overvoltage(&mut self, voltage_mv: u32) {
+        if voltage_mv > DC_BUS_OVERVOLTAGE_MV {
+            self.overvoltage_count = self
+                .overvoltage_count
+                .saturating_add(1)
+                .min(DC_BUS_OVERVOLTAGE_SAMPLES);
+            if self.overvoltage_count == DC_BUS_OVERVOLTAGE_SAMPLES {
+                self.overvoltage_active = true;
+            }
+        } else if voltage_mv <= DC_BUS_OVERVOLTAGE_MV - DC_BUS_OVERVOLTAGE_HYSTERESIS_MV {
+            if self.overvoltage_count == 0 {
+                self.overvoltage_active = false;
+            } else {
+                self.overvoltage_count -= 1;
+            }
         }
     }
 
@@ -253,19 +333,32 @@ fn thermistor_segment(intercept: i32, slope: i32, millivolts: i32) -> i32 {
     intercept.saturating_sub(slope.saturating_mul(millivolts) / 1_000)
 }
 
-fn thermal_limit_counts(temperature: i16, start: i16, stop: i16) -> u16 {
-    if temperature <= start {
-        return RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS;
+/// Drive current is reduced only above the derating start temperature.
+pub const fn derating(temperature_deci_c: i16, start_deci_c: i16) -> bool {
+    temperature_deci_c > start_deci_c
+}
+
+/// Drive current reaches zero at the stop temperature.
+pub const fn stopped(temperature_deci_c: i16, stop_deci_c: i16) -> bool {
+    temperature_deci_c >= stop_deci_c
+}
+
+/// Q16 share of the current ceiling: full at or below the start temperature,
+/// zero at the stop temperature, and linear between them.
+fn thermal_fraction_q16(temperature: i16, start: i16, stop: i16) -> u32 {
+    if !derating(temperature, start) {
+        return THERMAL_FRACTION_ONE;
     }
-    if temperature >= stop {
+    if stopped(temperature, stop) {
         return 0;
     }
     let remaining = u32::from(stop.saturating_sub(temperature) as u16);
     let span = u32::from(stop.saturating_sub(start) as u16);
-    u32::from(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
-        .saturating_mul(remaining)
-        .checked_div(span)
-        .unwrap_or_default() as u16
+    (remaining << 16).checked_div(span).unwrap_or_default()
+}
+
+fn scale_by_thermal_fraction(limit: u16, fraction_q16: u32) -> u16 {
+    ((u32::from(limit) * fraction_q16.min(THERMAL_FRACTION_ONE)) >> 16) as u16
 }
 
 #[cfg(test)]
@@ -278,6 +371,7 @@ mod tests {
             bus_voltage_adc: 2_945,
             motor_temperature_adc: 2_000,
             controller_temperature_adc: 1_774,
+            sampled_at_ms: 0,
         }
     }
 
@@ -303,6 +397,12 @@ mod tests {
 
     #[test]
     fn local_temperatures_derate_to_zero() {
+        let thermal_limit_counts = |temperature, start, stop| {
+            scale_by_thermal_fraction(
+                RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS,
+                thermal_fraction_q16(temperature, start, stop),
+            )
+        };
         assert_eq!(thermal_limit_counts(700, 700, 800), 640);
         assert_eq!(thermal_limit_counts(750, 700, 800), 320);
         assert_eq!(thermal_limit_counts(800, 700, 800), 0);
@@ -335,6 +435,135 @@ mod tests {
             Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
         );
         assert_eq!(monitor.derating_reasons(), 0);
+    }
+
+    fn bus_adc(millivolts: u32) -> u16 {
+        ((millivolts << 10).div_ceil(VBUS_MILLIVOLTS_Q10_PER_COUNT)) as u16
+    }
+
+    /// One analog conversion observed on every 1 ms ride pass until the
+    /// next conversion replaces it.
+    fn observe_sample(
+        monitor: &mut EnvironmentMonitor,
+        now: &mut u32,
+        sensors: RawLocalSensors,
+    ) -> Option<u16> {
+        let sample = RawLocalSensors {
+            sampled_at_ms: *now,
+            ..sensors
+        };
+        let mut limit = None;
+        for _ in 0..ANALOG_SAMPLE_PERIOD_MS {
+            limit = monitor.update(*now, sample, 0);
+            *now += 1;
+        }
+        limit
+    }
+
+    #[test]
+    fn overvoltage_debounce_is_thirty_milliseconds_of_fresh_samples() {
+        assert_eq!(DC_BUS_OVERVOLTAGE_SAMPLES, 3);
+        assert_eq!(
+            u32::from(DC_BUS_OVERVOLTAGE_SAMPLES) * ANALOG_SAMPLE_PERIOD_MS,
+            BIKE_CONFIG.battery.overvoltage_debounce_milliseconds
+        );
+    }
+
+    #[test]
+    fn one_noisy_conversion_seen_on_many_passes_does_not_trip_overvoltage() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut now = 0;
+        assert!(observe_sample(&mut monitor, &mut now, nominal()).is_some());
+        let mut high = nominal();
+        high.bus_voltage_adc = bus_adc(DC_BUS_OVERVOLTAGE_MV + 100);
+        assert_ne!(observe_sample(&mut monitor, &mut now, high), Some(0));
+        assert!(!monitor.overvoltage_active());
+        assert_ne!(observe_sample(&mut monitor, &mut now, nominal()), Some(0));
+        assert!(!monitor.overvoltage_active());
+    }
+
+    #[test]
+    fn overvoltage_removes_authority_within_the_debounce_and_clears_with_hysteresis() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut now = 0;
+        assert!(observe_sample(&mut monitor, &mut now, nominal()).is_some());
+        let mut high = nominal();
+        high.bus_voltage_adc = bus_adc(DC_BUS_OVERVOLTAGE_MV + 100);
+        assert!(bus_voltage_mv(high.bus_voltage_adc) > DC_BUS_OVERVOLTAGE_MV);
+        for _ in 1..DC_BUS_OVERVOLTAGE_SAMPLES {
+            assert_ne!(observe_sample(&mut monitor, &mut now, high), Some(0));
+        }
+        let tripping = RawLocalSensors {
+            sampled_at_ms: now,
+            ..high
+        };
+        assert_eq!(monitor.update(now, tripping, 0), Some(0));
+        assert!(monitor.overvoltage_active());
+        assert_ne!(monitor.derating_reasons() & reason::DC_BUS_OVERVOLTAGE, 0);
+        now += ANALOG_SAMPLE_PERIOD_MS;
+
+        let mut within_hysteresis = nominal();
+        within_hysteresis.bus_voltage_adc =
+            bus_adc(DC_BUS_OVERVOLTAGE_MV - DC_BUS_OVERVOLTAGE_HYSTERESIS_MV + 100);
+        for _ in 0..10 {
+            assert_eq!(
+                observe_sample(&mut monitor, &mut now, within_hysteresis),
+                Some(0)
+            );
+        }
+        for _ in 0..DC_BUS_OVERVOLTAGE_SAMPLES {
+            assert_eq!(observe_sample(&mut monitor, &mut now, nominal()), Some(0));
+        }
+        now += UPDATE_PERIOD_MS;
+        let released = RawLocalSensors {
+            sampled_at_ms: now,
+            ..nominal()
+        };
+        assert_eq!(
+            monitor.update(now, released, 0),
+            Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+        );
+        assert_eq!(monitor.derating_reasons(), 0);
+    }
+
+    #[test]
+    fn thermal_derating_scales_the_phase_current_ceiling() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        assert_eq!(monitor.phase_current_limit_counts(), 0);
+        monitor.update(0, nominal(), 0);
+        assert_eq!(
+            monitor.phase_current_limit_counts(),
+            RIDE_PHASE_CURRENT_LIMIT_COUNTS
+        );
+        assert_eq!(thermal_fraction_q16(700, 700, 800), THERMAL_FRACTION_ONE);
+        assert_eq!(
+            thermal_fraction_q16(750, 700, 800),
+            THERMAL_FRACTION_ONE / 2
+        );
+        assert_eq!(thermal_fraction_q16(800, 700, 800), 0);
+        assert_eq!(
+            scale_by_thermal_fraction(RIDE_PHASE_CURRENT_LIMIT_COUNTS, THERMAL_FRACTION_ONE / 2),
+            RIDE_PHASE_CURRENT_LIMIT_COUNTS / 2
+        );
+
+        let mut warm = nominal();
+        warm.controller_temperature_adc = 1_508;
+        assert!(derating(
+            controller_temperature_deci_c(1_508),
+            CONTROLLER_DERATE_START_DECI_C
+        ));
+        let limit = monitor.update(UPDATE_PERIOD_MS, warm, 0).unwrap();
+        let phase_limit = monitor.phase_current_limit_counts();
+        assert!(phase_limit > 0 && phase_limit < RIDE_PHASE_CURRENT_LIMIT_COUNTS);
+        let expected = u32::from(phase_limit) * u32::from(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+            / u32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS);
+        assert!(u32::from(limit).abs_diff(expected) <= 1);
+
+        assert_eq!(
+            monitor.update(2 * UPDATE_PERIOD_MS, RawLocalSensors::default(), 0),
+            None
+        );
+        assert_eq!(monitor.phase_current_limit_counts(), 0);
     }
 
     #[test]

@@ -2,3 +2,4 @@
 
 pub(crate) mod gpio;
 pub mod peripherals;
+pub(crate) mod system;

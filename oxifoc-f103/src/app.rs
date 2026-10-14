@@ -10,17 +10,12 @@ use crate::{
     transport::{RideCan, RuntimeTelemetry},
 };
 
-const WATCHDOG_FEED_PERIOD_MS: u32 = 10;
-
 pub struct RideApp {
     inputs: Option<sensors::InputMonitor>,
     environment: Option<environment::EnvironmentMonitor>,
     ride_controller: Option<ride::RideController>,
     last_ride_ms: u32,
-    watchdog_started: bool,
-    last_watchdog_feed_ms: u32,
-    last_watchdog_control_cycles: u32,
-    last_watchdog_injected_samples: u32,
+    watchdog: safety::MainLoopWatchdog,
     wheel_initialized: bool,
     wheel_estimator: wheel::Estimator,
     wheel_state: wheel::State,
@@ -33,6 +28,7 @@ pub struct RideApp {
     transient_budget_ms: u16,
     derating_reasons: u8,
     ride_stage: ride::Stage,
+    fault_lockout: bool,
     can: RideCan,
 }
 
@@ -49,10 +45,7 @@ impl RideApp {
             environment: None,
             ride_controller: None,
             last_ride_ms: u32::MAX,
-            watchdog_started: false,
-            last_watchdog_feed_ms: 0,
-            last_watchdog_control_cycles: 0,
-            last_watchdog_injected_samples: 0,
+            watchdog: safety::MainLoopWatchdog::new(),
             wheel_initialized: false,
             wheel_estimator: wheel::Estimator::new(),
             wheel_state: wheel::State::Uninitialized,
@@ -65,6 +58,7 @@ impl RideApp {
             transient_budget_ms: 0,
             derating_reasons: environment::reason::LOCAL_DATA_MISSING,
             ride_stage: ride::Stage::Disarmed,
+            fault_lockout: false,
             can: RideCan::new(),
         }
     }
@@ -104,11 +98,7 @@ impl RideApp {
         cp.SYST.enable_interrupt();
         cp.SYST.enable_counter();
         if self.ride_controller.is_some() {
-            let progress = foc::snapshot();
-            self.last_watchdog_control_cycles = progress.control_cycles;
-            self.last_watchdog_injected_samples = progress.injected_samples;
-            safety::start();
-            self.watchdog_started = true;
+            self.watchdog.start(control_progress());
         }
         // The resident bootloader masks interrupts before branching to the
         // application, and cortex-m-rt deliberately preserves PRIMASK. Every
@@ -123,20 +113,22 @@ impl RideApp {
         self.service_wheel();
         self.service_cadence(now_ms);
         self.service_ride(now_ms);
-        self.can.service(
-            now_ms,
-            RuntimeTelemetry {
-                vehicle_speed_tenths_kph: self.wheel_state.speed_tenths_kph(),
-                distance_counter: self.wheel_distance.value(),
-                cadence: self.cadence,
-                dc_bus_undervoltage: self.dc_bus_undervoltage,
-                effective_current_limit: self.effective_current_limit,
-                transient_budget_ms: self.transient_budget_ms,
-                derating_reasons: self.derating_reasons,
-                ride_stage: self.ride_stage as u8,
-            },
-        );
-        self.service_watchdog(now_ms);
+        let inputs = self.inputs.as_ref();
+        self.can.service(now_ms, || RuntimeTelemetry {
+            inputs: inputs
+                .map(sensors::InputMonitor::latest)
+                .unwrap_or_default(),
+            vehicle_speed_tenths_kph: self.wheel_state.speed_tenths_kph(),
+            distance_counter: self.wheel_distance.value(),
+            cadence: self.cadence,
+            dc_bus_undervoltage: self.dc_bus_undervoltage,
+            effective_current_limit: self.effective_current_limit,
+            transient_budget_ms: self.transient_budget_ms,
+            derating_reasons: self.derating_reasons,
+            ride_stage: self.ride_stage as u8,
+            fault_lockout: self.fault_lockout,
+        });
+        self.watchdog.service(now_ms, control_progress);
         self.service_updater_reset();
     }
 
@@ -144,13 +136,13 @@ impl RideApp {
         if now_ms == self.last_ride_ms {
             return;
         }
+        let local = self.latest_inputs();
         let (Some(environment), Some(ride_controller)) =
             (self.environment.as_mut(), self.ride_controller.as_mut())
         else {
             return;
         };
 
-        let local = sensors::latest();
         let control = foc::snapshot();
         foc::set_bus_voltage_mv(if local.analog_valid {
             sensors::bus_voltage_mv(local.bus_voltage_adc)
@@ -164,6 +156,7 @@ impl RideApp {
                 bus_voltage_adc: local.bus_voltage_adc,
                 motor_temperature_adc: local.motor_temperature_adc,
                 controller_temperature_adc: local.controller_temperature_adc,
+                sampled_at_ms: local.sampled_at_ms,
             },
             environment::projected_dc_current_counts(
                 control.measured_d_counts,
@@ -182,20 +175,24 @@ impl RideApp {
             cadence_demand_percent: self.cadence.demand_percent,
             brake_active: local.brake_active,
             environment_dc_limit_counts: environment_limit,
+            phase_current_limit_counts: environment.phase_current_limit_counts(),
             hall_valid: control.hall_valid,
             current_valid: control.current_valid,
             fault_flags: control.fault_flags,
             safety_events: control.safety_events,
+            phase_current_trips: control.phase_current_trips,
             hall_sequence: control.hall_sequence,
             hall_progress: control.hall_progress,
             hall_interval_us: control.hall_interval_us,
             electrical_rpm: control.electrical_rpm,
         });
         self.ride_stage = command.stage;
+        self.fault_lockout = ride_controller.fault_lockout();
         if command.energize {
             foc::authorize_ride_target(
                 command.target_q_counts,
                 command.dc_current_limit_counts,
+                command.phase_current_limit_counts,
                 ride::OUTPUT_LEASE_CYCLES,
                 control.safety_events,
             );
@@ -206,6 +203,13 @@ impl RideApp {
             }
         }
         self.last_ride_ms = now_ms;
+    }
+
+    fn latest_inputs(&self) -> sensors::Snapshot {
+        self.inputs
+            .as_ref()
+            .map(sensors::InputMonitor::latest)
+            .unwrap_or_default()
     }
 
     fn service_wheel(&mut self) {
@@ -228,30 +232,6 @@ impl RideApp {
         self.last_cadence_ms = now_ms;
     }
 
-    fn service_watchdog(&mut self, now_ms: u32) {
-        if !self.watchdog_started
-            || now_ms.wrapping_sub(self.last_watchdog_feed_ms) < WATCHDOG_FEED_PERIOD_MS
-        {
-            return;
-        }
-        let progress = foc::snapshot();
-        let latched_safe_off = progress.fault_flags != 0
-            && !progress.output_active
-            && peripherals::motor_outputs_disabled();
-        if safety::watchdog_progressed(
-            self.last_watchdog_control_cycles,
-            progress.control_cycles,
-            self.last_watchdog_injected_samples,
-            progress.injected_samples,
-            latched_safe_off,
-        ) {
-            safety::feed_main_loop();
-            self.last_watchdog_feed_ms = now_ms;
-            self.last_watchdog_control_cycles = progress.control_cycles;
-            self.last_watchdog_injected_samples = progress.injected_samples;
-        }
-    }
-
     fn service_updater_reset(&self) {
         if self.can.take_reset_request()
             && self.wheel_state.safe_for_update()
@@ -260,5 +240,15 @@ impl RideApp {
             peripherals::emergency_shutdown();
             cortex_m::peripheral::SCB::sys_reset();
         }
+    }
+}
+
+fn control_progress() -> safety::ControlProgress {
+    let snapshot = foc::snapshot();
+    safety::ControlProgress {
+        control_cycles: snapshot.control_cycles,
+        injected_samples: snapshot.injected_samples,
+        fault_flags: snapshot.fault_flags,
+        output_active: snapshot.output_active,
     }
 }

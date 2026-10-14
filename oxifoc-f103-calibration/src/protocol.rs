@@ -5,7 +5,7 @@ use oxifoc_f103::protocol::Frame;
 use crate::calibration::inductance::{PULSE_DIAGNOSTIC_COUNT, PulseDiagnostic};
 
 pub const SCHEMA: u8 = 4;
-pub const FIRMWARE_VERSION: [u8; 3] = [0, 3, 2];
+pub const FIRMWARE_VERSION: [u8; 3] = [0, 3, 3];
 pub const ARM_WINDOW_MS: u32 = 10_000;
 pub const COMMAND_ID: u16 = 0x2f2;
 pub const STATUS_ID: u16 = 0x2f7;
@@ -129,7 +129,7 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             let nominal_milliohm =
                 (status.nominal_resistance_uohm / 1_000).min(u32::from(u16::MAX)) as u16;
             data[5..7].copy_from_slice(&nominal_milliohm.to_le_bytes());
-            data[7] = 100;
+            data[7] = crate::config::NOMINAL_CURRENT_MA_PER_COUNT as u8;
         }
         3 => {
             data[1..3].copy_from_slice(&status.target_d_counts.to_le_bytes());
@@ -161,7 +161,8 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             );
         }
         8 => {
-            let residual_dead_time_mv = (status.residual_dead_time_uv / 1_000) as u16;
+            let residual_dead_time_mv =
+                (status.residual_dead_time_uv / 1_000).min(u32::from(u16::MAX)) as u16;
             data[1..3].copy_from_slice(&residual_dead_time_mv.to_le_bytes());
             data[3..5].copy_from_slice(&status.pulse_step_d_ticks.to_le_bytes());
             data[5..7].copy_from_slice(&status.pulse_step_q_ticks.to_le_bytes());
@@ -182,7 +183,7 @@ pub fn status_frame(page: u8, status: Status) -> Frame {
             data[7] = status.hall_valid_mask;
         }
         11 => {
-            let flux_centi_mwb = (status.flux_linkage_nwb / 10_000) as u16;
+            let flux_centi_mwb = (status.flux_linkage_nwb / 10_000).min(u32::from(u16::MAX)) as u16;
             data[1..3].copy_from_slice(&flux_centi_mwb.to_le_bytes());
             data[3..5].copy_from_slice(&status.flux_measurement_erpm.to_le_bytes());
             data[5..7].copy_from_slice(&status.hall_measurement_erpm.to_le_bytes());
@@ -378,8 +379,27 @@ mod tests {
     }
 
     #[test]
+    fn scaled_result_fields_saturate_instead_of_wrapping() {
+        let status = Status {
+            residual_dead_time_uv: 70_000_000,
+            flux_linkage_nwb: 700_000_000,
+            ..Status::default()
+        };
+        assert_eq!(status_frame(8, status).data[1..3], u16::MAX.to_le_bytes());
+        assert_eq!(status_frame(11, status).data[1..3], u16::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn resistance_page_reports_the_configured_current_scale() {
+        assert_eq!(
+            u32::from(status_frame(2, Status::default()).data[7]),
+            crate::config::NOMINAL_CURRENT_MA_PER_COUNT
+        );
+    }
+
+    #[test]
     fn telemetry_version_matches_the_crate_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.2");
-        assert_eq!(FIRMWARE_VERSION, [0, 3, 2]);
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.3");
+        assert_eq!(FIRMWARE_VERSION, [0, 3, 3]);
     }
 }

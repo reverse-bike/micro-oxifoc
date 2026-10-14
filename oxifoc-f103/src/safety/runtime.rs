@@ -9,8 +9,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use cortex_m_rt::{ExceptionFrame, exception};
 
 use super::*;
+use crate::hardware::system::RCC_APB1ENR;
 
-const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
 const RCC_APB1ENR_WWDGEN: u32 = 1 << 11;
 const RCC_CSR: *mut u32 = 0x4002_1024 as *mut u32;
 const RCC_CLEAR_RESET_FLAGS: u32 = 1 << 24;

@@ -1,129 +1,48 @@
-//! Sector-based space-vector PWM in timer-tick voltage units.
+//! Space-vector PWM in timer-tick voltage units.
 
 use super::control_types::{AlphaBeta, PwmDuty};
-use super::numeric::Scalar;
+use super::numeric::Fixed;
+use super::transforms::inverse_clarke;
 
 /// Convert αβ phase-voltage values expressed in timer ticks into compares.
+///
+/// Min/max zero-sequence injection shifts the three phase voltages so the
+/// largest and smallest sit symmetrically about `neutral`, which yields the
+/// same compares as six-sector space-vector modulation without a sector
+/// search. The phases are formed at twice their voltage so `√3·β` is the only
+/// rounded product, and each compare is built at four times its tick value so
+/// a single floor (every in-range compare is positive) quantizes it; the
+/// quadrupled neutral fits Q16.16 for `neutral` below 8,192 ticks.
 ///
 /// The caller supplies the conversion from physical voltage to timer ticks.
 /// `phase_limit_ticks` reserves the required bootstrap, dead-time,
 /// and ADC sampling margin around `neutral`.
-pub fn space_vector_pwm_ticks<N: Scalar>(
-    voltage: AlphaBeta<N>,
-    neutral: u16,
-    phase_limit_ticks: u16,
-) -> PwmDuty {
-    let alpha = voltage.alpha;
-    let beta = voltage.beta;
-    let full_period = N::from_i32(i32::from(neutral) * 2);
-
-    let (phase_a, phase_b, phase_c) = match get_sector(alpha, beta) {
-        1 => {
-            let t1 = (alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let t2 = N::SQRT_3 * beta;
-            let phase_a = (full_period + t1 + t2) * N::HALF;
-            let phase_b = phase_a - t1;
-            let phase_c = phase_b - t2;
-            (phase_a, phase_b, phase_c)
-        }
-        2 => {
-            let t2 = (alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let t3 = (-alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let phase_b = (full_period + t2 + t3) * N::HALF;
-            let phase_a = phase_b - t3;
-            let phase_c = phase_a - t2;
-            (phase_a, phase_b, phase_c)
-        }
-        3 => {
-            let t3 = N::SQRT_3 * beta;
-            let t4 = (-alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let phase_b = (full_period + t3 + t4) * N::HALF;
-            let phase_c = phase_b - t3;
-            let phase_a = phase_c - t4;
-            (phase_a, phase_b, phase_c)
-        }
-        4 => {
-            let t4 = (-alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let t5 = -(N::SQRT_3 * beta);
-            let phase_c = (full_period + t4 + t5) * N::HALF;
-            let phase_b = phase_c - t5;
-            let phase_a = phase_b - t4;
-            (phase_a, phase_b, phase_c)
-        }
-        5 => {
-            let t5 = (-alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let t6 = (alpha - N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let phase_c = (full_period + t5 + t6) * N::HALF;
-            let phase_a = phase_c - t5;
-            let phase_b = phase_a - t6;
-            (phase_a, phase_b, phase_c)
-        }
-        _ => {
-            let t6 = -(N::SQRT_3 * beta);
-            let t1 = (alpha + N::INV_SQRT_3 * beta) * N::THREE_HALVES;
-            let phase_a = (full_period + t6 + t1) * N::HALF;
-            let phase_c = phase_a - t1;
-            let phase_b = phase_c - t6;
-            (phase_a, phase_b, phase_c)
-        }
+pub fn space_vector_pwm_ticks(voltage: AlphaBeta, neutral: u16, phase_limit_ticks: u16) -> PwmDuty {
+    let (a, b, c) = inverse_clarke(voltage.alpha + voltage.alpha, voltage.beta + voltage.beta);
+    let largest = a.max(b).max(c);
+    let smallest = a.min(b).min(c);
+    let offset = Fixed::from_integer(i32::from(neutral) * 4) - largest - smallest;
+    let compare = |doubled_phase: Fixed| {
+        let quadrupled = offset + doubled_phase + doubled_phase;
+        limited_compare(quadrupled.integer() >> 2, neutral, phase_limit_ticks)
     };
 
     PwmDuty {
-        a: limited_compare(phase_a, neutral, phase_limit_ticks),
-        b: limited_compare(phase_b, neutral, phase_limit_ticks),
-        c: limited_compare(phase_c, neutral, phase_limit_ticks),
+        a: compare(a),
+        b: compare(b),
+        c: compare(c),
     }
 }
 
-/// Geometric sector for an αβ vector.
-pub fn get_sector<N: Scalar>(alpha: N, beta: N) -> u8 {
-    if beta >= N::ZERO {
-        if alpha >= N::ZERO {
-            if N::INV_SQRT_3 * beta > alpha { 2 } else { 1 }
-        } else if -(N::INV_SQRT_3 * beta) > alpha {
-            3
-        } else {
-            2
-        }
-    } else if alpha >= N::ZERO {
-        if -(N::INV_SQRT_3 * beta) > alpha {
-            5
-        } else {
-            6
-        }
-    } else if N::INV_SQRT_3 * beta > alpha {
-        4
-    } else {
-        5
-    }
-}
-
-pub trait TickModulator<N: Scalar> {
-    fn to_duties(voltage: AlphaBeta<N>, neutral: u16, phase_limit_ticks: u16) -> PwmDuty;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SvpwmTickModulator;
-
-impl<N: Scalar> TickModulator<N> for SvpwmTickModulator {
-    #[inline]
-    fn to_duties(voltage: AlphaBeta<N>, neutral: u16, phase_limit_ticks: u16) -> PwmDuty {
-        space_vector_pwm_ticks(voltage, neutral, phase_limit_ticks)
-    }
-}
-
-fn limited_compare<N: Scalar>(value: N, neutral: u16, phase_limit_ticks: u16) -> u16 {
+fn limited_compare(ticks: i32, neutral: u16, phase_limit_ticks: u16) -> u16 {
     let lower = neutral.saturating_sub(phase_limit_ticks);
     let upper = neutral.saturating_add(phase_limit_ticks);
-    value
-        .trunc_to_i32()
-        .clamp(i32::from(lower), i32::from(upper)) as u16
+    ticks.clamp(i32::from(lower), i32::from(upper)) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foc::numeric::Fixed;
 
     const NEUTRAL: u16 = 1_125;
     const PHASE_LIMIT: u16 = 1_085;
@@ -162,5 +81,50 @@ mod tests {
                 c: NEUTRAL,
             }
         );
+    }
+
+    /// Real-valued min/max injection, truncated toward zero like the
+    /// fixed-point path.
+    fn reference_compares(alpha: f64, beta: f64) -> [u16; 3] {
+        const SQRT_3: f64 = 1.732_050_807_568_877_2;
+        let phases = [
+            alpha,
+            (-alpha + SQRT_3 * beta) / 2.0,
+            (-alpha - SQRT_3 * beta) / 2.0,
+        ];
+        let largest = phases.into_iter().fold(f64::MIN, f64::max);
+        let smallest = phases.into_iter().fold(f64::MAX, f64::min);
+        let midpoint = (largest + smallest) / 2.0;
+        let lower = f64::from(NEUTRAL - PHASE_LIMIT);
+        let upper = f64::from(NEUTRAL + PHASE_LIMIT);
+        phases.map(|phase| {
+            (f64::from(NEUTRAL) + phase - midpoint)
+                .trunc()
+                .clamp(lower, upper) as u16
+        })
+    }
+
+    #[test]
+    fn modulation_matches_the_real_valued_reference_within_one_tick() {
+        for alpha_ticks in (-1_400_i32..=1_400).step_by(13) {
+            for beta_ticks in (-1_400_i32..=1_400).step_by(13) {
+                for fraction in [0, 1, 21_845, 32_768, 65_535] {
+                    let alpha = Fixed::from_bits((alpha_ticks << 16) + fraction);
+                    let beta = Fixed::from_bits((beta_ticks << 16) - fraction);
+                    let duty =
+                        space_vector_pwm_ticks(AlphaBeta { alpha, beta }, NEUTRAL, PHASE_LIMIT);
+                    let expected = reference_compares(
+                        f64::from(alpha.to_bits()) / 65_536.0,
+                        f64::from(beta.to_bits()) / 65_536.0,
+                    );
+                    for (compare, reference) in duty.as_array().into_iter().zip(expected) {
+                        assert!(
+                            compare.abs_diff(reference) <= 1,
+                            "alpha {alpha:?} beta {beta:?}: {compare} vs {reference}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -21,9 +21,14 @@ from can_f103_calibration import (
     format_hall_geometry,
     parse_hall_geometry,
     start_routine_with_retry,
+    stop_and_confirm,
     submit_stop_safely,
     validate_flux_hall_speed,
 )
+
+
+def status_message(data: bytes) -> can.Message:
+    return can.Message(arbitration_id=0x2F7, is_extended_id=False, data=data)
 
 
 class StatusTests(unittest.TestCase):
@@ -43,10 +48,10 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(status.can_command_queue_drop)
         self.assertFalse(status.output_active)
 
-    def test_schema_three_decodes_pulse_positions_and_hall_speed(self) -> None:
+    def test_pulse_positions_and_hall_speed_decode(self) -> None:
         status = Status()
         for data in (
-            bytes([0xC0, 3, 0, 0, 0x34, 0x12, 0, 0]),
+            bytes([0xC0, 4, 0, 0, 0x34, 0x12, 0, 0]),
             bytes([0xC8, 25, 0, 53, 0, 53, 0, 27]),
             bytes([0xCB, 0x3C, 0x05, 0x70, 0x17, 0x48, 0x17, 93]),
         ):
@@ -67,7 +72,17 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(status.hall_measurement_erpm, 5_960)
         self.assertEqual(status.sync_minimum_percent, 93)
 
-    def test_schema_dependent_page_waits_for_page_zero(self) -> None:
+    def test_other_schemas_are_not_decoded(self) -> None:
+        status = Status()
+        self.assertTrue(status.update(status_message(bytes([0xC0, 3, 0, 0, 0, 0, 0, 0]))))
+        self.assertTrue(
+            status.update(status_message(bytes([0xC8, 25, 0, 53, 0, 53, 0, 27])))
+        )
+        self.assertEqual(status.schema, 3)
+        self.assertEqual(status.pulse_step_d_ticks, 0)
+        self.assertNotIn(8, status.pages_seen)
+
+    def test_page_zero_precedes_every_other_page(self) -> None:
         status = Status()
         pulse_page = can.Message(
             arbitration_id=0x2F7,
@@ -81,7 +96,7 @@ class StatusTests(unittest.TestCase):
                 can.Message(
                     arbitration_id=0x2F7,
                     is_extended_id=False,
-                    data=bytes([0xC0, 3, 0, 0, 0x34, 0x12, 0, 0]),
+                    data=bytes([0xC0, 4, 0, 0, 0x34, 0x12, 0, 0]),
                 )
             )
         )
@@ -89,7 +104,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(status.pulse_step_d_ticks, 53)
         self.assertIn(8, status.pages_seen)
 
-    def test_schema_four_decodes_directional_hall_and_pulse_grid(self) -> None:
+    def test_directional_hall_and_pulse_grid_decode(self) -> None:
         status = Status()
         pages = (
             bytes([0xC0, 4, 0, 0, 0x34, 0x12, 0, 0]),
@@ -207,6 +222,26 @@ class FakeStopClient:
         self.sent.append(message)
 
 
+class FakeStopStatusClient:
+    """Replays status frames after STOP, starting from an empty Status."""
+
+    def __init__(self, frames: list[bytes]) -> None:
+        self.status = Status()
+        self.frames = frames
+        self.sent: list[can.Message] = []
+
+    def send(self, message: can.Message) -> None:
+        self.sent.append(message)
+
+    def receive_until(self, predicate, timeout: float) -> Status:
+        while self.frames:
+            if self.status.update(status_message(self.frames.pop(0))) and predicate(
+                self.status
+            ):
+                return self.status
+        raise CalibrationError("timed out")
+
+
 class FakeRunClient:
     def __init__(self) -> None:
         self.status = Status(routine=1, state=8, page_zero_updates=10)
@@ -228,6 +263,34 @@ class FakeRunClient:
         raise AssertionError("routine predicate rejected a new active routine")
 
 
+class FakeRerunClient:
+    """Reports queued page 0 snapshots of (routine, state, failure)."""
+
+    def __init__(
+        self, initial: tuple[int, int, int], pages: list[tuple[int, int, int]]
+    ) -> None:
+        routine, state, failure = initial
+        self.status = Status(
+            routine=routine, state=state, failure=failure, page_zero_updates=10
+        )
+        self.pages = list(pages)
+        self.sent: list[can.Message] = []
+
+    def send(self, message: can.Message) -> None:
+        self.sent.append(message)
+
+    def receive_until(self, predicate, timeout: float) -> Status:
+        while self.pages:
+            routine, state, failure = self.pages.pop(0)
+            self.status.routine = routine
+            self.status.state = state
+            self.status.failure = failure
+            self.status.page_zero_updates += 1
+            if predicate(self.status):
+                return self.status
+        raise CalibrationError("timed out")
+
+
 class RecoveryTests(unittest.TestCase):
     def test_arm_retries_until_the_firmware_acknowledges(self) -> None:
         client = FakeArmClient()
@@ -242,6 +305,29 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(client.sent), 1)
         self.assertEqual(bytes(client.sent[0].data), b"STOP")
         self.assertFalse(client.sent[0].is_rx)
+
+    def test_stop_waits_for_page_zero_with_outputs_inactive(self) -> None:
+        client = FakeStopStatusClient(
+            [
+                bytes([0xC3, 0, 0, 0, 0, 0, 0, 0]),
+                bytes([0xC0, 4, 3, 0, 0, 0, 0x04, 1]),
+                bytes([0xC5, 0, 0, 0, 0, 0, 0, 0]),
+            ]
+        )
+        with self.assertRaises(CalibrationError):
+            stop_and_confirm(client, timeout=1.0)
+        self.assertEqual(bytes(client.sent[0].data), b"STOP")
+
+        client = FakeStopStatusClient(
+            [
+                bytes([0xC0, 4, 3, 0, 0, 0, 0x04, 1]),
+                bytes([0xC0, 4, 9, 1, 0, 0, 0x20, 1]),
+            ]
+        )
+        status = stop_and_confirm(client, timeout=1.0)
+        self.assertFalse(status.output_active)
+        self.assertEqual(status.state, 9)
+        self.assertEqual(status.page_zero_updates, 2)
 
     def test_run_retries_until_a_new_active_routine_is_reported(self) -> None:
         client = FakeRunClient()
@@ -258,6 +344,55 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual((status.routine, status.state), (2, 2))
         self.assertEqual(len(client.sent), 2)
         self.assertTrue(all(bytes(frame.data[:4]) == b"RUNL" for frame in client.sent))
+
+    def test_rerun_ignores_the_failed_status_reported_before_run(self) -> None:
+        client = FakeRerunClient(
+            initial=(2, 10, 4),
+            pages=[(2, 10, 4), (2, 2, 0)],
+        )
+        status = start_routine_with_retry(
+            client,
+            b"RUNL",
+            0x1234,
+            routine=2,
+            complete_state=9,
+            failed_state=10,
+            timeout=1.0,
+            retry_interval=0.01,
+        )
+        self.assertEqual((status.routine, status.state, status.failure), (2, 2, 0))
+
+    def test_rerun_reports_a_new_failure_after_run(self) -> None:
+        client = FakeRerunClient(initial=(2, 10, 4), pages=[(2, 10, 4), (2, 10, 6)])
+        with self.assertRaisesRegex(CalibrationError, "calibration failed"):
+            start_routine_with_retry(
+                client,
+                b"RUNL",
+                0x1234,
+                routine=2,
+                complete_state=9,
+                failed_state=10,
+                timeout=1.0,
+                retry_interval=0.01,
+            )
+
+
+    def test_rerun_reports_an_identical_failure_on_the_second_page_after_run(
+        self,
+    ) -> None:
+        client = FakeRerunClient(initial=(3, 7, 11), pages=[(3, 7, 11), (3, 7, 11)])
+        with self.assertRaisesRegex(CalibrationError, "missing prerequisite"):
+            start_routine_with_retry(
+                client,
+                b"RUNF",
+                0x1234,
+                routine=3,
+                complete_state=6,
+                failed_state=7,
+                timeout=1.0,
+                retry_interval=0.01,
+            )
+        self.assertEqual(len(client.sent), 1)
 
 
 if __name__ == "__main__":

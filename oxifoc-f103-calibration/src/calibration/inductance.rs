@@ -5,6 +5,9 @@
 //! largest one-period current rise is used for each pulse. Reporting remains
 //! in native units: `L * current_scale` as nanowebers per ADC count.
 
+use crate::calibration::math::{
+    div_round, ramp_i16, ramp_i32, saturating_i64_to_i16, saturating_i64_to_i32, settled,
+};
 use crate::calibration::types::{Actuation, Failure};
 use crate::config::{
     INDUCTANCE_HOLD_CURRENT_COUNTS, INDUCTANCE_PULSES_PER_AXIS, INDUCTANCE_TARGET_DI_COUNTS,
@@ -435,16 +438,10 @@ impl InductanceCalibration {
         self.cycle_in_state = 0;
     }
 
-    fn finish_result(&mut self) -> bool {
-        let ld = self.result.inductance_d_nwb_per_count;
-        let lq = self.result.inductance_q_nwb_per_count;
-        if !(MIN_VALID_INDUCTANCE_NWB_PER_COUNT..=MAX_VALID_INDUCTANCE_NWB_PER_COUNT).contains(&ld)
-            || !(MIN_VALID_INDUCTANCE_NWB_PER_COUNT..=MAX_VALID_INDUCTANCE_NWB_PER_COUNT)
-                .contains(&lq)
-        {
-            return false;
-        }
-        true
+    fn finish_result(&self) -> bool {
+        let valid = MIN_VALID_INDUCTANCE_NWB_PER_COUNT..=MAX_VALID_INDUCTANCE_NWB_PER_COUNT;
+        valid.contains(&self.result.inductance_d_nwb_per_count)
+            && valid.contains(&self.result.inductance_q_nwb_per_count)
     }
 
     fn finish_pulse_level(&mut self, average_inductance: u32) {
@@ -551,41 +548,6 @@ fn pulse_step_for_level(base_bits: i32, level: u8) -> i32 {
 
 fn tick_mv_q16_to_uv(tick_mv_q16: i64, period_ticks: u16) -> i64 {
     tick_mv_q16.saturating_mul(1_000) / (i64::from(period_ticks) * Q16)
-}
-
-fn ramp_i16(start: i16, end: i16, cycle: u32, duration: u32) -> i16 {
-    let value = i64::from(start)
-        + (i64::from(end) - i64::from(start)) * i64::from(cycle.min(duration))
-            / i64::from(duration);
-    saturating_i64_to_i16(value)
-}
-
-fn ramp_i32(start: i32, end: i32, cycle: u32, duration: u32) -> i32 {
-    let value = i64::from(start)
-        + (i64::from(end) - i64::from(start)) * i64::from(cycle.min(duration))
-            / i64::from(duration);
-    saturating_i64_to_i32(value)
-}
-
-fn settled(measured: i16, target: i16) -> bool {
-    (i32::from(measured) - i32::from(target)).unsigned_abs()
-        <= (i32::from(target).unsigned_abs() * 3 / 10).max(2)
-}
-
-fn div_round(value: i64, divisor: i64) -> i64 {
-    if value < 0 {
-        (value - divisor / 2) / divisor
-    } else {
-        (value + divisor / 2) / divisor
-    }
-}
-
-fn saturating_i64_to_i16(value: i64) -> i16 {
-    value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
-}
-
-fn saturating_i64_to_i32(value: i64) -> i32 {
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 #[cfg(test)]

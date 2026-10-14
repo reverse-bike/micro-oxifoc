@@ -6,6 +6,68 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.11.0 - 2026-10-14
+
+Changes:
+
+- Bounded undriven current-offset tracking to 128 counts around the boot
+  calibration. A sustained 100 ms of undriven samples outside that window
+  marks current sensing invalid, so a new ride cannot arm on a drifted or
+  failed current sensor.
+- Added a 58 V DC-bus overvoltage cutoff checked on every 1 ms ride pass. It
+  counts only fresh 10 ms bus-voltage conversions, trips after three
+  consecutive ones (30 ms), and releases with 1 V hysteresis. It revokes ride
+  authority, reports derating-reason bit `0x08`, and re-arms only from
+  throttle rest. The calibration image keeps its own 39--60 V bus window and
+  is not blocked by this cutoff.
+- Stopped automatic fault acknowledgement after three consecutive hardware
+  break, PWM-range, or software phase-overcurrent faults without reaching
+  normal tracking. At most one fault counts per arming attempt, so a software
+  trip and the hardware break from the same event count once. The lockout
+  lasts until reset and appears as page-12 fault-mask bit `0x80`.
+- Scaled the ride phase-current ceiling by the same controller/motor thermal
+  fraction that already derated the battery-current envelope. The derated
+  ceiling is carried with each ride lease to the control interrupt and sets
+  the radius of the complete dq current command every cycle, so
+  field-weakening d current and q current together stay within it. Field
+  weakening is limited to half of the derated ceiling, leaving at least √3/2
+  of it for q current. A zero ceiling removes ride authority and commands no
+  current; the measured overcurrent trips keep their fixed thresholds.
+- Made CAN transmit mailbox selection a short BASEPRI-masked section at the
+  receive-interrupt priority, so identity responses from the receive
+  interrupt are no longer dropped while foreground telemetry is transmitting,
+  without delaying the TIM1 update, hardware break, or Hall capture.
+- Clock setup now clears every RCC_CFGR field it writes, including the APB1
+  prescaler, so a bootloader-selected APB1 divider cannot halve CAN, Hall, and
+  wheel timing.
+- Every AFIO_MAPR remap goes through one helper that always writes
+  `SWJ_CFG = 0b100`, so a read-modify-write cannot re-enable JTAG on the Hall,
+  wheel, or CAN-enable pins.
+- The stock headlight command requires a frame of at least three bytes.
+- The controller thermal-warning telemetry bit sets above the derating start
+  temperature, matching the point where current derating begins, instead of
+  at exactly the start temperature.
+- A ride-start observer reseed waits for an available Hall estimate instead of
+  being consumed by a cycle without one.
+- Hall electrical RPM follows the configured physical forward direction.
+- Field-weakening feedforward products are computed without i32 overflow.
+- SVPWM uses min/max zero-sequence injection instead of a six-sector search.
+  Compares differ from the sector form by at most one tick and are closer to
+  the exact value; the change frees about 1 KB of flash.
+- TIM1 timing derives from the APB2 timer clock; the wheel timer prescaler,
+  ADC sample-time registers, thermal telemetry thresholds, and CAN bit timing
+  derive from `BikeConfig`. Generated register values are unchanged.
+- Removed single-implementation generics and unused interfaces from
+  `oxifoc-core`, and unused constants and types from this crate.
+
+Reason: the ride image had no overvoltage protection, let offset tracking
+drift arbitrarily far from a validated calibration, retried repeated
+power-stage faults indefinitely, and left full phase current available to a
+hot motor or controller. Each of those changes only removes or reduces
+torque. The clock and remap fixes close latent hardware-configuration hazards,
+and the remaining fixes correct telemetry, startup, and arithmetic edge
+cases.
+
 ## 0.10.0 - 2026-08-26
 
 Changes:

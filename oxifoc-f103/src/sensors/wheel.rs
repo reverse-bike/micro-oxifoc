@@ -2,9 +2,6 @@
 
 use crate::config::BIKE_CONFIG;
 
-pub const DISTANCE_PER_PULSE_MM: u16 = BIKE_CONFIG.wheel.distance_per_pulse_millimeters;
-pub const MINIMUM_INTERVAL_US: u32 = BIKE_CONFIG.wheel.minimum_interval_microseconds;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capture {
     pub primed: bool,
@@ -80,11 +77,11 @@ impl Estimator {
             self.state = State::AwaitingSecondPulse;
             return self.state;
         }
-        if capture.interval_us < MINIMUM_INTERVAL_US {
+        if capture.interval_us < BIKE_CONFIG.wheel.minimum_interval_microseconds {
             self.state = State::Implausible;
             return self.state;
         }
-        let speed = u32::from(DISTANCE_PER_PULSE_MM)
+        let speed = u32::from(BIKE_CONFIG.wheel.distance_per_pulse_millimeters)
             .saturating_mul(36_000)
             .checked_div(capture.interval_us)
             .unwrap_or_default()
@@ -120,7 +117,7 @@ impl DistanceCounter {
         let new_pulses = pulse_count.wrapping_sub(self.last_pulse_count);
         self.last_pulse_count = pulse_count;
         let accumulated = new_pulses
-            .saturating_mul(u32::from(DISTANCE_PER_PULSE_MM))
+            .saturating_mul(u32::from(BIKE_CONFIG.wheel.distance_per_pulse_millimeters))
             .saturating_add(self.distance_remainder_mm);
         self.value = self.value.wrapping_add(accumulated / 100_000);
         self.distance_remainder_mm = accumulated % 100_000;
@@ -213,7 +210,7 @@ mod tests {
         assert_eq!(
             estimator.update(Capture {
                 primed: true,
-                interval_us: MINIMUM_INTERVAL_US - 1,
+                interval_us: BIKE_CONFIG.wheel.minimum_interval_microseconds - 1,
                 pulse_count: 3,
                 capture_overruns: 1,
                 ..Capture::default()

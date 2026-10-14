@@ -7,10 +7,10 @@
 //! The observer runs at the current-loop rate and is selected by
 //! [`super::PhaseManager`], including Hall-to-observer crossover policy.
 
-use crate::foc::numeric::Fixed;
+use crate::foc::numeric::{Fixed, multiply_q16, saturating_i64_to_i32};
 
 use super::PhaseInput;
-use crate::foc::trig::{CordicSinCos, SinCos, Turns};
+use crate::foc::trig::{Turns, sin_cos};
 
 const READY_MIN_CONFIDENCE: Fixed = Fixed::ratio(1, 2);
 const READY_MIN_ERPM: i32 = 287;
@@ -190,7 +190,7 @@ impl BackEmfObserver {
     /// two-revolution external-validity credit. Live BEMF disagreement still
     /// revokes that credit after the normal 400 ms hold interval.
     pub fn seed(&mut self, phase: Turns, electrical_rpm: i32) {
-        let (sin, cos) = CordicSinCos::sin_cos(phase);
+        let (sin, cos) = sin_cos(phase);
         self.flux_alpha_mwb = self.flux_linkage_mwb * cos;
         self.flux_beta_mwb = self.flux_linkage_mwb * sin;
         self.phase_raw = phase;
@@ -422,19 +422,21 @@ fn approximate_magnitude_bits(alpha: i32, beta: i32) -> i32 {
         .min(i32::MAX as u32) as i32
 }
 
-#[inline(always)]
-fn multiply_q16(left: i32, right: i32) -> i32 {
-    ((i64::from(left) * i64::from(right)) >> 16) as i32
-}
-
 fn multiply_q32(value: i32, coefficient_q32: u32) -> i32 {
     ((i64::from(value) * i64::from(coefficient_q32)) >> 32) as i32
 }
 
-/// Divide two Q16.16 values and return their Q16.16 ratio without a 64-bit
-/// divide. Scaling both operands to at most 15 significant bits keeps the
-/// shifted numerator in `i32` and maps to the Cortex-M3's bounded `sdiv`.
+/// Divide two Q16.16 values and return their Q16.16 ratio.
 fn divide_q16(numerator: i32, denominator: i32) -> i32 {
+    scaled_ratio::<16>(numerator, denominator)
+}
+
+/// Return `numerator / denominator` with `FRACTION_BITS` fractional bits and
+/// no 64-bit divide. Scaling both operands to at most 15 significant bits
+/// keeps the shifted numerator in `i32` and maps to the Cortex-M3's bounded
+/// `sdiv`. A nonpositive denominator yields zero.
+#[inline]
+fn scaled_ratio<const FRACTION_BITS: u32>(numerator: i32, denominator: i32) -> i32 {
     if denominator <= 0 {
         return 0;
     }
@@ -443,22 +445,12 @@ fn divide_q16(numerator: i32, denominator: i32) -> i32 {
     let shift = bit_length.saturating_sub(15);
     let scaled_numerator = numerator >> shift;
     let scaled_denominator = (denominator >> shift).max(1);
-    scaled_numerator.saturating_mul(1 << 16) / scaled_denominator
+    scaled_numerator.saturating_mul(1 << FRACTION_BITS) / scaled_denominator
 }
 
 fn ema_u32(previous: u32, sample: u32, coefficient_q32: u32) -> u32 {
     let difference = i64::from(sample) - i64::from(previous);
     (i64::from(previous) + ((difference * i64::from(coefficient_q32)) >> 32)) as u32
-}
-
-fn saturating_i64_to_i32(value: i64) -> i32 {
-    if value > i64::from(i32::MAX) {
-        i32::MAX
-    } else if value < i64::from(i32::MIN) {
-        i32::MIN
-    } else {
-        value as i32
-    }
 }
 
 fn clamp_symmetric(value: i32, limit: i32) -> i32 {
@@ -505,7 +497,7 @@ fn atan2_turns(y: i32, x: i32) -> Turns {
             3 * EIGHTH_TURN_Q32,
         )
     };
-    let ratio = ratio_q15(numerator, denominator);
+    let ratio = scaled_ratio::<15>(numerator, denominator);
     let ratio_squared = (i64::from(ratio) * i64::from(ratio)) >> 15;
     let polynomial = ((A_Q32 * ratio_squared) >> 15) + B_Q32;
     let angle = base + ((polynomial * i64::from(ratio)) >> 15);
@@ -514,18 +506,6 @@ fn atan2_turns(y: i32, x: i32) -> Turns {
     } else {
         angle as u32
     }
-}
-
-fn ratio_q15(numerator: i32, denominator: i32) -> i32 {
-    if denominator <= 0 {
-        return 0;
-    }
-    let largest = numerator.unsigned_abs().max(denominator as u32);
-    let bit_length = 32 - largest.leading_zeros();
-    let shift = bit_length.saturating_sub(15);
-    let scaled_numerator = numerator >> shift;
-    let scaled_denominator = (denominator >> shift).max(1);
-    scaled_numerator.saturating_mul(1 << 15) / scaled_denominator
 }
 
 #[cfg(test)]

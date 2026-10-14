@@ -1,45 +1,45 @@
 //! Per-control-period PI controller with external saturation back-calculation.
 
-use super::numeric::{Fixed, Scalar};
+use super::numeric::Fixed;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PIController<N: Scalar = Fixed> {
-    proportional_gain: N,
-    integral_gain_per_cycle: N,
-    integral: N,
-    previous_error: N,
+pub struct PIController {
+    proportional_gain: Fixed,
+    integral_gain_per_cycle: Fixed,
+    integral: Fixed,
+    previous_error: Fixed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct PIUpdate<N: Scalar> {
-    pub next_integral: N,
-    pub raw_output: N,
-    error: N,
+pub(crate) struct PIUpdate {
+    pub next_integral: Fixed,
+    pub raw_output: Fixed,
+    error: Fixed,
 }
 
-impl<N: Scalar> PIController<N> {
-    pub const fn new(proportional_gain: N, integral_gain_per_cycle: N) -> Self {
+impl PIController {
+    pub const fn new(proportional_gain: Fixed, integral_gain_per_cycle: Fixed) -> Self {
         Self {
             proportional_gain,
             integral_gain_per_cycle,
-            integral: N::ZERO,
-            previous_error: N::ZERO,
+            integral: Fixed::ZERO,
+            previous_error: Fixed::ZERO,
         }
     }
 
     pub fn reset(&mut self) {
-        self.integral = N::ZERO;
-        self.previous_error = N::ZERO;
+        self.integral = Fixed::ZERO;
+        self.previous_error = Fixed::ZERO;
     }
 
-    pub const fn integral(&self) -> N {
+    pub const fn integral(&self) -> Fixed {
         self.integral
     }
 
-    pub(crate) fn prepare_update(&self, target: N, measurement: N) -> PIUpdate<N> {
+    pub(crate) fn prepare_update(&self, target: Fixed, measurement: Fixed) -> PIUpdate {
         let error = target - measurement;
         let proportional = (error * self.proportional_gain).trunc();
-        let trapezoidal_error = (error + self.previous_error) * N::HALF;
+        let trapezoidal_error = (error + self.previous_error) * Fixed::HALF;
         let next_integral = self.integral + trapezoidal_error * self.integral_gain_per_cycle;
         PIUpdate {
             next_integral,
@@ -48,7 +48,7 @@ impl<N: Scalar> PIController<N> {
         }
     }
 
-    pub(crate) fn apply_back_calculation(&mut self, update: PIUpdate<N>, output_error: N) {
+    pub(crate) fn apply_back_calculation(&mut self, update: PIUpdate, output_error: Fixed) {
         self.integral = update.next_integral + output_error;
         self.previous_error = update.error;
     }
@@ -58,7 +58,7 @@ impl<N: Scalar> PIController<N> {
 mod tests {
     use super::*;
 
-    fn fixed_pi() -> PIController<Fixed> {
+    fn fixed_pi() -> PIController {
         PIController::new(Fixed::ratio(512, 1_024), Fixed::ratio(605, 16_384))
     }
 

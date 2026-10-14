@@ -11,18 +11,16 @@ use stm32f1::stm32f103::interrupt;
 
 use crate::config::BIKE_CONFIG;
 use crate::hardware::gpio;
+use crate::hardware::system::{
+    RCC_APB1ENR, RCC_APB1RSTR, RCC_APB2ENR, RCC_APB2RSTR, remap_afio, set_interrupt_priority,
+};
 use crate::safety::{PwmFailureContext, pwm_failure_cause as pwm_cause, pwm_pin_flag as pwm_pin};
 
-const RCC_APB2ENR: *mut u32 = 0x4002_1018 as *mut u32;
-const RCC_APB2RSTR: *mut u32 = 0x4002_100c as *mut u32;
 const RCC_CR: *mut u32 = 0x4002_1000 as *mut u32;
 const RCC_CFGR: *mut u32 = 0x4002_1004 as *mut u32;
 const RCC_CIR: *const u32 = 0x4002_1008 as *const u32;
-const RCC_APB1ENR: *mut u32 = 0x4002_101c as *mut u32;
-const RCC_APB1RSTR: *mut u32 = 0x4002_1010 as *mut u32;
 const FLASH_ACR: *mut u32 = 0x4002_2000 as *mut u32;
 const SCB_VTOR: *mut u32 = 0xe000_ed08 as *mut u32;
-const NVIC_IPR: *mut u8 = 0xe000_e400 as *mut u8;
 const CORE_DEBUG_DEMCR: *mut u32 = 0xe000_edfc as *mut u32;
 const DWT_CTRL: *mut u32 = 0xe000_1000 as *mut u32;
 const DWT_CYCCNT: *mut u32 = 0xe000_1004 as *mut u32;
@@ -37,22 +35,34 @@ const RCC_CR_CSSON: u32 = 1 << 19;
 const RCC_CR_PLLON: u32 = 1 << 24;
 const RCC_CR_PLLRDY: u32 = 1 << 25;
 const RCC_CIR_CLOCK_SECURITY_FAILURE: u32 = 1 << 7;
-const RCC_CFGR_CLOCK_MASK: u32 = 0x003f_fcf3;
+const RCC_CFGR_SW_MASK: u32 = 0b11;
+const RCC_CFGR_HPRE_MASK: u32 = 0b1111 << 4;
+const RCC_CFGR_PPRE1_MASK: u32 = 0b111 << 8;
+const RCC_CFGR_PPRE2_MASK: u32 = 0b111 << 11;
+const RCC_CFGR_ADCPRE_MASK: u32 = 0b11 << 14;
+const RCC_CFGR_PLL_MASK: u32 = 0b11_1111 << 16;
+/// Every writable field the clock bring-up owns: the clock switch, AHB/APB/ADC
+/// prescalers, and the PLL source, HSE divider, and multiplier.
+const RCC_CFGR_CLOCK_MASK: u32 = RCC_CFGR_SW_MASK
+    | RCC_CFGR_HPRE_MASK
+    | RCC_CFGR_PPRE1_MASK
+    | RCC_CFGR_PPRE2_MASK
+    | RCC_CFGR_ADCPRE_MASK
+    | RCC_CFGR_PLL_MASK;
 const RCC_CFGR_HSE_PLL_X9_72MHZ: u32 = (0b100 << 8) | (0b10 << 14) | (1 << 16) | (0b0111 << 18);
 const RCC_CFGR_SWITCH_HSI: u32 = 0;
 const RCC_CFGR_SWITCH_PLL: u32 = 0b10;
 const RCC_CFGR_STATUS_HSI: u32 = 0;
 const RCC_CFGR_STATUS_PLL: u32 = 0b10 << 2;
+const _: () = assert!(RCC_CFGR_HSE_PLL_X9_72MHZ & !RCC_CFGR_CLOCK_MASK == 0);
+const _: () = assert!(RCC_CFGR_SWITCH_PLL & !RCC_CFGR_CLOCK_MASK == 0);
 const FLASH_ACR_72MHZ: u32 = (1 << 4) | 0b010;
 const CLOCK_WAIT_ITERATIONS: u32 = 1_000_000;
 
-const RCC_APB2ENR_AFIOEN: u32 = 1;
 const RCC_APB2ENR_ADC1EN: u32 = 1 << 9;
 const RCC_APB2ENR_ADC2EN: u32 = 1 << 10;
 const RCC_APB2ENR_TIM1EN: u32 = 1 << 11;
 const RCC_APB1ENR_TIM2EN: u32 = 1;
-
-const AFIO_MAPR: *mut u32 = 0x4001_0004 as *mut u32;
 
 const TIM1_CR1: *mut u32 = 0x4001_2c00 as *mut u32;
 const TIM1_CR2: *mut u32 = 0x4001_2c04 as *mut u32;
@@ -92,7 +102,6 @@ const ADC2_BASE: usize = 0x4001_2800;
 const ADC_SR_OFFSET: usize = 0x00;
 const ADC_CR1_OFFSET: usize = 0x04;
 const ADC_CR2_OFFSET: usize = 0x08;
-const ADC_SMPR1_OFFSET: usize = 0x0c;
 const ADC_JSQR_OFFSET: usize = 0x38;
 const ADC_JDR1_OFFSET: usize = 0x3c;
 const ADC_ADON: u32 = 1;
@@ -148,10 +157,10 @@ static TIM2_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
 static HALL_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static FAULT_FLAGS: AtomicU32 = AtomicU32::new(0);
 
-pub const FAULT_HARDWARE_BREAK: u32 = 1;
-pub const FAULT_PWM_RANGE: u32 = 1 << 1;
-pub const FAULT_HALL_CAPTURE: u32 = 1 << 2;
-pub const FAULT_CONTROL_TIMING: u32 = 1 << 3;
+pub const FAULT_HARDWARE_BREAK: u32 = crate::safety::fault_flag::HARDWARE_BREAK;
+pub const FAULT_PWM_RANGE: u32 = crate::safety::fault_flag::PWM_RANGE;
+pub const FAULT_HALL_CAPTURE: u32 = crate::safety::fault_flag::HALL_CAPTURE;
+pub const FAULT_CONTROL_TIMING: u32 = crate::safety::fault_flag::CONTROL_TIMING;
 
 /// Establishes the hardware invariant that the active-low power stage is
 /// disabled. This is idempotent and must precede every other peripheral init.
@@ -230,7 +239,6 @@ impl PhaseCurrentSample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CurrentSampleError {
     NotReady,
-    OutOfRange,
 }
 
 pub fn configure_72mhz_clock() -> Result<(), ClockError> {
@@ -281,10 +289,7 @@ pub fn configure_72mhz_clock() -> Result<(), ClockError> {
 pub fn configure_tim1_passive() {
     // SAFETY: called once before interrupts or timer start.
     unsafe {
-        write_volatile(
-            RCC_APB2ENR,
-            read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_TIM1EN,
-        );
+        write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | RCC_APB2ENR_TIM1EN);
         write_volatile(
             RCC_APB2RSTR,
             read_volatile(RCC_APB2RSTR) | RCC_APB2ENR_TIM1EN,
@@ -294,9 +299,9 @@ pub fn configure_tim1_passive() {
             read_volatile(RCC_APB2RSTR) & !RCC_APB2ENR_TIM1EN,
         );
 
-        write_volatile(
-            AFIO_MAPR,
-            (read_volatile(AFIO_MAPR) & !(0b11 << 6)) | crate::config::tim1_remap_bits(),
+        remap_afio(
+            crate::config::AFIO_MAPR_TIM1_REMAP_MASK,
+            crate::config::tim1_remap_bits(),
         );
         gpio::configure_pull_up_input(BIKE_CONFIG.pins.inverter.hardware_break);
         configure_inert_motor_pins();
@@ -330,7 +335,7 @@ pub fn configure_tim1_passive() {
         write_volatile(TIM1_CNT, 0);
         // The validated board firmware keeps this active after passive timer
         // setup. Normal stops use TIM1 channel gating and inert GPIO modes;
-        // fatal shutdown still raises PA2 independently.
+        // fatal shutdown still drives the power-stage enable inactive.
         gpio::set_output_active(BIKE_CONFIG.pins.inverter.power_stage_enable, true);
     }
 }
@@ -350,12 +355,9 @@ pub fn configure_hall_capture() {
             RCC_APB1RSTR,
             read_volatile(RCC_APB1RSTR) & !RCC_APB1ENR_TIM2EN,
         );
-        write_volatile(RCC_APB2ENR, read_volatile(RCC_APB2ENR) | RCC_APB2ENR_AFIOEN);
-
-        let mapr = read_volatile(AFIO_MAPR) & !((0b111 << 24) | (0b11 << 8));
-        write_volatile(
-            AFIO_MAPR,
-            mapr | (0b100 << 24) | crate::config::tim2_remap_bits(),
+        remap_afio(
+            crate::config::AFIO_MAPR_TIM2_REMAP_MASK,
+            crate::config::tim2_remap_bits(),
         );
         for pin in BIKE_CONFIG.pins.hall {
             gpio::configure(pin, gpio::FLOATING_INPUT);
@@ -572,8 +574,9 @@ fn retain_pwm_failure(cause: u8, duty: PwmDuty) {
 #[inline]
 pub fn disable_motor_outputs() {
     // SAFETY: clearing MOE and motor-channel enables removes PWM before the
-    // pins return to analog mode. PA2 remains in its validated run-time state
-    // so a recoverable stop never cold-starts the gate driver.
+    // pins return to analog mode. The power-stage enable remains in its
+    // validated run-time state so a recoverable stop never cold-starts the
+    // gate driver.
     unsafe {
         write_volatile(
             TIM1_BDTR,
@@ -691,11 +694,6 @@ pub fn cycle_count() -> u32 {
     unsafe { read_volatile(DWT_CYCCNT) }
 }
 
-pub fn configure_can_interrupt_priority() {
-    // CAN servicing is intentionally below Hall capture and the FOC update.
-    unsafe { set_interrupt_priority(20, 0x40) }
-}
-
 #[interrupt]
 fn TIM1_BRK() {
     retain_current_pwm_failure(pwm_cause::BREAK_ACTIVE);
@@ -728,7 +726,7 @@ pub fn write_pwm_duties(duty: PwmDuty) -> bool {
     let neutral = crate::config::PWM_NEUTRAL;
     if [duty.a, duty.b, duty.c].into_iter().any(|compare| {
         compare > crate::config::PWM_ARR
-            || compare.abs_diff(neutral) > crate::config::FOC_HARD_PHASE_LIMIT_TICKS
+            || compare.abs_diff(neutral) > crate::config::FOC_PHASE_LIMIT_TICKS
     }) {
         retain_pwm_failure(pwm_cause::COMPARE_RANGE, duty);
         latch_fault(FAULT_PWM_RANGE);
@@ -789,11 +787,6 @@ fn TIM2() {
             HALL_SEQUENCE.fetch_add(1, Ordering::Release);
         }
     }
-}
-
-unsafe fn set_interrupt_priority(interrupt_number: usize, priority: u8) {
-    // SAFETY: each external interrupt owns one byte in NVIC IPR.
-    unsafe { write_volatile(NVIC_IPR.add(interrupt_number), priority) }
 }
 
 unsafe fn configure_inert_motor_pins() {
@@ -871,14 +864,8 @@ pub fn configure_and_calibrate_current_adcs() -> Result<CurrentOffsets, AdcError
         gpio::configure(BIKE_CONFIG.pins.phase_current[0].pin, gpio::ANALOG_INPUT);
         gpio::configure(BIKE_CONFIG.pins.phase_current[1].pin, gpio::ANALOG_INPUT);
 
-        configure_adc(
-            ADC1_BASE,
-            u32::from(BIKE_CONFIG.pins.phase_current[0].channel),
-        )?;
-        configure_adc(
-            ADC2_BASE,
-            u32::from(BIKE_CONFIG.pins.phase_current[1].channel),
-        )?;
+        configure_adc(ADC1_BASE, BIKE_CONFIG.pins.phase_current[0].channel)?;
+        configure_adc(ADC2_BASE, BIKE_CONFIG.pins.phase_current[1].channel)?;
 
         let mut sum_a = 0_u32;
         let mut sum_b = 0_u32;
@@ -936,9 +923,6 @@ pub fn read_phase_currents(
         write_volatile(reg(ADC2_BASE, ADC_SR_OFFSET), status_b & !ADC_JEOC);
         (raw_a, raw_b)
     };
-    if raw_a > 4_095 || raw_b > 4_095 || offsets.phase_a > 4_095 || offsets.phase_b > 4_095 {
-        return Err(CurrentSampleError::OutOfRange);
-    }
     let phase_a = i32::from(raw_a) - i32::from(offsets.phase_a);
     let phase_b = i32::from(raw_b) - i32::from(offsets.phase_b);
     let phase_c = 0_i32.saturating_sub(phase_a).saturating_sub(phase_b);
@@ -952,11 +936,12 @@ pub fn read_phase_currents(
     Ok(sample)
 }
 
-unsafe fn configure_adc(base: usize, channel: u32) -> Result<(), AdcError> {
+unsafe fn configure_adc(base: usize, channel: u8) -> Result<(), AdcError> {
+    let (sample_time_offset, sample_time_shift) = crate::config::adc_sample_time_field(channel);
     unsafe {
         write_volatile(reg(base, ADC_CR1_OFFSET), 0);
-        write_volatile(reg(base, ADC_SMPR1_OFFSET), 0b010 << ((channel - 10) * 3));
-        write_volatile(reg(base, ADC_JSQR_OFFSET), channel << 15);
+        write_volatile(reg(base, sample_time_offset), 0b010 << sample_time_shift);
+        write_volatile(reg(base, ADC_JSQR_OFFSET), u32::from(channel) << 15);
         write_volatile(
             reg(base, ADC_CR2_OFFSET),
             ADC_ADON | ADC_JEXTTRIG | ADC_JEXTSEL_SOFTWARE,

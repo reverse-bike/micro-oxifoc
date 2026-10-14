@@ -5,11 +5,9 @@
 //! Platform code retains raw ADC sampling, PWM register writes, and immediate
 //! hardware shutdown so those operations remain explicit at the ISR boundary.
 
+use crate::foc::numeric::multiply_q16;
 use crate::foc::phase::{PhaseEstimate, PhaseInput, PhaseProvider};
-use crate::foc::trig::Turns;
-use crate::foc::{
-    AlphaBeta, DecouplingModel, Dq, Fixed, FixedFocController, NoDecoupling, PwmDuty, Scalar,
-};
+use crate::foc::{AlphaBeta, DecouplingModel, Dq, Fixed, FocController, NoDecoupling, PwmDuty};
 
 /// Current-command, supply-current, and measured-overcurrent limits.
 ///
@@ -20,7 +18,8 @@ use crate::foc::{
 /// trip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CurrentLimits {
-    /// Maximum commanded dq magnitude in current-sensor counts.
+    /// Maximum commanded dq magnitude in current-sensor counts. A zero or
+    /// negative ceiling commands no current.
     pub max_current: Fixed,
     /// Hard measured dq trip magnitude in current-sensor counts.
     pub overcurrent_threshold: Fixed,
@@ -51,9 +50,9 @@ impl CurrentLimits {
 
     fn clamp_targets_and_quadrature_limit(&self, target: Dq) -> (Dq, Fixed) {
         if self.max_current <= Fixed::ZERO {
-            return (target, self.max_current);
+            return (Dq::new(Fixed::ZERO, Fixed::ZERO), Fixed::ZERO);
         }
-        let direct = Scalar::clamp(target.d, -self.max_current, self.max_current);
+        let direct = Fixed::clamp(target.d, -self.max_current, self.max_current);
         let quadrature_limit = if direct == Fixed::ZERO {
             self.max_current
         } else {
@@ -62,7 +61,7 @@ impl CurrentLimits {
         (
             Dq::new(
                 direct,
-                Scalar::clamp(target.q, -quadrature_limit, quadrature_limit),
+                Fixed::clamp(target.q, -quadrature_limit, quadrature_limit),
             ),
             quadrature_limit,
         )
@@ -125,9 +124,15 @@ impl FieldWeakening {
         self.current
     }
 
+    /// Bound the weakening current; an active excess is dropped immediately.
+    fn set_maximum_current(&mut self, maximum_current: Fixed) {
+        self.maximum_current = maximum_current.max(Fixed::ZERO);
+        self.current = self.current.max(-self.maximum_current);
+    }
+
     fn direct_target(&self, requested: Fixed) -> Fixed {
         if self.maximum_current > Fixed::ZERO {
-            core::cmp::min(requested, self.current)
+            requested.min(self.current)
         } else {
             requested
         }
@@ -142,13 +147,13 @@ impl FieldWeakening {
             && self.maximum_current > Fixed::ZERO
             && whole_unit_magnitude_exceeds(requested_voltage, self.voltage_threshold);
         if voltage_full {
-            self.current = Scalar::clamp(
+            self.current = Fixed::clamp(
                 self.current - self.ramp_in_per_cycle,
                 -self.maximum_current,
                 Fixed::ZERO,
             );
         } else {
-            self.current = Scalar::clamp(
+            self.current = Fixed::clamp(
                 self.current + self.ramp_out_per_cycle,
                 -self.maximum_current,
                 Fixed::ZERO,
@@ -189,9 +194,9 @@ pub struct FocDriver<
     Phase,
     const DEAD_TIME_NUMERATOR: i32 = 0,
     const DEAD_TIME_DENOMINATOR: i32 = 1,
-    Decoupling: DecouplingModel<Fixed> = NoDecoupling,
+    Decoupling: DecouplingModel = NoDecoupling,
 > {
-    controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
+    controller: FocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
     phase: Phase,
     current_limits: CurrentLimits,
     field_weakening: FieldWeakening,
@@ -207,11 +212,11 @@ impl<
     Phase,
     const DEAD_TIME_NUMERATOR: i32,
     const DEAD_TIME_DENOMINATOR: i32,
-    Decoupling: DecouplingModel<Fixed>,
+    Decoupling: DecouplingModel,
 > FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>
 {
     pub const fn new(
-        controller: FixedFocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
+        controller: FocController<DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>,
         phase: Phase,
         current_limits: CurrentLimits,
         pwm_period_ticks: u16,
@@ -272,6 +277,16 @@ impl<
         self.current_limits = limits;
     }
 
+    /// Replace the commanded dq current-circle radius. The measured trip and
+    /// supply-current limits are unchanged.
+    pub fn set_max_current(&mut self, max_current: Fixed) {
+        self.current_limits.max_current = max_current;
+    }
+
+    pub fn set_field_weakening_maximum_current(&mut self, maximum_current: Fixed) {
+        self.field_weakening.set_maximum_current(maximum_current);
+    }
+
     pub fn set_bus_limits(&mut self, input: Option<Fixed>, regen: Option<Fixed>) {
         self.current_limits.bus_in_max = input;
         self.current_limits.bus_regen_max = regen;
@@ -324,32 +339,6 @@ impl<
             return (target, static_quadrature_limit);
         }
 
-        if target.d == Fixed::ZERO {
-            let q_voltage_ticks = self.bus_mod_filt_ticks.q.abs_ceil_u32();
-            let motoring = (target.q > Fixed::ZERO) == (filtered_voltage_bits > 0);
-            let bus_limit = if motoring {
-                self.current_limits.bus_in_max
-            } else {
-                self.current_limits.bus_regen_max
-            };
-            let quadrature_limit = bus_limit.map_or(static_quadrature_limit, |limit| {
-                core::cmp::min(
-                    phase_current_limit(
-                        bus_power_bound(limit, self.pwm_period_ticks),
-                        q_voltage_ticks,
-                    ),
-                    static_quadrature_limit,
-                )
-            });
-            return (
-                Dq::new(
-                    target.d,
-                    Scalar::clamp(target.q, -quadrature_limit, quadrature_limit),
-                ),
-                quadrature_limit,
-            );
-        }
-
         let q_voltage_ticks = signed_ceil_abs(self.bus_mod_filt_ticks.q);
         let d_voltage_ticks = signed_ceil_abs(self.bus_mod_filt_ticks.d);
         let d_current_counts = signed_ceil_abs(target.d);
@@ -365,15 +354,12 @@ impl<
             })
         };
         let quadrature_limit = power_room.map_or(static_quadrature_limit, |room| {
-            core::cmp::min(
-                phase_current_limit(room, q_voltage_ticks.unsigned_abs()),
-                static_quadrature_limit,
-            )
+            phase_current_limit(room, q_voltage_ticks.unsigned_abs()).min(static_quadrature_limit)
         });
         (
             Dq::new(
                 target.d,
-                Scalar::clamp(target.q, -quadrature_limit, quadrature_limit),
+                Fixed::clamp(target.q, -quadrature_limit, quadrature_limit),
             ),
             quadrature_limit,
         )
@@ -384,16 +370,16 @@ impl<
     Phase,
     const DEAD_TIME_NUMERATOR: i32,
     const DEAD_TIME_DENOMINATOR: i32,
-    Decoupling: DecouplingModel<Fixed>,
+    Decoupling: DecouplingModel,
 > FocDriver<Phase, DEAD_TIME_NUMERATOR, DEAD_TIME_DENOMINATOR, Decoupling>
 where
-    Phase: PhaseProvider<Fixed, Angle = Turns>,
+    Phase: PhaseProvider,
 {
     pub fn estimate_for_control(
         &mut self,
         elapsed_since_observation_us: u32,
         control_period_ns: u32,
-    ) -> Option<PhaseEstimate<Turns>> {
+    ) -> Option<PhaseEstimate> {
         self.phase
             .estimate_for_control(elapsed_since_observation_us, control_period_ns)
     }
@@ -402,21 +388,19 @@ where
         &mut self,
         phase_a: Fixed,
         phase_b: Fixed,
-        estimate: PhaseEstimate<Turns>,
+        estimate: PhaseEstimate,
         target: Dq,
         pwm_neutral: u16,
         control_period_ns: u32,
     ) -> Result<FocOutput, StepError> {
         let target = Dq::new(self.field_weakening.direct_target(target.d), target.q);
         let (target, quadrature_limit) = self.clamp_targets_with_limit(target);
-        let injection = self.phase.injection();
-        let (measured_current, duties) = self.controller.step_with_velocity_and_injection(
+        let (measured_current, duties) = self.controller.step_with_velocity(
             phase_a,
             phase_b,
             estimate.angle,
             estimate.electrical_rpm,
             target,
-            injection,
             self.volts_per_pwm_tick,
             pwm_neutral,
         );
@@ -466,7 +450,7 @@ fn scale_observer_input(value: Fixed, scale: Fixed) -> Fixed {
     // envelopes. Their physical scales cannot approach Q16.16 overflow, so
     // the observer bridge needs only the fixed-point product, not another
     // saturation tree around each of its four axes.
-    Fixed::from_bits(((i64::from(value.to_bits()) * i64::from(scale.to_bits())) >> 16) as i32)
+    Fixed::from_bits(multiply_q16(value.to_bits(), scale.to_bits()))
 }
 
 #[inline]
@@ -527,13 +511,15 @@ mod tests {
     struct TestPhase;
 
     impl PhaseProvider for TestPhase {
-        type Angle = Turns;
-
         fn source(&self) -> PhaseSource {
             PhaseSource::Hall
         }
 
-        fn estimate(&self, _elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
+        fn estimate_for_control(
+            &mut self,
+            _elapsed_since_observation_us: u32,
+            _control_period_ns: u32,
+        ) -> Option<PhaseEstimate> {
             Some(PhaseEstimate {
                 angle: 0,
                 electrical_rpm: 0,
@@ -548,13 +534,15 @@ mod tests {
     }
 
     impl PhaseProvider for CapturingPhase {
-        type Angle = Turns;
-
         fn source(&self) -> PhaseSource {
             PhaseSource::Observer
         }
 
-        fn estimate(&self, _elapsed_since_observation_us: u32) -> Option<PhaseEstimate<Turns>> {
+        fn estimate_for_control(
+            &mut self,
+            _elapsed_since_observation_us: u32,
+            _control_period_ns: u32,
+        ) -> Option<PhaseEstimate> {
             Some(PhaseEstimate {
                 angle: 0,
                 electrical_rpm: 0,
@@ -602,6 +590,42 @@ mod tests {
         assert_eq!(
             limits.clamp_targets(Dq::new(Fixed::from_integer(60), Fixed::from_integer(100),)),
             Dq::new(Fixed::from_integer(60), Fixed::from_integer(80)),
+        );
+    }
+
+    #[test]
+    fn non_positive_current_ceiling_commands_no_current() {
+        for ceiling in [Fixed::ZERO, Fixed::from_integer(-1)] {
+            let limits = CurrentLimits::new(ceiling, Fixed::from_integer(130), None, None);
+            assert_eq!(
+                limits.clamp_targets(Dq::new(Fixed::from_integer(-60), Fixed::from_integer(80))),
+                Dq::new(Fixed::ZERO, Fixed::ZERO),
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_current_ceiling_bounds_field_weakening_and_quadrature_together() {
+        let mut driver = driver_with_limits(
+            0,
+            CurrentLimits::new(
+                Fixed::from_integer(880),
+                Fixed::from_integer(1_344),
+                None,
+                None,
+            ),
+        );
+        driver.set_max_current(Fixed::from_integer(100));
+        let (target, quadrature_limit) = driver.clamp_targets_with_limit(Dq::new(
+            Fixed::from_integer(-200),
+            Fixed::from_integer(-880),
+        ));
+        assert_eq!(target.d, Fixed::from_integer(-100));
+        assert_eq!(target.q, Fixed::ZERO);
+        assert_eq!(quadrature_limit, Fixed::ZERO);
+        assert_eq!(
+            driver.current_limits().overcurrent_threshold,
+            Fixed::from_integer(1_344)
         );
     }
 
@@ -820,6 +844,29 @@ mod tests {
             .unwrap();
         assert_eq!(second.target.d, Fixed::from_integer(-10));
         assert_eq!(driver.field_weakening_current(), Fixed::from_integer(-20));
+    }
+
+    #[test]
+    fn lowering_the_field_weakening_maximum_drops_active_excess() {
+        let mut weakening = FieldWeakening::new(
+            Fixed::from_integer(200),
+            6_000,
+            Fixed::from_integer(50),
+            Fixed::from_integer(10),
+            Fixed::from_integer(5),
+        );
+        weakening.current = Fixed::from_integer(-200);
+
+        weakening.set_maximum_current(Fixed::from_integer(40));
+        assert_eq!(weakening.current(), Fixed::from_integer(-40));
+        assert_eq!(
+            weakening.direct_target(Fixed::ZERO),
+            Fixed::from_integer(-40)
+        );
+
+        weakening.set_maximum_current(Fixed::from_integer(-5));
+        assert_eq!(weakening.current(), Fixed::ZERO);
+        assert_eq!(weakening.direct_target(Fixed::ZERO), Fixed::ZERO);
     }
 
     #[test]

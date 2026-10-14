@@ -1,65 +1,11 @@
-//! Fixed-point scalar support used by the shared FOC algorithms.
+//! Signed Q16.16 fixed-point arithmetic used by the shared FOC algorithms.
 //!
-//! The control code remains generic over [`Scalar`] so its numeric contract
-//! is explicit. [`Fixed`] is the sole implementation for this controller
-//! family.
+//! Arithmetic saturates and actuator commands truncate toward zero.
 
-use core::fmt::Debug;
 use core::ops::{Add, Mul, Neg, Sub};
 
 const FRACTION_BITS: u32 = 16;
 const SCALE: i64 = 1_i64 << FRACTION_BITS;
-
-/// Arithmetic required by the Clarke/Park, PI, limiting, and SVPWM paths.
-///
-/// Implementations define their overflow and quantization behavior. The fixed
-/// backend saturates arithmetic and truncates actuator commands toward zero.
-pub trait Scalar:
-    Copy
-    + Debug
-    + Default
-    + PartialEq
-    + PartialOrd
-    + Add<Output = Self>
-    + Sub<Output = Self>
-    + Mul<Output = Self>
-    + Neg<Output = Self>
-{
-    const ZERO: Self;
-    const ONE: Self;
-    const HALF: Self;
-    const THREE_HALVES: Self;
-    const TWO_THIRDS: Self;
-    const INV_SQRT_3: Self;
-    const TWO_INV_SQRT_3: Self;
-    const SQRT_3: Self;
-
-    fn from_i32(value: i32) -> Self;
-    fn from_ratio(numerator: i32, denominator: i32) -> Self;
-    fn trunc_to_i32(self) -> i32;
-    fn trunc(self) -> Self;
-    fn sqrt(self) -> Self;
-    fn abs(self) -> Self;
-    fn abs_ceil_u32(self) -> u32;
-    fn circular_remaining(limit: Self, direct: Self) -> Self;
-    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool;
-    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self);
-
-    #[inline]
-    fn min(self, other: Self) -> Self {
-        if self < other { self } else { other }
-    }
-
-    #[inline]
-    fn max(self, other: Self) -> Self {
-        if self > other { self } else { other }
-    }
-
-    #[inline]
-    fn clamp(self, minimum: Self, maximum: Self) -> Self {
-        self.max(minimum).min(maximum)
-    }
-}
 
 /// Signed Q16.16 scalar.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -69,6 +15,11 @@ pub struct Fixed(i32);
 impl Fixed {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1_i32 << FRACTION_BITS);
+    pub const HALF: Self = Self(32_768);
+    pub const TWO_THIRDS: Self = Self(43_690);
+    pub const INV_SQRT_3: Self = Self(37_837);
+    pub const TWO_INV_SQRT_3: Self = Self(75_674);
+    pub const SQRT_3: Self = Self(113_512);
 
     pub const fn from_bits(bits: i32) -> Self {
         Self(bits)
@@ -139,38 +90,33 @@ impl Neg for Fixed {
     }
 }
 
-impl Scalar for Fixed {
-    const ZERO: Self = Self::ZERO;
-    const ONE: Self = Self::ONE;
-    const HALF: Self = Self(32_768);
-    const THREE_HALVES: Self = Self(98_304);
-    const TWO_THIRDS: Self = Self(43_690);
-    const INV_SQRT_3: Self = Self(37_837);
-    const TWO_INV_SQRT_3: Self = Self(75_674);
-    const SQRT_3: Self = Self(113_512);
-
+impl Fixed {
+    /// Non-panicking minimum; takes precedence over [`Ord::min`].
     #[inline]
-    fn from_i32(value: i32) -> Self {
-        Self::from_integer(value)
+    pub fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    /// Non-panicking maximum; takes precedence over [`Ord::max`].
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+
+    /// Clamp without [`Ord::clamp`]'s `minimum <= maximum` panic: an empty
+    /// range yields `maximum`.
+    #[inline]
+    pub fn clamp(self, minimum: Self, maximum: Self) -> Self {
+        self.max(minimum).min(maximum)
     }
 
     #[inline]
-    fn from_ratio(numerator: i32, denominator: i32) -> Self {
-        Self::ratio(numerator, denominator)
-    }
-
-    #[inline]
-    fn trunc_to_i32(self) -> i32 {
-        self.integer()
-    }
-
-    #[inline]
-    fn trunc(self) -> Self {
+    pub fn trunc(self) -> Self {
         Self::from_integer(self.integer())
     }
 
     #[inline]
-    fn sqrt(self) -> Self {
+    pub fn sqrt(self) -> Self {
         if self.0 <= 0 {
             return Self::ZERO;
         }
@@ -179,12 +125,12 @@ impl Scalar for Fixed {
     }
 
     #[inline]
-    fn abs(self) -> Self {
+    pub fn abs(self) -> Self {
         Self(self.0.saturating_abs())
     }
 
     #[inline]
-    fn abs_ceil_u32(self) -> u32 {
+    pub fn abs_ceil_u32(self) -> u32 {
         self.0
             .unsigned_abs()
             .saturating_add((1_u32 << FRACTION_BITS) - 1)
@@ -192,14 +138,14 @@ impl Scalar for Fixed {
     }
 
     #[inline]
-    fn circular_remaining(limit: Self, direct: Self) -> Self {
+    pub fn circular_remaining(limit: Self, direct: Self) -> Self {
         let limit = limit.0.max(0) as u32;
         let direct = direct.0.unsigned_abs().min(limit);
         Self(conservative_circular_remaining_bits(limit, direct) as i32)
     }
 
     #[inline]
-    fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool {
+    pub fn magnitude_exceeds(direct: Self, quadrature: Self, limit: Self) -> bool {
         let direct = i64::from(direct.0);
         let quadrature = i64::from(quadrature.0);
         let limit = i64::from(limit.0.max(0));
@@ -210,7 +156,7 @@ impl Scalar for Fixed {
     }
 
     #[inline]
-    fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self) {
+    pub fn limit_vector(direct: Self, quadrature: Self, limit: Self) -> (Self, Self, Self) {
         let limit_bits = limit.0.max(0);
         let direct_bits = i64::from(direct.0);
         let quadrature_bits = i64::from(quadrature.0);
@@ -243,7 +189,8 @@ impl Scalar for Fixed {
     }
 }
 
-const fn saturating_i64_to_i32(value: i64) -> i32 {
+/// Clamp a wide intermediate into the `i32` range.
+pub const fn saturating_i64_to_i32(value: i64) -> i32 {
     if value > i32::MAX as i64 {
         i32::MAX
     } else if value < i32::MIN as i64 {
@@ -253,7 +200,9 @@ const fn saturating_i64_to_i32(value: i64) -> i32 {
     }
 }
 
-fn integer_sqrt_u64(mut radicand: u64) -> u64 {
+/// Floor square root of a `u64` using only shifts, adds, and compares, so it
+/// links no 64-bit division helper on the Cortex-M3.
+pub const fn integer_sqrt_u64(mut radicand: u64) -> u64 {
     let mut result = 0_u64;
     let mut bit = 1_u64 << 62;
     while bit > radicand {
@@ -269,6 +218,15 @@ fn integer_sqrt_u64(mut radicand: u64) -> u64 {
         bit >>= 2;
     }
     result
+}
+
+/// Multiply two Q16.16 words and truncate the product back to Q16.16.
+///
+/// The result wraps on overflow, so callers use it only where both operands
+/// are bounded by physical envelopes that keep the product inside `i32`.
+#[inline(always)]
+pub(crate) fn multiply_q16(left: i32, right: i32) -> i32 {
+    ((i64::from(left) * i64::from(right)) >> 16) as i32
 }
 
 #[inline]

@@ -3,14 +3,8 @@
 use crate::config::BIKE_CONFIG;
 
 pub const DEBOUNCE_SAMPLES: u8 = BIKE_CONFIG.cadence.debounce_milliseconds;
-pub const QUALIFYING_PULSES: u8 = BIKE_CONFIG.cadence.qualifying_pulses;
-pub const MAXIMUM_LOW_MS: u32 = BIKE_CONFIG.cadence.maximum_low_milliseconds;
-pub const SLOW_TIMEOUT_MS: u32 = BIKE_CONFIG.cadence.slow_timeout_milliseconds;
-pub const FAST_TIMEOUT_MS: u32 = BIKE_CONFIG.cadence.fast_timeout_milliseconds;
 pub const FAST_TIMEOUT_THRESHOLD_TENTHS_KPH: u16 =
     BIKE_CONFIG.cadence.fast_timeout_threshold_kph * 10;
-pub const PULSES_PER_REVOLUTION: u32 = BIKE_CONFIG.cadence.pulses_per_revolution;
-pub const MINIMUM_COMMAND_LOW_MS: u16 = BIKE_CONFIG.cadence.full_demand_low_milliseconds;
 pub const STOCK_COMMAND_MAXIMUM: u16 = 2_500;
 pub const STOCK_COMMAND_NUMERATOR: u32 = 41_074;
 pub const STOCK_COMMAND_OFFSET: u32 = 67;
@@ -95,16 +89,16 @@ impl Tracker {
         }
 
         let timeout_ms = if vehicle_speed_tenths_kph <= FAST_TIMEOUT_THRESHOLD_TENTHS_KPH {
-            SLOW_TIMEOUT_MS
+            BIKE_CONFIG.cadence.slow_timeout_milliseconds
         } else {
-            FAST_TIMEOUT_MS
+            BIKE_CONFIG.cadence.fast_timeout_milliseconds
         };
         if now_ms.wrapping_sub(self.phase_started_ms) > timeout_ms {
             self.reset_qualification();
         }
 
         Observation {
-            state: if self.qualifying_pulses >= QUALIFYING_PULSES {
+            state: if self.qualifying_pulses >= BIKE_CONFIG.cadence.qualifying_pulses {
                 State::Active
             } else if self.qualifying_pulses != 0 {
                 State::Priming
@@ -112,7 +106,7 @@ impl Tracker {
                 State::Inactive
             },
             rpm: self.rpm,
-            demand_percent: if self.qualifying_pulses >= QUALIFYING_PULSES {
+            demand_percent: if self.qualifying_pulses >= BIKE_CONFIG.cadence.qualifying_pulses {
                 self.demand_percent
             } else {
                 0
@@ -123,16 +117,17 @@ impl Tracker {
     }
 
     fn observe_low_phase(&mut self, now_ms: u32, duration_ms: u32) {
-        if duration_ms > MAXIMUM_LOW_MS {
+        if duration_ms > BIKE_CONFIG.cadence.maximum_low_milliseconds {
             self.reset_qualification();
             return;
         }
 
-        let low_ms = duration_ms.max(u32::from(MINIMUM_COMMAND_LOW_MS)) as u16;
+        let low_ms =
+            duration_ms.max(u32::from(BIKE_CONFIG.cadence.full_demand_low_milliseconds)) as u16;
         if self.qualifying_pulses != 0 {
             let denominator = now_ms
                 .wrapping_sub(self.last_pulse_ms)
-                .saturating_mul(PULSES_PER_REVOLUTION);
+                .saturating_mul(BIKE_CONFIG.cadence.pulses_per_revolution);
             if denominator != 0 {
                 self.rpm = 60_000_u32
                     .checked_div(denominator)
@@ -145,8 +140,8 @@ impl Tracker {
         self.last_pulse_ms = now_ms;
         self.previous_low_ms = low_ms;
         self.qualifying_pulses = self.qualifying_pulses.saturating_add(1);
-        if self.qualifying_pulses >= QUALIFYING_PULSES {
-            self.qualifying_pulses = QUALIFYING_PULSES;
+        if self.qualifying_pulses >= BIKE_CONFIG.cadence.qualifying_pulses {
+            self.qualifying_pulses = BIKE_CONFIG.cadence.qualifying_pulses;
         }
     }
 
@@ -159,10 +154,10 @@ impl Tracker {
 }
 
 pub const fn demand_percent_from_low_ms(low_ms: u16) -> u8 {
-    if low_ms == 0 || low_ms as u32 > MAXIMUM_LOW_MS {
+    if low_ms == 0 || low_ms as u32 > BIKE_CONFIG.cadence.maximum_low_milliseconds {
         return 0;
     }
-    let command = if low_ms <= MINIMUM_COMMAND_LOW_MS {
+    let command = if low_ms <= BIKE_CONFIG.cadence.full_demand_low_milliseconds {
         STOCK_COMMAND_MAXIMUM as u32
     } else {
         let derived = STOCK_COMMAND_NUMERATOR / low_ms as u32 + STOCK_COMMAND_OFFSET;
