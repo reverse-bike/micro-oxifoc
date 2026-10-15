@@ -1,13 +1,16 @@
 //! Local ride-demand authority and Hall-progress lifecycle.
 
 use crate::config::{BIKE_CONFIG, RideConfig};
-use crate::safety::fault_flag;
+use crate::safety::{SafetyLossReason, fault_flag};
 use crate::sensors::throttle::{Demand, Observation as ThrottleObservation};
 
 const RIDE: RideConfig = BIKE_CONFIG.ride;
 /// Latched faults that indicate a power-stage problem rather than a sensing
 /// or scheduling interruption; only these count toward the retry lockout.
 const RETRY_LIMITED_FAULTS: u32 = fault_flag::HARDWARE_BREAK | fault_flag::PWM_RANGE;
+/// Latched faults a Hall-interruption retry may acknowledge without a
+/// throttle rest sample.
+const HALL_RETRY_FAULTS: u32 = fault_flag::HALL_CAPTURE;
 
 pub const OUTPUT_LEASE_CYCLES: u32 =
     RIDE.command_lease_milliseconds * crate::config::PWM_HZ / 1_000;
@@ -22,6 +25,11 @@ pub enum Stage {
     StartupTracking = 3,
     Tracking = 4,
     Coasting = 5,
+    /// Armed with authority withheld while the brake is applied.
+    BrakeHold = 6,
+    /// Armed ride stopped by a Hall interruption, waiting for the Hall retry
+    /// conditions or throttle rest.
+    HallRecovery = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +44,9 @@ pub struct Observation {
     pub current_valid: bool,
     pub fault_flags: u32,
     pub safety_events: u32,
+    /// [`SafetyLossReason`] of the latest counted safety event.
+    pub last_safety_loss_reason: u8,
+    pub output_active: bool,
     pub phase_current_trips: u32,
     pub hall_sequence: u32,
     pub hall_progress: i32,
@@ -46,7 +57,10 @@ pub struct Observation {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Command {
     pub energize: bool,
-    pub acknowledge_faults: bool,
+    /// Latched fault mask observed by this pass and chosen for
+    /// acknowledgement; zero requests none. The hardware clears the latch
+    /// only while it still holds exactly this mask.
+    pub acknowledge_fault_mask: u32,
     pub target_q_counts: i16,
     pub dc_current_limit_counts: u16,
     /// Thermally derated radius of the complete dq current command.
@@ -57,12 +71,17 @@ pub struct Command {
 impl Command {
     pub const OFF: Self = Self {
         energize: false,
-        acknowledge_faults: false,
+        acknowledge_fault_mask: 0,
         target_q_counts: 0,
         dc_current_limit_counts: 0,
         phase_current_limit_counts: 0,
         stage: Stage::Disarmed,
     };
+
+    /// No authority, reported as `stage`.
+    pub const fn withheld(stage: Stage) -> Self {
+        Self { stage, ..Self::OFF }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +95,16 @@ struct Run {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
+    /// Arms only from a valid throttle rest sample.
     Disarmed,
+    /// Armed, with authority withheld only while the brake is applied.
+    BrakeHold,
+    /// Armed ride stopped only by a Hall interruption. It re-arms from
+    /// throttle rest, or without one once the Hall has stayed valid since
+    /// `quiet_since_ms` for the retry interval and retries remain.
+    HallRecovery {
+        quiet_since_ms: u32,
+    },
     Ready,
     Active(Run),
 }
@@ -92,6 +120,12 @@ pub struct RideController {
     /// break in adjacent passes counts once.
     fault_counted: bool,
     consecutive_faults: u8,
+    /// Hall-interruption retries spent on starting a run since the throttle
+    /// was last at rest.
+    hall_retries: u8,
+    /// The ride left a Hall recovery without throttle rest; the next run
+    /// started spends one retry.
+    hall_retry_pending: bool,
 }
 
 impl RideController {
@@ -103,6 +137,8 @@ impl RideController {
             retry_limited_fault_latched: false,
             fault_counted: false,
             consecutive_faults: 0,
+            hall_retries: 0,
+            hall_retry_pending: false,
         }
     }
 
@@ -121,7 +157,9 @@ impl RideController {
     }
 
     fn update_authority(&mut self, observation: Observation) -> Command {
-        let safety_event = observation.safety_events != self.observed_safety_events;
+        let new_safety_events = observation
+            .safety_events
+            .wrapping_sub(self.observed_safety_events);
         self.observed_safety_events = observation.safety_events;
         // At most one power-stage fault counts per arming attempt; a fault
         // stays latched until acknowledged.
@@ -139,66 +177,125 @@ impl RideController {
             self.state = State::Disarmed;
             return Command::OFF;
         }
-        if observation.fault_flags != 0 {
+        let throttle_rest = observation.throttle.is_valid() && observation.throttle.is_at_rest();
+        if throttle_rest {
+            self.hall_retries = 0;
+            self.hall_retry_pending = false;
+        }
+
+        // Exactly one new loss with a Hall cause can be retried; several
+        // losses in one pass may hide a different cause behind the latest.
+        let hall_loss = new_safety_events == 1
+            && !phase_overcurrent
+            && SafetyLossReason::is_hall(observation.last_safety_loss_reason);
+        let environment_limit = observation.environment_dc_limit_counts.unwrap_or(0);
+        // A zero DC or phase ceiling leaves no current authority to grant.
+        let requires_rest = (new_safety_events != 0 && !hall_loss)
+            || observation.fault_flags & !HALL_RETRY_FAULTS != 0
+            || !observation.throttle.is_valid()
+            || !observation.current_valid
+            || environment_limit == 0
+            || observation.phase_current_limit_counts == 0;
+        let hall_interrupted = hall_loss || observation.fault_flags != 0 || !observation.hall_valid;
+        if requires_rest || (hall_interrupted && self.state == State::Disarmed) {
             self.state = State::Disarmed;
             return Command {
-                acknowledge_faults: observation.throttle.is_valid()
-                    && observation.throttle.is_at_rest(),
+                acknowledge_fault_mask: if throttle_rest {
+                    observation.fault_flags
+                } else {
+                    0
+                },
                 ..Command::OFF
             };
         }
-        let environment_limit = observation.environment_dc_limit_counts.unwrap_or(0);
-        // A zero DC or phase ceiling leaves no current authority to grant.
-        let safety_ready = !safety_event
-            && observation.hall_valid
-            && observation.current_valid
-            && environment_limit != 0
-            && observation.phase_current_limit_counts != 0;
-        if !observation.throttle.is_valid() || !safety_ready {
-            self.state = State::Disarmed;
-            return Command::OFF;
-        }
-        if observation.brake_active && !matches!(self.state, State::Active(_)) {
-            self.state = State::Disarmed;
-            return Command::OFF;
+        if hall_interrupted {
+            self.state = State::HallRecovery {
+                quiet_since_ms: observation.now_ms,
+            };
+            let acknowledge =
+                throttle_rest || self.hall_retries < RIDE.hall_retries_per_throttle_press;
+            return Command {
+                acknowledge_fault_mask: if acknowledge {
+                    observation.fault_flags
+                } else {
+                    0
+                },
+                ..Command::withheld(Stage::HallRecovery)
+            };
         }
 
         match self.state {
-            State::Disarmed => {
-                if observation.throttle.is_at_rest() && observation.cadence_demand_percent == 0 {
-                    self.state = State::Ready;
-                    self.fault_counted = false;
-                    Command {
-                        stage: Stage::Ready,
-                        ..Command::OFF
-                    }
-                } else {
-                    Command::OFF
+            State::Disarmed => self.arm_from_rest(observation, throttle_rest),
+            State::HallRecovery { quiet_since_ms } => {
+                if throttle_rest {
+                    return self.arm_from_rest(observation, throttle_rest);
                 }
+                if observation.now_ms.wrapping_sub(quiet_since_ms)
+                    < RIDE.hall_retry_quiet_milliseconds
+                    || self.hall_retries >= RIDE.hall_retries_per_throttle_press
+                    || observation.output_active
+                {
+                    return Command::withheld(Stage::HallRecovery);
+                }
+                self.hall_retry_pending = true;
+                self.update_ready(observation, environment_limit)
             }
-            State::Ready => self.update_ready(observation, environment_limit),
+            State::BrakeHold | State::Ready => self.update_ready(observation, environment_limit),
             State::Active(run) => self.update_active(run, observation, environment_limit),
         }
     }
 
+    /// A valid throttle rest sample arms the ride; while the brake is applied
+    /// it arms into the brake hold, so releasing the brake needs no second
+    /// rest sample.
+    fn arm_from_rest(&mut self, observation: Observation, throttle_rest: bool) -> Command {
+        if !throttle_rest {
+            self.state = State::Disarmed;
+            return Command::OFF;
+        }
+        self.fault_counted = false;
+        if observation.brake_active {
+            self.state = State::BrakeHold;
+            return Command::withheld(Stage::BrakeHold);
+        }
+        self.state = State::Ready;
+        Command::withheld(Stage::Ready)
+    }
+
+    /// Authority withheld without torque. The brake keeps the ride armed so
+    /// its release resumes through a fresh startup; any other cause needs a
+    /// throttle rest sample.
+    fn withhold(&mut self, brake_active: bool) -> Command {
+        if brake_active {
+            self.state = State::BrakeHold;
+            Command::withheld(Stage::BrakeHold)
+        } else {
+            self.state = State::Disarmed;
+            Command::OFF
+        }
+    }
+
     fn update_ready(&mut self, observation: Observation, environment_limit: u16) -> Command {
+        if observation.brake_active {
+            self.state = State::BrakeHold;
+            return Command::withheld(Stage::BrakeHold);
+        }
+        self.state = State::Ready;
         let Some(demand) = ride_demand(observation) else {
             if !observation.throttle.is_at_rest() {
                 self.state = State::Disarmed;
                 return Command::OFF;
             }
-            return Command {
-                stage: Stage::Ready,
-                ..Command::OFF
-            };
+            return Command::withheld(Stage::Ready);
         };
         if observation.electrical_rpm.unsigned_abs() > RIDE.maximum_entry_electrical_rpm {
-            return Command {
-                stage: Stage::Ready,
-                ..Command::OFF
-            };
+            return Command::withheld(Stage::Ready);
         }
 
+        if self.hall_retry_pending {
+            self.hall_retry_pending = false;
+            self.hall_retries += 1;
+        }
         let run = Run {
             stage: Stage::AwaitingFirstEdge,
             startup_deadline_ms: observation
@@ -233,8 +330,7 @@ impl RideController {
         if matches!(run.stage, Stage::AwaitingFirstEdge | Stage::StartupTracking)
             && demand.is_none()
         {
-            self.state = State::Disarmed;
-            return Command::OFF;
+            return self.withhold(observation.brake_active);
         }
 
         let startup_progress = observation
@@ -244,7 +340,7 @@ impl RideController {
             let first_edge = matches!(run.stage, Stage::AwaitingFirstEdge);
             run.last_hall_sequence = observation.hall_sequence;
             run.hall_deadline_ms = observation.now_ms.wrapping_add(if first_edge {
-                RIDE.startup_first_hall_timeout_milliseconds
+                RIDE.startup_second_hall_timeout_milliseconds
             } else {
                 hall_timeout_ms(observation.hall_interval_us)
             });
@@ -260,10 +356,12 @@ impl RideController {
 
         let timed_out = match run.stage {
             // The seeded Hall sector is sufficient for low-speed commutation.
-            // Waiting for the first edge must cover a rollback that reverses
-            // within that sector, where no transition occurs around zero speed.
+            // The first-edge wait covers a rollback that reverses within that
+            // sector, where no transition occurs around zero speed, and bounds
+            // a stalled motor or a dead Hall sensor.
             Stage::AwaitingFirstEdge => {
                 deadline_reached(observation.now_ms, run.startup_deadline_ms)
+                    || deadline_reached(observation.now_ms, run.hall_deadline_ms)
             }
             Stage::StartupTracking => {
                 // Reversing a rolling wheel necessarily has a no-edge interval at zero speed.
@@ -275,18 +373,16 @@ impl RideController {
             Stage::Tracking | Stage::Coasting => {
                 deadline_reached(observation.now_ms, run.hall_deadline_ms)
             }
-            Stage::Disarmed | Stage::Ready => true,
+            Stage::Disarmed | Stage::Ready | Stage::BrakeHold | Stage::HallRecovery => true,
         };
         if timed_out {
-            self.state = State::Disarmed;
-            return Command::OFF;
+            return self.withhold(observation.brake_active);
         }
 
         match (run.stage, demand) {
             (Stage::Tracking, None) => {
                 if observation.electrical_rpm.unsigned_abs() <= RIDE.maximum_entry_electrical_rpm {
-                    self.state = State::Disarmed;
-                    Command::OFF
+                    self.withhold(observation.brake_active)
                 } else {
                     run.stage = Stage::Coasting;
                     self.state = State::Active(run);
@@ -300,8 +396,7 @@ impl RideController {
             }
             (Stage::Coasting, None) => {
                 if observation.electrical_rpm.unsigned_abs() <= RIDE.maximum_entry_electrical_rpm {
-                    self.state = State::Disarmed;
-                    Command::OFF
+                    self.withhold(observation.brake_active)
                 } else {
                     self.state = State::Active(run);
                     active_command(
@@ -356,7 +451,7 @@ fn active_command(
 ) -> Command {
     Command {
         energize: true,
-        acknowledge_faults: false,
+        acknowledge_fault_mask: 0,
         target_q_counts,
         dc_current_limit_counts: environment_limit,
         phase_current_limit_counts,
@@ -398,6 +493,8 @@ mod tests {
             current_valid: true,
             fault_flags: 0,
             safety_events: 0,
+            last_safety_loss_reason: 0,
+            output_active: false,
             phase_current_trips: 0,
             hall_sequence: 0,
             hall_progress: 0,
@@ -447,11 +544,18 @@ mod tests {
     }
 
     #[test]
-    fn active_cadence_cannot_arm_at_boot_and_throttle_can_take_over() {
+    fn active_cadence_needs_a_throttle_rest_sample_at_boot_and_throttle_can_take_over() {
         let mut blocked = RideController::new(0);
-        let mut already_pedaling = observation(0, REST_ADC);
-        already_pedaling.cadence_demand_percent = 44;
-        assert_eq!(blocked.update(already_pedaling), Command::OFF);
+        let mut held_while_pedaling = observation(0, FULL_ADC);
+        held_while_pedaling.cadence_demand_percent = 44;
+        assert_eq!(blocked.update(held_while_pedaling), Command::OFF);
+        let mut rest_while_pedaling = observation(1, REST_ADC);
+        rest_while_pedaling.cadence_demand_percent = 44;
+        let command = blocked.update(rest_while_pedaling);
+        assert!(!command.energize);
+        assert_eq!(command.stage, Stage::Ready);
+        rest_while_pedaling.now_ms = 2;
+        assert!(blocked.update(rest_while_pedaling).energize);
 
         let mut controller = RideController::new(0);
         arm(&mut controller);
@@ -493,17 +597,552 @@ mod tests {
     }
 
     #[test]
-    fn brake_and_safety_events_remove_authority_and_require_rest() {
-        for brake in [false, true] {
+    fn pedaling_rearms_from_throttle_rest_without_stopping() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let mut pedaling = observation(1, REST_ADC);
+        pedaling.cadence_demand_percent = 44;
+        assert!(controller.update(pedaling).energize);
+
+        let mut lost = pedaling;
+        lost.now_ms = 2;
+        lost.safety_events = 1;
+        lost.last_safety_loss_reason = SafetyLossReason::ControlTiming as u8;
+        assert_eq!(controller.update(lost), Command::OFF);
+        lost.now_ms = 3;
+        assert_eq!(controller.update(lost).stage, Stage::Ready);
+        lost.now_ms = 4;
+        assert!(controller.update(lost).energize);
+    }
+
+    #[test]
+    fn safety_events_remove_authority_and_require_rest() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        let mut stopped = observation(2, FULL_ADC);
+        stopped.safety_events = 1;
+        assert_eq!(controller.update(stopped), Command::OFF);
+        let mut held = stopped;
+        held.now_ms = 3;
+        assert_eq!(controller.update(held), Command::OFF);
+        held.now_ms = 1_000;
+        assert_eq!(controller.update(held), Command::OFF);
+    }
+
+    fn braking(now_ms: u32, throttle_raw: u16) -> Observation {
+        Observation {
+            brake_active: true,
+            ..observation(now_ms, throttle_raw)
+        }
+    }
+
+    #[test]
+    fn brake_release_resumes_without_a_throttle_reset() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert_eq!(
+            controller.update(braking(1, FULL_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert_eq!(
+            controller.update(braking(500, FULL_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        let command = controller.update(observation(501, FULL_ADC));
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::AwaitingFirstEdge);
+    }
+
+    #[test]
+    fn brake_release_at_rest_returns_to_ready() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert_eq!(
+            controller.update(braking(1, REST_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert_eq!(
+            controller.update(observation(2, REST_ADC)).stage,
+            Stage::Ready
+        );
+    }
+
+    #[test]
+    fn low_speed_brake_cuts_torque_and_restarts_the_startup_sequence() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        reach_tracking(&mut controller, 1, 0);
+
+        let mut brake = braking(3, FULL_ADC);
+        brake.hall_sequence = 12;
+        brake.hall_progress = 12;
+        brake.electrical_rpm = 1_000;
+        assert_eq!(
+            controller.update(brake),
+            Command::withheld(Stage::BrakeHold)
+        );
+        brake.now_ms = 1_000;
+        assert_eq!(
+            controller.update(brake),
+            Command::withheld(Stage::BrakeHold)
+        );
+
+        let mut released = brake;
+        released.brake_active = false;
+        released.now_ms = 1_001;
+        let command = controller.update(released);
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::AwaitingFirstEdge);
+        released.now_ms = 1_000 + RIDE.startup_first_hall_timeout_milliseconds;
+        assert!(controller.update(released).energize);
+        released.now_ms += 1;
+        assert_eq!(controller.update(released), Command::OFF);
+    }
+
+    #[test]
+    fn brake_during_startup_restarts_it_on_release() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        let mut edge = observation(100, FULL_ADC);
+        edge.hall_sequence = 1;
+        edge.hall_progress = 1;
+        assert_eq!(controller.update(edge).stage, Stage::StartupTracking);
+
+        let mut brake = edge;
+        brake.now_ms = 200;
+        brake.brake_active = true;
+        assert_eq!(
+            controller.update(brake),
+            Command::withheld(Stage::BrakeHold)
+        );
+
+        let mut released = edge;
+        released.now_ms = 300;
+        assert_eq!(controller.update(released).stage, Stage::AwaitingFirstEdge);
+        let mut progress = released;
+        progress.now_ms = 310;
+        progress.hall_sequence = 12;
+        progress.hall_progress = 12;
+        assert_eq!(controller.update(progress).stage, Stage::StartupTracking);
+        progress.now_ms = 320;
+        progress.hall_sequence = 13;
+        progress.hall_progress = 13;
+        assert_eq!(controller.update(progress).stage, Stage::Tracking);
+    }
+
+    #[test]
+    fn a_hall_timeout_while_braking_holds_instead_of_disarming() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        controller.update(observation(1, FULL_ADC));
+        let mut tracking = observation(20, FULL_ADC);
+        tracking.hall_sequence = 12;
+        tracking.hall_progress = 12;
+        tracking.electrical_rpm = 10_000;
+        assert_eq!(controller.update(tracking).stage, Stage::Tracking);
+
+        let mut brake = tracking;
+        brake.now_ms = 21;
+        brake.brake_active = true;
+        assert_eq!(controller.update(brake).stage, Stage::Coasting);
+        brake.now_ms = 21 + RIDE.maximum_running_hall_timeout_milliseconds;
+        assert_eq!(
+            controller.update(brake),
+            Command::withheld(Stage::BrakeHold)
+        );
+
+        let mut released = brake;
+        released.now_ms += 1;
+        released.brake_active = false;
+        released.electrical_rpm = 0;
+        assert_eq!(controller.update(released).stage, Stage::AwaitingFirstEdge);
+    }
+
+    #[test]
+    fn faults_and_safety_events_while_braking_still_require_rest() {
+        for fault in [false, true] {
+            let mut controller = RideController::new(0);
+            arm(&mut controller);
+            assert_eq!(
+                controller.update(braking(1, FULL_ADC)),
+                Command::withheld(Stage::BrakeHold)
+            );
+            let mut interrupted = braking(2, FULL_ADC);
+            if fault {
+                interrupted.fault_flags = fault_flag::CONTROL_TIMING;
+            } else {
+                interrupted.safety_events = 1;
+                interrupted.last_safety_loss_reason = SafetyLossReason::CurrentSample as u8;
+            }
+            assert_eq!(controller.update(interrupted), Command::OFF);
+            let mut released = interrupted;
+            released.brake_active = false;
+            released.now_ms = 3;
+            assert_eq!(controller.update(released), Command::OFF);
+            released.now_ms = 1_000;
+            assert_eq!(controller.update(released), Command::OFF);
+            released.now_ms = 1_001;
+            released.throttle = ThrottleObservation::from_raw(REST_ADC);
+            assert_eq!(
+                controller.update(released).acknowledge_fault_mask != 0,
+                fault
+            );
+            released.fault_flags = 0;
+            released.now_ms = 1_002;
+            assert_eq!(controller.update(released).stage, Stage::Ready);
+        }
+    }
+
+    #[test]
+    fn boot_brake_release_still_needs_a_throttle_rest_sample() {
+        let mut controller = RideController::new(0);
+        assert_eq!(controller.update(braking(0, FULL_ADC)), Command::OFF);
+        assert_eq!(controller.update(observation(1, FULL_ADC)), Command::OFF);
+        assert_eq!(
+            controller.update(observation(2, REST_ADC)).stage,
+            Stage::Ready
+        );
+    }
+
+    #[test]
+    fn a_throttle_rest_sample_seen_while_braking_arms_the_release() {
+        let mut controller = RideController::new(0);
+        assert_eq!(
+            controller.update(braking(0, REST_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert_eq!(
+            controller.update(braking(1, FULL_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert!(controller.update(observation(2, FULL_ADC)).energize);
+    }
+
+    fn hall_loss(now_ms: u32, safety_events: u32) -> Observation {
+        Observation {
+            safety_events,
+            last_safety_loss_reason: SafetyLossReason::HallTransition as u8,
+            hall_valid: false,
+            ..observation(now_ms, FULL_ADC)
+        }
+    }
+
+    fn held(now_ms: u32, safety_events: u32) -> Observation {
+        Observation {
+            safety_events,
+            last_safety_loss_reason: SafetyLossReason::HallTransition as u8,
+            ..observation(now_ms, FULL_ADC)
+        }
+    }
+
+    #[test]
+    fn a_hall_loss_retries_after_a_quiet_interval_without_throttle_rest() {
+        for reason in [
+            SafetyLossReason::HallCaptureSequence,
+            SafetyLossReason::HallTransition,
+            SafetyLossReason::HallStationaryMismatch,
+        ] {
             let mut controller = RideController::new(0);
             arm(&mut controller);
             assert!(controller.update(observation(1, FULL_ADC)).energize);
-            let mut stopped = observation(2, FULL_ADC);
-            stopped.brake_active = brake;
-            stopped.safety_events = u32::from(!brake);
-            assert_eq!(controller.update(stopped), Command::OFF);
-            assert_eq!(controller.update(observation(3, FULL_ADC)), Command::OFF);
+            let mut lost = hall_loss(2, 1);
+            lost.last_safety_loss_reason = reason as u8;
+            assert_eq!(
+                controller.update(lost),
+                Command::withheld(Stage::HallRecovery)
+            );
+            assert_eq!(
+                controller.update(held(3, 1)),
+                Command::withheld(Stage::HallRecovery)
+            );
+            assert_eq!(
+                controller.update(held(1 + RIDE.hall_retry_quiet_milliseconds, 1)),
+                Command::withheld(Stage::HallRecovery)
+            );
+            let command = controller.update(held(2 + RIDE.hall_retry_quiet_milliseconds, 1));
+            assert!(command.energize);
+            assert_eq!(command.stage, Stage::AwaitingFirstEdge);
         }
+    }
+
+    #[test]
+    fn a_hall_retry_waits_for_a_valid_hall_and_stopped_output() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        assert_eq!(
+            controller.update(hall_loss(2, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        assert_eq!(
+            controller.update(hall_loss(100, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        let quiet = 100 + RIDE.hall_retry_quiet_milliseconds;
+        assert_eq!(
+            controller.update(held(quiet - 1, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        let mut still_driving = held(quiet, 1);
+        still_driving.output_active = true;
+        assert_eq!(
+            controller.update(still_driving),
+            Command::withheld(Stage::HallRecovery)
+        );
+        assert!(controller.update(held(quiet + 1, 1)).energize);
+    }
+
+    #[test]
+    fn a_hall_retry_while_braking_resumes_on_release() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        assert_eq!(
+            controller.update(hall_loss(2, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        let quiet = 2 + RIDE.hall_retry_quiet_milliseconds;
+        let mut brake = held(quiet, 1);
+        brake.brake_active = true;
+        assert_eq!(
+            controller.update(brake),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert!(controller.update(held(quiet + 1, 1)).energize);
+    }
+
+    #[test]
+    fn hall_retries_are_limited_per_throttle_press() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let mut now = 1;
+        let mut events = 0;
+        assert!(controller.update(observation(now, FULL_ADC)).energize);
+        for _ in 0..RIDE.hall_retries_per_throttle_press {
+            events += 1;
+            now += 1;
+            assert_eq!(
+                controller.update(hall_loss(now, events)),
+                Command::withheld(Stage::HallRecovery)
+            );
+            now += RIDE.hall_retry_quiet_milliseconds;
+            assert!(controller.update(held(now, events)).energize);
+        }
+        events += 1;
+        now += 1;
+        assert_eq!(
+            controller.update(hall_loss(now, events)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        now += 10 * RIDE.hall_retry_quiet_milliseconds;
+        assert_eq!(
+            controller.update(held(now, events)),
+            Command::withheld(Stage::HallRecovery)
+        );
+
+        now += 1;
+        let mut rest = held(now, events);
+        rest.throttle = ThrottleObservation::from_raw(REST_ADC);
+        assert_eq!(controller.update(rest).stage, Stage::Ready);
+        now += 1;
+        assert!(controller.update(held(now, events)).energize);
+        events += 1;
+        now += 1;
+        assert_eq!(
+            controller.update(hall_loss(now, events)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        now += RIDE.hall_retry_quiet_milliseconds;
+        assert!(controller.update(held(now, events)).energize);
+    }
+
+    #[test]
+    fn a_hall_capture_fault_is_acknowledged_for_a_retry_without_rest() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        let mut latched = hall_loss(2, 1);
+        latched.last_safety_loss_reason = SafetyLossReason::HallCaptureSequence as u8;
+        latched.fault_flags = fault_flag::HALL_CAPTURE;
+        let command = controller.update(latched);
+        assert_ne!(command.acknowledge_fault_mask, 0);
+        assert!(!command.energize);
+        assert_eq!(
+            controller.update(held(3, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        assert!(
+            controller
+                .update(held(2 + RIDE.hall_retry_quiet_milliseconds, 1))
+                .energize
+        );
+    }
+
+    #[test]
+    fn mixed_or_non_hall_losses_still_require_rest() {
+        for case in 0..4 {
+            let mut controller = RideController::new(0);
+            arm(&mut controller);
+            assert!(controller.update(observation(1, FULL_ADC)).energize);
+            let mut lost = hall_loss(2, 1);
+            match case {
+                0 => lost.fault_flags = fault_flag::HALL_CAPTURE | fault_flag::CONTROL_TIMING,
+                1 => lost.last_safety_loss_reason = SafetyLossReason::ControlTiming as u8,
+                2 => lost.safety_events = 2,
+                _ => lost.current_valid = false,
+            }
+            let command = controller.update(lost);
+            assert_eq!(command, Command::OFF);
+            let mut later = held(
+                2 + 10 * RIDE.hall_retry_quiet_milliseconds,
+                lost.safety_events,
+            );
+            later.fault_flags = lost.fault_flags;
+            assert_eq!(controller.update(later), Command::OFF);
+        }
+    }
+
+    #[test]
+    fn a_hall_loss_before_the_first_rest_sample_cannot_retry() {
+        let mut controller = RideController::new(0);
+        assert_eq!(controller.update(hall_loss(0, 1)), Command::OFF);
+        assert_eq!(
+            controller.update(held(10 * RIDE.hall_retry_quiet_milliseconds, 1)),
+            Command::OFF
+        );
+    }
+
+    #[test]
+    fn hall_retries_are_spent_only_when_a_run_starts() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        let mut now = 1;
+        let mut events = 0;
+        assert!(controller.update(observation(now, FULL_ADC)).energize);
+        for _ in 0..=RIDE.hall_retries_per_throttle_press {
+            events += 1;
+            now += 1;
+            let mut lost = hall_loss(now, events);
+            lost.brake_active = true;
+            assert!(!controller.update(lost).energize);
+            now += RIDE.hall_retry_quiet_milliseconds;
+            let mut brake = held(now, events);
+            brake.brake_active = true;
+            assert!(!controller.update(brake).energize);
+        }
+        for _ in 0..RIDE.hall_retries_per_throttle_press {
+            now += 1;
+            assert!(controller.update(held(now, events)).energize);
+            events += 1;
+            now += 1;
+            assert!(!controller.update(hall_loss(now, events)).energize);
+            now += RIDE.hall_retry_quiet_milliseconds;
+        }
+        assert!(!controller.update(held(now, events)).energize);
+    }
+
+    #[test]
+    fn a_stalled_start_without_a_first_hall_edge_is_cut_at_the_first_edge_timeout() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        let stalled = observation(
+            1 + RIDE.startup_first_hall_timeout_milliseconds - 1,
+            FULL_ADC,
+        );
+        assert!(controller.update(stalled).energize);
+        let overdue = observation(1 + RIDE.startup_first_hall_timeout_milliseconds, FULL_ADC);
+        assert!(!controller.update(overdue).energize);
+    }
+
+    #[test]
+    fn a_late_first_hall_edge_inside_the_first_edge_timeout_continues_the_start() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(0, FULL_ADC)).energize);
+        let mut first_edge = observation(1_900, FULL_ADC);
+        first_edge.hall_sequence = 1;
+        first_edge.hall_progress = 1;
+        let command = controller.update(first_edge);
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::StartupTracking);
+        let mut waiting = first_edge;
+        waiting.now_ms = 1_900 + RIDE.startup_second_hall_timeout_milliseconds - 1;
+        assert!(controller.update(waiting).energize);
+        waiting.now_ms += 1;
+        assert!(!controller.update(waiting).energize);
+    }
+
+    #[test]
+    fn a_fault_acknowledgement_names_the_mask_it_observed() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert!(controller.update(observation(1, FULL_ADC)).energize);
+        let mut latched = hall_loss(2, 1);
+        latched.last_safety_loss_reason = SafetyLossReason::HallCaptureSequence as u8;
+        latched.fault_flags = fault_flag::HALL_CAPTURE;
+        assert_eq!(
+            controller.update(latched).acknowledge_fault_mask,
+            fault_flag::HALL_CAPTURE
+        );
+
+        let mut rest = observation(3, REST_ADC);
+        rest.fault_flags = fault_flag::HALL_CAPTURE | fault_flag::CONTROL_TIMING;
+        assert_eq!(
+            controller.update(rest).acknowledge_fault_mask,
+            fault_flag::HALL_CAPTURE | fault_flag::CONTROL_TIMING
+        );
+    }
+
+    #[test]
+    fn brake_hold_and_hall_recovery_report_their_own_stage_without_authority() {
+        let mut controller = RideController::new(0);
+        arm(&mut controller);
+        assert_eq!(
+            controller.update(braking(1, FULL_ADC)),
+            Command::withheld(Stage::BrakeHold)
+        );
+        assert!(controller.update(observation(2, FULL_ADC)).energize);
+        let lost = controller.update(hall_loss(3, 1));
+        assert_eq!(lost, Command::withheld(Stage::HallRecovery));
+        assert_eq!(
+            controller.update(held(4, 1)),
+            Command::withheld(Stage::HallRecovery)
+        );
+        let mut rest = held(5, 1);
+        rest.throttle = ThrottleObservation::from_raw(REST_ADC);
+        assert_eq!(controller.update(rest).stage, Stage::Ready);
+
+        for stage in [Stage::BrakeHold, Stage::HallRecovery] {
+            let command = Command::withheld(stage);
+            assert!(!command.energize);
+            assert_eq!(command.target_q_counts, 0);
+            assert_eq!(command.dc_current_limit_counts, 0);
+            assert_eq!(command.phase_current_limit_counts, 0);
+        }
+    }
+
+    #[test]
+    fn stage_codes_fit_the_three_bit_telemetry_field() {
+        assert_eq!(Stage::Disarmed as u8, 0);
+        assert_eq!(Stage::Coasting as u8, 5);
+        assert_eq!(Stage::BrakeHold as u8, 6);
+        assert_eq!(Stage::HallRecovery as u8, 7);
+    }
+
+    #[test]
+    fn ride_entry_and_startup_limits() {
+        assert_eq!(RIDE.startup_timeout_milliseconds, 3_500);
+        assert_eq!(RIDE.startup_forward_hall_transitions, 12);
+        assert_eq!(RIDE.startup_first_hall_timeout_milliseconds, 2_000);
+        assert_eq!(RIDE.startup_second_hall_timeout_milliseconds, 500);
+        assert_eq!(RIDE.maximum_entry_electrical_rpm, 3_000);
+        assert!(
+            RIDE.maximum_entry_electrical_rpm
+                <= crate::config::OBSERVER_BLEND_LOW_ERPM.unsigned_abs()
+        );
     }
 
     #[test]
@@ -515,24 +1154,24 @@ mod tests {
         faulted.fault_flags = 1;
         let command = controller.update(faulted);
         assert_eq!(command, Command::OFF);
-        assert!(!command.acknowledge_faults);
+        assert_eq!(command.acknowledge_fault_mask, 0);
 
         faulted.now_ms = 2;
-        assert!(!controller.update(faulted).acknowledge_faults);
+        assert_eq!(controller.update(faulted).acknowledge_fault_mask, 0);
 
         faulted.now_ms = 3;
         faulted.throttle = ThrottleObservation::invalid_acquisition(REST_ADC);
-        assert!(!controller.update(faulted).acknowledge_faults);
+        assert_eq!(controller.update(faulted).acknowledge_fault_mask, 0);
 
         faulted.now_ms = 4;
         faulted.throttle = ThrottleObservation::from_raw(REST_ADC);
         let acknowledgement = controller.update(faulted);
         assert!(!acknowledgement.energize);
-        assert!(acknowledgement.acknowledge_faults);
+        assert_ne!(acknowledgement.acknowledge_fault_mask, 0);
         assert_eq!(acknowledgement.stage, Stage::Disarmed);
 
         let ready = controller.update(observation(5, REST_ADC));
-        assert!(!ready.acknowledge_faults);
+        assert_eq!(ready.acknowledge_fault_mask, 0);
         assert_eq!(ready.stage, Stage::Ready);
     }
 
@@ -594,7 +1233,7 @@ mod tests {
                 faulted.now_ms += tick;
                 let command = controller.update(faulted);
                 let locked = attempt == u32::from(RIDE.consecutive_fault_limit);
-                assert_eq!(command.acknowledge_faults, !locked);
+                assert_eq!(command.acknowledge_fault_mask != 0, !locked);
             }
             controller.update(observation(attempt * 10 + 5, REST_ADC));
         }
@@ -651,7 +1290,10 @@ mod tests {
             assert_eq!(controller.fault_lockout(), locked);
             latched.now_ms = base + 3;
             latched.throttle = ThrottleObservation::from_raw(REST_ADC);
-            assert_eq!(controller.update(latched).acknowledge_faults, !locked);
+            assert_eq!(
+                controller.update(latched).acknowledge_fault_mask != 0,
+                !locked
+            );
             let mut rest = tripped;
             rest.now_ms = base + 4;
             rest.throttle = ThrottleObservation::from_raw(REST_ADC);
@@ -668,7 +1310,7 @@ mod tests {
             for fault in 0..u32::from(RIDE.consecutive_fault_limit) - 1 {
                 let mut faulted = observation(cycle * 100 + fault * 10, REST_ADC);
                 faulted.fault_flags = crate::safety::fault_flag::PWM_RANGE;
-                assert!(controller.update(faulted).acknowledge_faults);
+                assert_ne!(controller.update(faulted).acknowledge_fault_mask, 0);
                 controller.update(observation(cycle * 100 + fault * 10 + 1, REST_ADC));
             }
             reach_tracking(&mut controller, cycle * 100 + 50, 0);
@@ -686,7 +1328,7 @@ mod tests {
             let mut faulted = observation(attempt * 10, REST_ADC);
             faulted.fault_flags =
                 crate::safety::fault_flag::HALL_CAPTURE | crate::safety::fault_flag::CONTROL_TIMING;
-            assert!(controller.update(faulted).acknowledge_faults);
+            assert_ne!(controller.update(faulted).acknowledge_fault_mask, 0);
             controller.update(observation(attempt * 10 + 1, REST_ADC));
         }
         assert!(!controller.fault_lockout());
@@ -784,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_the_first_edge_still_obeys_the_absolute_startup_deadline() {
+    fn a_late_reverse_first_edge_still_obeys_the_absolute_startup_deadline() {
         let mut controller = RideController::new(0);
         arm(&mut controller);
 
@@ -792,8 +1434,17 @@ mod tests {
         rolling_backward.electrical_rpm = -1_000;
         assert!(controller.update(rolling_backward).energize);
 
-        let mut startup_overdue = observation(2_001, FULL_ADC);
-        startup_overdue.electrical_rpm = -100;
+        let mut reverse_edge = observation(RIDE.startup_first_hall_timeout_milliseconds, FULL_ADC);
+        reverse_edge.hall_sequence = 1;
+        reverse_edge.hall_progress = -1;
+        reverse_edge.electrical_rpm = -100;
+        assert!(controller.update(reverse_edge).energize);
+
+        let mut startup_due = reverse_edge;
+        startup_due.now_ms = RIDE.startup_timeout_milliseconds;
+        assert!(controller.update(startup_due).energize);
+        let mut startup_overdue = startup_due;
+        startup_overdue.now_ms += 1;
         assert_eq!(controller.update(startup_overdue), Command::OFF);
     }
 
@@ -845,7 +1496,7 @@ mod tests {
         reverse_edge.hall_progress = -1;
         assert!(controller.update(reverse_edge).energize);
 
-        let mut startup_overdue = observation(2_001, FULL_ADC);
+        let mut startup_overdue = observation(1 + RIDE.startup_timeout_milliseconds, FULL_ADC);
         startup_overdue.hall_sequence = 1;
         startup_overdue.hall_progress = -1;
         assert_eq!(controller.update(startup_overdue), Command::OFF);
@@ -859,13 +1510,13 @@ mod tests {
         let mut tracking = observation(20, FULL_ADC);
         tracking.hall_sequence = 12;
         tracking.hall_progress = 12;
-        tracking.electrical_rpm = 3_000;
+        tracking.electrical_rpm = RIDE.maximum_entry_electrical_rpm as i32 + 500;
         assert_eq!(controller.update(tracking).stage, Stage::Tracking);
 
         let mut coast = observation(21, REST_ADC);
         coast.hall_sequence = 12;
         coast.hall_progress = 12;
-        coast.electrical_rpm = 3_000;
+        coast.electrical_rpm = RIDE.maximum_entry_electrical_rpm as i32 + 500;
         let command = controller.update(coast);
         assert!(command.energize);
         assert_eq!(command.target_q_counts, 0);
@@ -873,12 +1524,12 @@ mod tests {
 
         let mut stopped = coast;
         stopped.now_ms = 22;
-        stopped.electrical_rpm = 2_500;
+        stopped.electrical_rpm = RIDE.maximum_entry_electrical_rpm as i32;
         assert_eq!(controller.update(stopped), Command::OFF);
     }
 
     #[test]
-    fn high_speed_brake_uses_energized_zero_current_coast() {
+    fn high_speed_brake_coasts_energized_then_holds_until_release() {
         let mut controller = RideController::new(0);
         arm(&mut controller);
         controller.update(observation(1, FULL_ADC));
@@ -898,7 +1549,17 @@ mod tests {
 
         braking.now_ms = 22;
         braking.electrical_rpm = RIDE.maximum_entry_electrical_rpm as i32;
-        assert_eq!(controller.update(braking), Command::OFF);
+        assert_eq!(
+            controller.update(braking),
+            Command::withheld(Stage::BrakeHold)
+        );
+
+        let mut released = braking;
+        released.now_ms = 23;
+        released.brake_active = false;
+        let command = controller.update(released);
+        assert!(command.energize);
+        assert_eq!(command.stage, Stage::AwaitingFirstEdge);
     }
 
     #[test]

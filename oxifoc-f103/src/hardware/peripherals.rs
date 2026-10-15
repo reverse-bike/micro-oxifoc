@@ -635,7 +635,10 @@ fn latch_fault(fault: u32) {
     disable_motor_outputs();
 }
 
-pub fn acknowledge_faults() -> bool {
+/// Clears the latched faults only while they are exactly `expected_faults`,
+/// the mask the caller observed and chose to acknowledge. A fault latched
+/// since that observation leaves every latch in place and returns false.
+pub fn acknowledge_faults(expected_faults: u32) -> bool {
     disable_motor_outputs();
     if fault_flags() == 0 {
         return true;
@@ -644,10 +647,15 @@ pub fn acknowledge_faults() -> bool {
         return false;
     }
     cortex_m::interrupt::free(|_| {
-        if break_input_active() {
+        let previous_faults = fault_flags();
+        if break_input_active()
+            || !crate::safety::fault_flag::acknowledgement_permitted(
+                previous_faults,
+                expected_faults,
+            )
+        {
             return false;
         }
-        let previous_faults = fault_flags();
         // SAFETY: motor outputs and interrupts are disabled while the stale
         // break flag is cleared and its interrupt is rearmed.
         unsafe {
@@ -760,23 +768,22 @@ fn TIM2() {
         if status & TIM2_UIF != 0 {
             TIM2_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         }
-        let invalid_capture = status & TIM2_OVERCAPTURE_FLAGS != 0
-            || status & TIM2_CAPTURE_FLAGS == TIM2_CAPTURE_FLAGS;
-        let captured = if status & TIM2_CC1IF != 0 {
-            Some(read_volatile(TIM2_CCR1) & 0xffff)
-        } else if status & TIM2_CC2IF != 0 {
-            Some(read_volatile(TIM2_CCR2) & 0xffff)
-        } else {
-            None
+        // Each capture holds the time since the previous XOR edge, so two
+        // pending captures together span both edges since the last one
+        // published. They are published as one edge at the live Hall state;
+        // a rising-and-falling pair on one line returns to the same state.
+        let captured = match status & TIM2_CAPTURE_FLAGS {
+            TIM2_CAPTURE_FLAGS => {
+                Some((read_volatile(TIM2_CCR1) & 0xffff) + (read_volatile(TIM2_CCR2) & 0xffff))
+            }
+            TIM2_CC1IF => Some(read_volatile(TIM2_CCR1) & 0xffff),
+            TIM2_CC2IF => Some(read_volatile(TIM2_CCR2) & 0xffff),
+            _ => None,
         };
         write_volatile(
             TIM2_SR,
             !(status & (TIM2_UIF | TIM2_CAPTURE_FLAGS | TIM2_OVERCAPTURE_FLAGS)),
         );
-        if invalid_capture {
-            latch_fault(FAULT_HALL_CAPTURE);
-            return;
-        }
         if let Some(captured_ticks) = captured {
             let overflows = TIM2_OVERFLOWS.swap(0, Ordering::Relaxed);
             let interval_us = overflows
@@ -784,7 +791,15 @@ fn TIM2() {
                 .saturating_add(captured_ticks);
             HALL_RAW.store(read_hall_pins(), Ordering::Relaxed);
             HALL_INTERVAL_US.store(interval_us, Ordering::Relaxed);
-            HALL_SEQUENCE.fetch_add(1, Ordering::Release);
+            // An overcapture lost at least one edge and its interval. The
+            // sequence gap makes the control pass resynchronise to the live
+            // state near standstill or latch a Hall-capture fault in motion.
+            let edges = if status & TIM2_OVERCAPTURE_FLAGS != 0 {
+                2
+            } else {
+                1
+            };
+            HALL_SEQUENCE.fetch_add(edges, Ordering::Release);
         }
     }
 }

@@ -19,6 +19,9 @@ pub const DC_BUS_OVERVOLTAGE_HYSTERESIS_MV: u32 =
 /// sample is one analog sample period.
 pub const DC_BUS_OVERVOLTAGE_SAMPLES: u8 =
     (BIKE_CONFIG.battery.overvoltage_debounce_milliseconds / ANALOG_SAMPLE_PERIOD_MS) as u8;
+/// Consecutive envelope evaluations without complete local readings before
+/// the limits are withdrawn; shorter gaps keep the last valid limits.
+pub const MISSING_DATA_EVALUATIONS: u8 = BIKE_CONFIG.sensors.local_data_missing_evaluations;
 /// Q16 thermal fraction granting the full current ceiling.
 pub const THERMAL_FRACTION_ONE: u32 = 1 << 16;
 pub const CONTROLLER_DERATE_START_DECI_C: i16 =
@@ -51,6 +54,7 @@ const _: () = assert!(
 );
 const _: () = assert!(RIDE_DC_BUS_TRANSIENT_DURATION_MS <= u16::MAX as u32);
 const _: () = assert!(TRANSIENT_BUDGET_CAPACITY > 0);
+const _: () = assert!(MISSING_DATA_EVALUATIONS > 0);
 
 pub mod reason {
     pub const CONTROLLER_TEMPERATURE: u8 = 1;
@@ -80,6 +84,7 @@ pub struct EnvironmentMonitor {
     overvoltage_active: bool,
     last_overvoltage_sample_ms: u32,
     last_update_ms: u32,
+    missing_evaluations: u8,
     latest_limit: Option<u16>,
     phase_current_limit: u16,
     derating_reasons: u8,
@@ -96,6 +101,7 @@ impl EnvironmentMonitor {
             overvoltage_active: false,
             last_overvoltage_sample_ms: now_ms.wrapping_sub(1),
             last_update_ms: now_ms.wrapping_sub(UPDATE_PERIOD_MS),
+            missing_evaluations: 0,
             latest_limit: None,
             phase_current_limit: 0,
             derating_reasons: reason::LOCAL_DATA_MISSING,
@@ -121,13 +127,35 @@ impl EnvironmentMonitor {
             return self.limit();
         }
         self.last_update_ms = now_ms;
-        self.latest_limit = None;
-        self.phase_current_limit = 0;
-        self.derating_reasons = reason::LOCAL_DATA_MISSING;
+        if self
+            .evaluate(sensors, bus_voltage, projected_dc_current_counts)
+            .is_some()
+        {
+            self.missing_evaluations = 0;
+        } else {
+            self.missing_evaluations = self.missing_evaluations.saturating_add(1);
+            if self.latest_limit.is_some() && self.missing_evaluations < MISSING_DATA_EVALUATIONS {
+                self.derating_reasons |= reason::LOCAL_DATA_MISSING;
+            } else {
+                self.latest_limit = None;
+                self.phase_current_limit = 0;
+                self.derating_reasons = reason::LOCAL_DATA_MISSING;
+            }
+        }
+        self.limit()
+    }
+
+    /// Publishes new limits from one complete set of local readings, or
+    /// returns `None` without changing them when a reading is missing.
+    fn evaluate(
+        &mut self,
+        sensors: RawLocalSensors,
+        bus_voltage: u32,
+        projected_dc_current_counts: u16,
+    ) -> Option<()> {
         if !sensors.valid {
             return None;
         }
-
         self.update_undervoltage(bus_voltage);
         let motor_temperature = motor_temperature_deci_c(sensors.motor_temperature_adc)?;
         let controller_temperature =
@@ -165,12 +193,13 @@ impl EnvironmentMonitor {
         }
         self.derating_reasons = reasons;
         self.latest_limit = Some(limit);
-        self.limit()
+        Some(())
     }
 
-    /// Overvoltage is applied on every 1 ms pass over the 50 ms envelope.
+    /// Overvoltage is applied on every 1 ms pass over the 50 ms envelope, and
+    /// undervoltage as soon as it asserts, including over held limits.
     fn limit(&self) -> Option<u16> {
-        if self.overvoltage_active {
+        if self.overvoltage_active || self.undervoltage_active {
             self.latest_limit.map(|_| 0)
         } else {
             self.latest_limit
@@ -191,11 +220,14 @@ impl EnvironmentMonitor {
     }
 
     pub const fn derating_reasons(&self) -> u8 {
+        let mut reasons = self.derating_reasons;
         if self.overvoltage_active {
-            self.derating_reasons | reason::DC_BUS_OVERVOLTAGE
-        } else {
-            self.derating_reasons
+            reasons |= reason::DC_BUS_OVERVOLTAGE;
         }
+        if self.undervoltage_active {
+            reasons |= reason::DC_BUS_UNDERVOLTAGE;
+        }
+        reasons
     }
 
     /// Remaining time at the full transient-minus-continuous current excess.
@@ -559,11 +591,103 @@ mod tests {
             / u32::from(RIDE_PHASE_CURRENT_LIMIT_COUNTS);
         assert!(u32::from(limit).abs_diff(expected) <= 1);
 
+        for evaluation in 2..1 + u32::from(MISSING_DATA_EVALUATIONS) {
+            assert_eq!(
+                monitor.update(evaluation * UPDATE_PERIOD_MS, RawLocalSensors::default(), 0),
+                Some(limit)
+            );
+            assert_eq!(monitor.phase_current_limit_counts(), phase_limit);
+        }
         assert_eq!(
-            monitor.update(2 * UPDATE_PERIOD_MS, RawLocalSensors::default(), 0),
+            monitor.update(
+                (1 + u32::from(MISSING_DATA_EVALUATIONS)) * UPDATE_PERIOD_MS,
+                RawLocalSensors::default(),
+                0
+            ),
             None
         );
         assert_eq!(monitor.phase_current_limit_counts(), 0);
+    }
+
+    #[test]
+    fn brief_missing_local_data_holds_the_last_valid_limits() {
+        assert_eq!(MISSING_DATA_EVALUATIONS, 3);
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut now = 0;
+        let mut evaluate = |monitor: &mut EnvironmentMonitor, sensors| {
+            let limit = monitor.update(now, sensors, 0);
+            now += UPDATE_PERIOD_MS;
+            limit
+        };
+        let mut out_of_range = nominal();
+        out_of_range.motor_temperature_adc = 3_200;
+        for missing in [RawLocalSensors::default(), out_of_range] {
+            assert_eq!(
+                evaluate(&mut monitor, nominal()),
+                Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+            );
+            for _ in 1..MISSING_DATA_EVALUATIONS {
+                assert_eq!(
+                    evaluate(&mut monitor, missing),
+                    Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+                );
+                assert_eq!(
+                    monitor.phase_current_limit_counts(),
+                    RIDE_PHASE_CURRENT_LIMIT_COUNTS
+                );
+                assert_ne!(monitor.derating_reasons() & reason::LOCAL_DATA_MISSING, 0);
+            }
+            // A valid evaluation restarts the count.
+            assert_eq!(
+                evaluate(&mut monitor, nominal()),
+                Some(RIDE_DC_BUS_TRANSIENT_LIMIT_COUNTS)
+            );
+            assert_eq!(monitor.derating_reasons(), 0);
+            for _ in 1..MISSING_DATA_EVALUATIONS {
+                assert!(evaluate(&mut monitor, missing).is_some());
+            }
+            assert_eq!(evaluate(&mut monitor, missing), None);
+            assert_eq!(monitor.phase_current_limit_counts(), 0);
+            assert_eq!(monitor.derating_reasons(), reason::LOCAL_DATA_MISSING);
+        }
+    }
+
+    #[test]
+    fn held_limits_still_obey_an_overvoltage_cutoff() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut now = 0;
+        assert!(observe_sample(&mut monitor, &mut now, nominal()).is_some());
+        let mut high = nominal();
+        high.bus_voltage_adc = bus_adc(DC_BUS_OVERVOLTAGE_MV + 100);
+        high.motor_temperature_adc = 3_200;
+        for _ in 0..DC_BUS_OVERVOLTAGE_SAMPLES {
+            observe_sample(&mut monitor, &mut now, high);
+        }
+        assert!(monitor.overvoltage_active());
+        while now < UPDATE_PERIOD_MS * u32::from(MISSING_DATA_EVALUATIONS) {
+            assert_eq!(observe_sample(&mut monitor, &mut now, high), Some(0));
+        }
+    }
+
+    #[test]
+    fn held_limits_still_obey_an_undervoltage_cutoff() {
+        let mut monitor = EnvironmentMonitor::new(0);
+        let mut low = nominal();
+        low.bus_voltage_adc = 2_000;
+        for sample in 0..u32::from(DC_BUS_UNDERVOLTAGE_SAMPLES) - 1 {
+            assert_ne!(monitor.update(sample * UPDATE_PERIOD_MS, low, 0), Some(0));
+        }
+        assert!(!monitor.undervoltage_active());
+        let mut low_without_motor_temperature = low;
+        low_without_motor_temperature.motor_temperature_adc = 3_200;
+        let asserted_at = u32::from(DC_BUS_UNDERVOLTAGE_SAMPLES - 1) * UPDATE_PERIOD_MS;
+        assert_eq!(
+            monitor.update(asserted_at, low_without_motor_temperature, 0),
+            Some(0)
+        );
+        assert!(monitor.undervoltage_active());
+        assert_ne!(monitor.derating_reasons() & reason::DC_BUS_UNDERVOLTAGE, 0);
+        assert_eq!(monitor.update(asserted_at + 1, low, 0), Some(0));
     }
 
     #[test]

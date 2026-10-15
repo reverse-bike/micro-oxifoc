@@ -1,5 +1,7 @@
 //! Motor-control policy and the synchronous FOC interrupt.
 
+#[cfg(any(feature = "firmware", test))]
+use oxifoc_core::foc::hall_sensor::HallEdge;
 use oxifoc_core::foc::{Fixed, FocController, NoDecoupling, PIController};
 use oxifoc_core::foc::{hall_sensor::HallSensor, phase::PhaseManager};
 use oxifoc_core::motor::foc_driver::{CurrentLimits, FieldWeakening, FocDriver};
@@ -117,6 +119,44 @@ pub(crate) const fn stationary_phase_recovery_allowed(
     estimate_missing && motor_outputs_disabled
 }
 
+/// Missed Hall edges are resynchronised to the live Hall state, rather than
+/// latched as a capture fault, while the motor is undriven or its estimate
+/// holds the sector center; the live sector is then the whole estimate. The
+/// resynchronisation is published as [`HallEdge::Chatter`]; `None` latches
+/// the fault.
+#[cfg(any(feature = "firmware", test))]
+pub(crate) const fn missed_hall_edges_resynchronisation(
+    output_was_active: bool,
+    holds_sector_center: bool,
+) -> Option<HallEdge> {
+    if !output_was_active || holds_sector_center {
+        Some(HallEdge::Chatter)
+    } else {
+        None
+    }
+}
+
+/// What an accepted Hall edge publishes to the ride path.
+#[cfg(any(feature = "firmware", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HallEdgePublication {
+    /// Advances the published Hall sequence, which renews ride Hall deadlines.
+    pub renews_sequence: bool,
+    /// Publishes the progress step, sector interval, and speed.
+    pub updates_estimate: bool,
+}
+
+/// Only a transition counts as ride Hall progress. Chatter and
+/// resynchronisation keep the progress sum consistent without renewing ride
+/// deadlines; a repeated raw state publishes nothing.
+#[cfg(any(feature = "firmware", test))]
+pub(crate) const fn hall_edge_publication(edge: HallEdge) -> HallEdgePublication {
+    HallEdgePublication {
+        renews_sequence: matches!(edge, HallEdge::Transition),
+        updates_estimate: !matches!(edge, HallEdge::Repeated),
+    }
+}
+
 #[cfg(any(feature = "firmware", test))]
 #[inline]
 pub(crate) const fn observer_diagnostic_schedule(
@@ -137,15 +177,16 @@ pub mod ride;
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTUATION_ADVANCE_Q12_PER_ERPM, RideFocDriver, actuation_advance_from_erpm,
-        apply_ride_current_ceilings, observer_diagnostic_schedule, ride_foc_driver,
+        ACTUATION_ADVANCE_Q12_PER_ERPM, HallEdgePublication, RideFocDriver,
+        actuation_advance_from_erpm, apply_ride_current_ceilings, hall_edge_publication,
+        missed_hall_edges_resynchronisation, observer_diagnostic_schedule, ride_foc_driver,
         stationary_phase_recovery_allowed,
     };
     use crate::config as cfg;
     use crate::sensors::environment::{self, EnvironmentMonitor, RawLocalSensors};
     use oxifoc_core::foc::{
         Dq, Fixed,
-        hall_sensor::HallSensor,
+        hall_sensor::{HallEdge, HallSensor},
         phase::{PhaseEstimate, PhaseManager},
     };
 
@@ -307,6 +348,51 @@ mod tests {
         assert!(stationary_phase_recovery_allowed(true, true));
         assert!(!stationary_phase_recovery_allowed(false, true));
         assert!(!stationary_phase_recovery_allowed(true, false));
+    }
+
+    #[test]
+    fn missed_hall_edges_resynchronise_only_undriven_or_below_center_snap_speed() {
+        assert_eq!(
+            missed_hall_edges_resynchronisation(false, false),
+            Some(HallEdge::Chatter)
+        );
+        assert_eq!(
+            missed_hall_edges_resynchronisation(false, true),
+            Some(HallEdge::Chatter)
+        );
+        assert_eq!(
+            missed_hall_edges_resynchronisation(true, true),
+            Some(HallEdge::Chatter)
+        );
+        assert_eq!(missed_hall_edges_resynchronisation(true, false), None);
+    }
+
+    #[test]
+    fn only_a_real_transition_renews_the_ride_hall_sequence() {
+        assert_eq!(
+            hall_edge_publication(HallEdge::Transition),
+            HallEdgePublication {
+                renews_sequence: true,
+                updates_estimate: true,
+            }
+        );
+        let resynchronised = missed_hall_edges_resynchronisation(false, false).unwrap();
+        for edge in [HallEdge::Chatter, resynchronised] {
+            assert_eq!(
+                hall_edge_publication(edge),
+                HallEdgePublication {
+                    renews_sequence: false,
+                    updates_estimate: true,
+                }
+            );
+        }
+        assert_eq!(
+            hall_edge_publication(HallEdge::Repeated),
+            HallEdgePublication {
+                renews_sequence: false,
+                updates_estimate: false,
+            }
+        );
     }
 
     #[test]

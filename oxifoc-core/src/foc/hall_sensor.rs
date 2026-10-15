@@ -4,6 +4,9 @@ use crate::foc::phase::{PhaseEstimate, PhaseProvider, PhaseSource};
 use crate::foc::trig::Turns;
 
 const MIN_EDGE_INTERVAL_US: u32 = 100;
+/// A reversal back into the sector just left within this time, while the
+/// estimate holds the sector center, is contact or noise chatter.
+const CHATTER_WINDOW_US: u32 = 1_000;
 const STALE_SECTOR_MULTIPLE: u32 = 8;
 const RATE_LIMIT_MIN_ERPM: u32 = 500;
 const Q16_TURN_UNITS: u32 = 1 << 16;
@@ -133,6 +136,20 @@ pub enum HallError {
     EdgeTooFast,
 }
 
+/// Classification of an accepted Hall edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HallEdge {
+    /// The raw state did not change; position, direction, and speed are kept.
+    Repeated,
+    /// The motor entered an adjacent sector.
+    Transition,
+    /// A return into the sector just left within 1 ms while the estimate
+    /// holds the sector center. The sensor holds the sector center with unknown
+    /// speed, and [`HallSensor::physical_direction`] is the step back, so the
+    /// excursion and its return cancel in any accumulated progress.
+    Chatter,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HallSensor {
     geometry: &'static HallGeometry,
@@ -194,16 +211,17 @@ impl HallSensor {
         self.next_interval_since_run_start = true;
     }
 
-    pub fn update_edge(&mut self, raw: u8, interval_us: u32) -> Result<(), HallError> {
+    pub fn update_edge(&mut self, raw: u8, interval_us: u32) -> Result<HallEdge, HallError> {
         let Some(entered_sector) = self.geometry.sector(raw) else {
             self.valid = false;
             return Err(HallError::InvalidState);
         };
         if !self.valid {
-            return self.seed(raw);
+            self.seed(raw)?;
+            return Ok(HallEdge::Transition);
         }
         if raw == self.raw {
-            return Ok(());
+            return Ok(HallEdge::Repeated);
         }
 
         let previous_raw = self.raw;
@@ -223,6 +241,10 @@ impl HallSensor {
             self.valid = false;
             return Err(HallError::InvalidTransition);
         };
+        let chatter = previous_direction != 0
+            && direction != previous_direction
+            && interval_us < CHATTER_WINDOW_US
+            && self.holds_sector_center();
         let boundary_q16 = if direction < 0 {
             entered_sector
                 .boundary_q16
@@ -230,7 +252,9 @@ impl HallSensor {
         } else {
             entered_sector.boundary_q16
         };
-        let (measured_interval_us, measured_width_q16) = if interval_since_run_start {
+        let (measured_interval_us, measured_width_q16) = if chatter {
+            (0, previous_width)
+        } else if interval_since_run_start {
             if previous_direction == direction && self.measured_interval_us != 0 {
                 (self.measured_interval_us, self.measured_width_q16)
             } else {
@@ -250,7 +274,8 @@ impl HallSensor {
         } else {
             (interval_us, previous_width)
         };
-        if (previous_direction != 0 || interval_since_run_start)
+        if !chatter
+            && (previous_direction != 0 || interval_since_run_start)
             && measured_interval_us < MIN_EDGE_INTERVAL_US
         {
             self.valid = false;
@@ -263,7 +288,7 @@ impl HallSensor {
         self.entered_width_q16 = entered_sector.width_q16;
         // A turnaround recrosses one boundary; its edge-to-edge time is not
         // the traversal time of the sector that was only partly entered.
-        if previous_direction != direction && !interval_since_run_start {
+        if chatter || (previous_direction != direction && !interval_since_run_start) {
             self.entered_duration_us = 0;
             self.measured_interval_us = 0;
         } else {
@@ -277,7 +302,17 @@ impl HallSensor {
         }
         self.direction = direction;
         self.refresh_control_rate(self.control_period_ns);
-        Ok(())
+        Ok(if chatter {
+            HallEdge::Chatter
+        } else {
+            HallEdge::Transition
+        })
+    }
+
+    /// True while the angle estimate is the live sector center: no measured
+    /// speed, or a sector traversal slower than the center-snap speed.
+    pub fn holds_sector_center(&self) -> bool {
+        self.entered_duration_us == 0 || self.entered_duration_us > self.center_snap_after_us()
     }
 
     pub fn angle(&self, edge_age_us: u32) -> Option<Turns> {
@@ -729,10 +764,97 @@ mod tests {
     fn in_run_reversal_keeps_the_minimum_edge_interval_check() {
         let mut hall = tracker();
         hall.seed(5).unwrap();
-        hall.update_edge(1, 30_303).unwrap();
-        hall.update_edge(3, 30_303).unwrap();
+        hall.update_edge(1, 3_000).unwrap();
+        hall.update_edge(3, 3_000).unwrap();
+        assert!(!hall.holds_sector_center());
 
         assert_eq!(hall.update_edge(1, 99), Err(HallError::EdgeTooFast));
+        assert!(!hall.is_valid());
+    }
+
+    #[test]
+    fn moving_reversal_inside_the_chatter_window_is_a_normal_turnaround() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(1, 3_000).unwrap();
+        hall.update_edge(3, 3_000).unwrap();
+
+        assert_eq!(hall.update_edge(1, 500), Ok(HallEdge::Transition));
+        assert_eq!(hall.angle_direction(), -1);
+        assert!(hall.is_stationary());
+    }
+
+    #[test]
+    fn standstill_chatter_back_to_the_previous_state_is_not_a_fault() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        assert!(hall.holds_sector_center());
+        assert_eq!(hall.update_edge(4, 40_000), Ok(HallEdge::Transition));
+        let departure = hall.physical_direction();
+        assert_ne!(departure, 0);
+
+        assert_eq!(hall.update_edge(5, 40), Ok(HallEdge::Chatter));
+        assert!(hall.is_valid());
+        assert_eq!(hall.raw_state(), 5);
+        assert_eq!(hall.physical_direction(), -departure);
+        assert!(hall.is_stationary());
+        assert_eq!(hall.electrical_rpm(), 0);
+        let center = u32::from(TEST_GEOMETRY.sector(5).unwrap().center_q16()) << 16;
+        assert_eq!(hall.angle(0), Some(center));
+
+        assert_eq!(hall.update_edge(4, 30), Ok(HallEdge::Chatter));
+        assert_eq!(hall.physical_direction(), departure);
+        assert_eq!(hall.update_edge(5, 30), Ok(HallEdge::Chatter));
+        assert_eq!(hall.raw_state(), 5);
+        assert!(hall.is_stationary());
+    }
+
+    #[test]
+    fn creeping_chatter_inside_the_center_snap_speed_is_not_a_fault() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 200_000).unwrap();
+        hall.update_edge(6, 200_000).unwrap();
+        assert!(hall.holds_sector_center());
+
+        assert_eq!(hall.update_edge(4, 20), Ok(HallEdge::Chatter));
+        assert!(hall.is_valid());
+        assert!(hall.is_stationary());
+        assert_eq!(hall.update_edge(6, 20), Ok(HallEdge::Chatter));
+    }
+
+    #[test]
+    fn a_standstill_reversal_after_the_chatter_window_is_a_transition() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 40_000).unwrap();
+        assert_eq!(
+            hall.update_edge(5, CHATTER_WINDOW_US),
+            Ok(HallEdge::Transition)
+        );
+    }
+
+    #[test]
+    fn chatter_after_a_run_start_does_not_derive_a_speed() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        hall.update_edge(4, 40_000).unwrap();
+        hall.discard_next_interval();
+
+        assert_eq!(hall.update_edge(5, 40), Ok(HallEdge::Chatter));
+        assert!(hall.is_stationary());
+        assert_eq!(hall.electrical_rpm(), 0);
+    }
+
+    #[test]
+    fn a_repeated_state_and_invalid_states_are_reported() {
+        let mut hall = tracker();
+        hall.seed(5).unwrap();
+        assert_eq!(hall.update_edge(5, 10), Ok(HallEdge::Repeated));
+        assert_eq!(hall.update_edge(0, 10_000), Err(HallError::InvalidState));
+        assert!(!hall.is_valid());
+        hall.seed(5).unwrap();
+        assert_eq!(hall.update_edge(7, 10_000), Err(HallError::InvalidState));
         assert!(!hall.is_valid());
     }
 

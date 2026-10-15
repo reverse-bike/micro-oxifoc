@@ -8,6 +8,7 @@ use super::{
     RideFocDriver, actuation_advance_from_erpm, apply_ride_current_ceilings, ride_foc_driver,
 };
 use crate::hardware::peripherals::{self as hardware, CurrentOffsets};
+use crate::safety::SafetyLossReason;
 use oxifoc_core::foc::{
     Dq, Fixed,
     hall_sensor::HallSensor,
@@ -41,23 +42,6 @@ struct IsrCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for IsrCell<T> {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(u8)]
-pub enum SafetyLossReason {
-    #[default]
-    None = 0,
-    ControlTiming = 1,
-    CurrentSample = 2,
-    PhaseOvercurrent = 3,
-    HallCaptureSequence = 4,
-    HallTransition = 5,
-    HallStationaryMismatch = 6,
-    PhaseEstimate = 7,
-    HardwareFault = 8,
-    OutputLease = 9,
-    PwmOutput = 10,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
     pub hall_valid: bool,
     pub current_valid: bool,
@@ -67,6 +51,7 @@ pub struct Snapshot {
     pub applied_d_ticks: i16,
     pub applied_q_ticks: i16,
     pub safety_events: u32,
+    pub last_safety_loss_reason: u8,
     pub phase_current_trips: u32,
     pub hall_sequence: u32,
     pub hall_interval_us: u32,
@@ -138,6 +123,7 @@ struct RuntimeSnapshotRaw {
     measured_current: Dq,
     applied_voltage: Dq,
     safety_events: u32,
+    last_safety_loss_reason: u8,
     phase_current_trips: u32,
     hall_sequence: u32,
     hall_interval_us: u32,
@@ -286,6 +272,7 @@ pub fn snapshot() -> Snapshot {
                 measured_current: diagnostics.measured_current,
                 applied_voltage: diagnostics.applied_voltage,
                 safety_events: diagnostics.safety_events,
+                last_safety_loss_reason: diagnostics.last_safety_loss_reason,
                 phase_current_trips: diagnostics.phase_current_trips,
                 hall_sequence: diagnostics.hall_sequence,
                 hall_interval_us: diagnostics.hall_interval_us,
@@ -307,6 +294,7 @@ pub fn snapshot() -> Snapshot {
         applied_d_ticks: fixed_to_i16(raw.applied_voltage.d),
         applied_q_ticks: fixed_to_i16(raw.applied_voltage.q),
         safety_events: raw.safety_events,
+        last_safety_loss_reason: raw.last_safety_loss_reason,
         phase_current_trips: raw.phase_current_trips,
         hall_sequence: raw.hall_sequence,
         hall_interval_us: raw.hall_interval_us,
@@ -516,34 +504,44 @@ fn control_cycle() {
     let (sequence, raw, interval_us) = hardware::hall_edge_snapshot();
     let hall_edge_updated = sequence != state.hardware_hall_sequence;
     if hall_edge_updated {
-        if state.hardware_hall_sequence != 0
+        let hall = state.driver.phase_mut().hall_mut();
+        let edge = if state.hardware_hall_sequence != 0
             && sequence.wrapping_sub(state.hardware_hall_sequence) != 1
         {
-            hardware::latch_hall_capture_fault();
-            publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, false);
-            stop_control(state, Some(SafetyLossReason::HallCaptureSequence));
-            return;
-        }
-        state.hardware_hall_sequence = sequence;
-        if state
-            .driver
-            .phase_mut()
-            .hall_mut()
-            .update_edge(raw, interval_us)
-            .is_err()
-        {
+            match super::missed_hall_edges_resynchronisation(
+                output_was_active,
+                hall.holds_sector_center(),
+            ) {
+                Some(edge) if hall.seed(raw).is_ok() => edge,
+                _ => {
+                    hardware::latch_hall_capture_fault();
+                    publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, false);
+                    stop_control(state, Some(SafetyLossReason::HallCaptureSequence));
+                    return;
+                }
+            }
+        } else if let Ok(edge) = hall.update_edge(raw, interval_us) {
+            edge
+        } else {
             publish_flag(&mut state.diagnostics, CONTROL_HALL_VALID, false);
             stop_control(state, Some(SafetyLossReason::HallTransition));
             return;
-        }
+        };
+        state.hardware_hall_sequence = sequence;
         state.hall_recovery_cycles = 0;
-        state.diagnostics.hall_sequence = sequence;
-        state.diagnostics.hall_interval_us = state.driver.phase().hall().sector_interval_us();
-        state.diagnostics.hall_progress = state
-            .diagnostics
-            .hall_progress
-            .wrapping_add(i32::from(state.driver.phase().hall().physical_direction()));
-        state.diagnostics.electrical_rpm = state.driver.phase().hall().electrical_rpm();
+        let publication = super::hall_edge_publication(edge);
+        if publication.renews_sequence {
+            state.diagnostics.hall_sequence = sequence;
+        }
+        if publication.updates_estimate {
+            let hall = state.driver.phase().hall();
+            state.diagnostics.hall_interval_us = hall.sector_interval_us();
+            state.diagnostics.hall_progress = state
+                .diagnostics
+                .hall_progress
+                .wrapping_add(i32::from(hall.physical_direction()));
+            state.diagnostics.electrical_rpm = hall.electrical_rpm();
+        }
     }
     let command_started = command_enabled && !state.command_was_enabled;
     if command_started && state.driver.phase().hall().is_stationary() {

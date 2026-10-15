@@ -147,7 +147,14 @@ for this controller family.
   commutation snaps to the calibrated center of the live Hall sector; above
   that threshold, boundary corrections are rate-limited to 1.5 times the
   measured per-cycle angle travel rather than being applied as a single
-  transform-frame jump.
+  transform-frame jump. Two pending captures are published as one edge at the
+  live Hall state; an overcapture is published as a sequence gap. The control
+  pass resynchronises a sequence gap to the live state while the motor is
+  undriven or below the center-snap speed and otherwise latches a Hall-capture
+  fault. Below that speed, a return into the sector just left within 1 ms is
+  chatter: the estimate holds the sector center with unknown speed, the
+  progress sum nets to zero, and ride Hall deadlines are not renewed. Invalid
+  raw states (0 or 7) and stale estimates remain faults.
 - TIM3 captures the PB4 wheel input. Its qualified speed and volatile distance
   feed stock CAN telemetry; its independent quiet state is required for an
   updater reset.
@@ -182,13 +189,33 @@ regular DMA scan is:
 
 The active-low brake input is PC4 with a pull-up and four matching 1 kHz
 samples. Throttle is plausible at 250--3,750 ADC counts, is at rest through
-850, and reaches full demand at 3,252. At high speed, brake enters the same
-energized zero-q coast as throttle release so field weakening can unwind with
-voltage headroom; at or below 2,500 eRPM it disarms. Boot-high, invalid
-acquisition, current trip, Hall loss, or another safety loss disarms the ride
-path until a fresh valid rest sample is observed. A latched hardware fault is
-acknowledged only in a throttle-rest pass, after ride authority is revoked,
-and only while PB12 is inactive; that pass cannot energize the motor.
+850, and reaches full demand at 3,252. Brake removes torque immediately. Above
+3,000 eRPM it enters the same energized zero-q coast as throttle release so
+field weakening can unwind with voltage headroom. At or below 3,000 eRPM,
+during startup, or before a run, it holds the ride armed with the motor
+channels disabled; a Hall timeout while braking also holds. Releasing the
+brake needs no throttle rest sample when nothing else has interrupted the
+ride: a coast returns to tracking, and a hold returns to ready or, with
+throttle or cadence demand present and the entry-speed limit met, straight
+into a fresh startup sequence.
+
+Boot, invalid acquisition, current or environment loss, a latched power-stage
+or timing fault, or a safety loss other than a Hall interruption disarms the
+ride path until a fresh valid rest sample is observed, including when it
+happens while braking. A rest sample seen while braking arms the release.
+Pedaling does not block arming: throttle rest alone arms, and cadence demand
+then starts a run. A safety loss caused only by the Hall (page-12 reasons 4--6,
+or a lone Hall-capture fault) after the ride has armed re-arms without a rest
+sample once the Hall has stayed valid for 250 ms with the output off, at most
+twice per throttle press; a valid rest sample restores both retries. A retry is
+spent only when it starts a run, so a recovery held by the brake or the entry
+speed limit costs none until the run begins. Such a Hall-capture fault is
+acknowledged without rest while a retry remains. Any other latched hardware
+fault is acknowledged only in a throttle-rest pass, after ride authority is
+revoked, and only while PB12 is inactive; that pass cannot energize the motor.
+An acknowledgement names the fault mask its ride pass observed and clears the
+latches only while they still hold exactly that mask; a fault latched in
+between stays latched for the next pass to observe.
 Three consecutive power-stage faults (a hardware break or PWM-range latch, or a
 software phase-overcurrent trip) without reaching normal Hall tracking in
 between stop acknowledgement and arming until the next reset. At most one
@@ -222,15 +249,26 @@ the directly wired inputs and local protection state.
 Forward torque is negative q. Demand increases by eight current counts per
 millisecond and reductions apply immediately. The ride ceiling is 900 phase-
 current counts (90.0 A at the loaded-run fit of 100 mA/count), including during
-the two-second startup window. Startup requires its first Hall edge within 500
-ms and twelve net-forward Hall transitions. While measured startup progress is
-negative, the absolute two-second deadline allows the wheel to decelerate
-through the no-edge interval at zero speed; the ordinary edge deadline resumes
-as soon as progress recovers to the starting position. The software phase-
+the 3.5-second startup window. A run may start at up to 3,000 eRPM, the
+observer blend start, so every start commutates on Hall alone. A run waits at
+most 2 s for its first Hall edge, commutating on the seeded sector; that wait
+covers a hill-start rollback that reverses within one sector and bounds how
+long a stalled motor or dead Hall sensor stays energized. After the first edge,
+the next must arrive within 500 ms, and twelve net-forward Hall transitions
+must complete within the absolute 3.5-second startup deadline. While measured
+startup progress is negative, only the absolute deadline applies, allowing the
+wheel to decelerate through the no-edge interval at zero speed; the ordinary
+edge deadline resumes as soon as progress recovers to the starting position. The software phase-
 current guard trips above 1,344 counts (134.4 A) on A, B, or reconstructed C,
 preserving about a 1.49-times margin over commanded phase
-current. The local 39 V undervoltage debounce can only reduce the
-battery-current envelope. The bus voltage is checked on every 1 ms ride pass
+current. Voltage and temperature limits are re-evaluated every 50 ms. An
+evaluation without usable data (analog data not ready, or the motor
+thermistor out of range) keeps the last valid limits and reports
+derating-reason bit `0x40`; the third consecutive one withdraws ride
+authority until valid data returns, and the ride then re-arms from throttle
+rest. The local 39 V undervoltage debounce can only reduce the
+battery-current envelope; once asserted it zeroes the envelope immediately,
+including over held limits. The bus voltage is checked on every 1 ms ride pass
 but counted only on fresh 10 ms analog conversions, so one noisy conversion
 cannot trip it. Three consecutive conversions above 58 V (30 ms) revoke ride
 authority and report derating-reason bit `0x08`; it clears only after the bus
@@ -307,11 +345,15 @@ mask and safety-event count. Page 13 retains peak phase current from boot;
 its direct-current maximum restarts after each successful fault
 acknowledgement. Page 14 reports field-weakening active/at-limit/voltage-limit
 flags, target d current, and requested dq voltage.
+Page 10 byte 1 bits 4--6 carry the ride stage: 0 disarmed (needs throttle
+rest), 1 ready, 2 awaiting the first Hall edge, 3 startup tracking, 4
+tracking, 5 energized zero-current coast, 6 brake hold, and 7 Hall recovery.
+Stages 6 and 7 are armed but never energize the motor.
 Page 12 also retains the specific cause of the latest safety loss. Pages 19
 and 20 report observer configuration/readiness/activity, blend,
 confidence, angle-coordinate eRPM, Hall disagreement, flux magnitude, q-axis
 back-EMF, PLL error, and external-validity travel. Page 18 carries telemetry
-schema 15 and the crate version. Page 19 supplies readiness, confidence, and
+schema 16 and the crate version. Page 19 supplies readiness, confidence, and
 observer eRPM, while page 20 supplies the full PLL error and external-validity
 progress.
 Pages 22 and 23 report the RCC reset cause and, after a watchdog reset, the
@@ -336,7 +378,7 @@ therefore appears as 510 to this legacy layout; derating-reason bit `0x04`
 distinguishes the exhausted continuous-recovery state, whose 431-count limit
 remains exact. Bit `0x08` reports an active bus overvoltage cutoff. Page 11 bytes 1--2 report how many milliseconds of equivalent
 full-transient excess remain. Firmware-version page 18 reports telemetry
-schema 15.
+schema 16.
 
 An updater request is one-shot. It is accepted only with no local command,
 motor channels disabled, at least 500 ms without a motor Hall edge, and the PB4

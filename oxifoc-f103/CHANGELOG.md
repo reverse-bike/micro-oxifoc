@@ -6,6 +6,61 @@ Before every real `flash-f103 --yes` invocation, make exactly one appropriate
 bump and add an entry here. Validation builds and rebuilding an unchanged image
 do not create a new version.
 
+## 0.12.0 - 2026-10-14
+
+Changes:
+
+- Releasing the brake no longer requires a throttle reset. Brake still removes
+  torque immediately and keeps the energized zero-current coast above the
+  entry speed. At or below it, during startup, or before a run, the ride stays
+  armed with the outputs off; release returns to ready, or with demand present
+  straight into a fresh startup sequence. A Hall timeout while braking holds
+  instead of disarming. A fault or non-Hall safety loss during braking still
+  requires throttle rest, and a rest sample seen while braking arms the release.
+- Re-arming needs only throttle rest; active cadence no longer blocks it.
+  Boot still requires one valid throttle rest sample.
+- A safety loss caused only by the Hall (capture sequence, transition, or
+  stationary mismatch, or a lone Hall-capture fault) re-arms without throttle
+  rest once the Hall has stayed valid for 250 ms with the output off, at most
+  twice per throttle press. A retry is spent only when it starts a run, not
+  while the brake or the entry speed holds it. A lone Hall-capture fault is
+  acknowledged without rest for that retry.
+- A fault acknowledgement carries the fault mask its ride pass observed and
+  clears the latches only while they still hold exactly that mask, so a fault
+  latched between the observation and the acknowledgement stays latched. The
+  calibration image acknowledges the mask latched when its stop command is
+  processed.
+- Page 10 reports brake hold as ride stage 6 and Hall recovery as stage 7
+  instead of 0; neither energizes the motor. Project telemetry moves to
+  schema 16.
+- Hall chatter at standstill is tolerated. TIM2 publishes two pending captures
+  as one edge at the live Hall state and an overcapture as a sequence gap
+  instead of latching a Hall-capture fault. The control pass resynchronises a
+  sequence gap to the live state while undriven or below the 500 eRPM
+  center-snap speed. Below that speed a return into the previous sector within
+  1 ms is chatter: no fault, sector-center hold, net-zero progress, and no
+  renewal of ride Hall deadlines. A repeated raw state no longer adds Hall
+  progress. Invalid raw states and stale estimates remain faults.
+- The absolute startup deadline for twelve net-forward transitions is 3.5 s
+  instead of 2 s. A run without a first Hall edge is still cut after 2 s, now
+  by its own first-edge limit, so a stalled motor or dead Hall sensor is not
+  energized for the longer startup window. After the first edge, the next edge
+  must arrive within 500 ms as before.
+- The maximum ride-entry speed is 3,000 eRPM instead of 2,500, equal to the
+  observer blend start.
+- A single missing 50 ms environment evaluation (analog data not ready or the
+  motor thermistor out of range) keeps the last valid limits; the third
+  consecutive one withdraws ride authority. An undervoltage assertion zeroes
+  the envelope immediately, also over held limits, and is reported with them.
+  Voltage and thermal limits are unchanged.
+
+Reason: the rider sometimes had no power at a stop until the throttle was
+released, and sometimes lost power in motion. Brake release, pedaling, Hall
+chatter, and single missing sensor readings each sent the ride to the fully
+disarmed state, which required throttle rest. These changes keep the existing
+protections that only remove torque and stop treating those interruptions as
+faults that need a throttle reset.
+
 ## 0.11.0 - 2026-10-14
 
 Changes:

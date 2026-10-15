@@ -185,7 +185,9 @@ impl CalibrationApp {
                 }
                 self.armed = false;
                 if local_ready {
-                    let _ = peripherals::acknowledge_faults();
+                    // A stop command acknowledges every fault latched when it
+                    // is processed.
+                    let _ = peripherals::acknowledge_faults(peripherals::fault_flags());
                 }
             }
             Command::Arm {

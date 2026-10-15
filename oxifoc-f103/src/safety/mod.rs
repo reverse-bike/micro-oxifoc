@@ -18,6 +18,40 @@ pub mod fault_flag {
     /// Telemetry-only: repeated power-stage faults stopped acknowledgement
     /// until the next reset.
     pub const RETRY_LOCKOUT: u32 = 1 << 7;
+
+    /// Latched faults are cleared only when the live mask is exactly the mask
+    /// the caller observed and chose to acknowledge, so a fault latched after
+    /// that observation stays latched until it has been observed.
+    pub const fn acknowledgement_permitted(live: u32, expected: u32) -> bool {
+        live == expected
+    }
+}
+
+/// Cause of the latest safety loss, reported on project telemetry page 12.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SafetyLossReason {
+    #[default]
+    None = 0,
+    ControlTiming = 1,
+    CurrentSample = 2,
+    PhaseOvercurrent = 3,
+    HallCaptureSequence = 4,
+    HallTransition = 5,
+    HallStationaryMismatch = 6,
+    PhaseEstimate = 7,
+    HardwareFault = 8,
+    OutputLease = 9,
+    PwmOutput = 10,
+}
+
+impl SafetyLossReason {
+    /// Losses caused only by Hall capture or Hall-state plausibility.
+    pub const fn is_hall(reason: u8) -> bool {
+        reason == Self::HallCaptureSequence as u8
+            || reason == Self::HallTransition as u8
+            || reason == Self::HallStationaryMismatch as u8
+    }
 }
 
 pub mod fatal_reason {
@@ -243,6 +277,24 @@ pub use runtime::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faults_are_acknowledged_only_as_the_observed_mask() {
+        use fault_flag::{
+            CONTROL_TIMING, HALL_CAPTURE, HARDWARE_BREAK, PWM_RANGE, acknowledgement_permitted,
+        };
+        assert!(acknowledgement_permitted(HALL_CAPTURE, HALL_CAPTURE));
+        assert!(acknowledgement_permitted(
+            HALL_CAPTURE | CONTROL_TIMING,
+            HALL_CAPTURE | CONTROL_TIMING
+        ));
+        assert!(!acknowledgement_permitted(
+            HALL_CAPTURE | HARDWARE_BREAK,
+            HALL_CAPTURE
+        ));
+        assert!(!acknowledgement_permitted(PWM_RANGE, HALL_CAPTURE));
+        assert!(!acknowledgement_permitted(HALL_CAPTURE, 0));
+    }
 
     #[test]
     fn reset_flags_are_compacted_without_losing_a_cause() {

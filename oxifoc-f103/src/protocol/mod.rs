@@ -142,7 +142,7 @@ pub const fn next_project_telemetry_page(page: u8) -> u8 {
     if page >= 14 { 0 } else { page + 1 }
 }
 
-pub const PROJECT_TELEMETRY_SCHEMA: u8 = 15;
+pub const PROJECT_TELEMETRY_SCHEMA: u8 = 16;
 
 fn controller_status(snapshot: StockTelemetry) -> Frame {
     let faults = stock_fault_word(snapshot).to_le_bytes();
@@ -391,7 +391,8 @@ pub fn control_timing_telemetry(snapshot: ControlTimingTelemetry) -> Frame {
 }
 
 /// Page 10: instantaneous current-loop demand and response. The ride stage is
-/// packed into the upper flag nibble and therefore remains limited to 0--7.
+/// packed into flag bits 4--6 and therefore remains limited to 0--7; every
+/// value is used.
 pub fn control_live_telemetry(snapshot: ControlLiveTelemetry) -> Frame {
     let flags = u8::from(snapshot.hall_valid)
         | (u8::from(snapshot.current_valid) << 1)
@@ -895,6 +896,14 @@ mod tests {
             control_live_telemetry(live).data,
             [10, 0x4f, 0xba, 0xfc, 0xef, 0xff, 0xdf, 0xfc]
         );
+
+        for stage in [6, 7] {
+            let held = ControlLiveTelemetry {
+                ride_stage: stage,
+                ..live
+            };
+            assert_eq!(control_live_telemetry(held).data[1], 0x0f | (stage << 4));
+        }
 
         let output = ControlOutputTelemetry {
             transient_budget_ms: 0x1234,

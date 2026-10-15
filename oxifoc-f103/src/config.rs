@@ -99,6 +99,10 @@ pub struct SensorConfig {
     /// Sustained out-of-tolerance undriven samples for this long invalidate
     /// current sensing until they have decayed for the same duration.
     pub current_offset_fault_milliseconds: u32,
+    /// Consecutive 50 ms environment evaluations without usable bus-voltage
+    /// or motor-temperature data before ride authority is removed. Shorter
+    /// gaps keep the last valid voltage and thermal limits.
+    pub local_data_missing_evaluations: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,12 +173,30 @@ pub struct ThermalConfig {
 pub struct RideConfig {
     pub command_lease_milliseconds: u32,
     pub brake_debounce_milliseconds: u8,
+    /// Longest a run may stay energized waiting for its first Hall edge. The
+    /// seeded sector commutates the start, and the wait covers a hill-start
+    /// rollback that reverses within that sector, where no edge occurs.
     pub startup_first_hall_timeout_milliseconds: u32,
+    /// After the first Hall edge, the next one must arrive within this long
+    /// while net startup progress is not negative; later edges use the
+    /// running Hall timeout.
+    pub startup_second_hall_timeout_milliseconds: u32,
+    /// Absolute deadline from the start of a run to reach
+    /// `startup_forward_hall_transitions` net forward Hall transitions.
     pub startup_timeout_milliseconds: u32,
     pub startup_forward_hall_transitions: i32,
     pub minimum_running_hall_timeout_milliseconds: u32,
     pub maximum_running_hall_timeout_milliseconds: u32,
+    /// Fastest Hall speed at which a run may start; above it, a run without
+    /// demand coasts energized at zero current. It never exceeds the observer
+    /// blend start, so every start commutates on Hall alone.
     pub maximum_entry_electrical_rpm: u32,
+    /// After a ride stopped only by a Hall interruption, the Hall must stay
+    /// valid this long before arming again without a throttle rest sample.
+    pub hall_retry_quiet_milliseconds: u32,
+    /// Hall-interruption re-arms allowed without a throttle rest sample; a
+    /// valid rest sample restores the full allowance.
+    pub hall_retries_per_throttle_press: u8,
     /// Consecutive hardware-break, PWM-range, or phase-overcurrent faults
     /// without reaching normal tracking before acknowledgement stops until reset.
     pub consecutive_fault_limit: u8,
@@ -257,6 +279,7 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
         bus_voltage_nanovolts_per_adc_count: 18_530_273,
         current_offset_tolerance_milliamps: 12_800,
         current_offset_fault_milliseconds: 100,
+        local_data_missing_evaluations: 3,
     },
     inverter: InverterConfig {
         pwm_frequency_hz: 16_000,
@@ -305,12 +328,15 @@ pub const BIKE_CONFIG: BikeConfig = BikeConfig {
     ride: RideConfig {
         command_lease_milliseconds: 10,
         brake_debounce_milliseconds: 4,
-        startup_first_hall_timeout_milliseconds: 500,
-        startup_timeout_milliseconds: 2_000,
+        startup_first_hall_timeout_milliseconds: 2_000,
+        startup_second_hall_timeout_milliseconds: 500,
+        startup_timeout_milliseconds: 3_500,
         startup_forward_hall_transitions: 12,
         minimum_running_hall_timeout_milliseconds: 100,
         maximum_running_hall_timeout_milliseconds: 500,
-        maximum_entry_electrical_rpm: 2_500,
+        maximum_entry_electrical_rpm: 3_000,
+        hall_retry_quiet_milliseconds: 250,
+        hall_retries_per_throttle_press: 2,
         consecutive_fault_limit: 3,
     },
     throttle: ThrottleConfig {
@@ -749,6 +775,24 @@ const _: () = assert!(
         > BIKE_CONFIG.battery.minimum_bus_voltage_millivolts
 );
 const _: () = assert!(BIKE_CONFIG.ride.consecutive_fault_limit > 0);
+const _: () = assert!(BIKE_CONFIG.ride.hall_retry_quiet_milliseconds > 0);
+const _: () = assert!(
+    BIKE_CONFIG.ride.maximum_entry_electrical_rpm
+        <= BIKE_CONFIG.observer.blend_start_electrical_rpm as u32
+);
+const _: () = assert!(BIKE_CONFIG.ride.startup_first_hall_timeout_milliseconds > 0);
+const _: () = assert!(
+    BIKE_CONFIG.ride.startup_first_hall_timeout_milliseconds
+        <= BIKE_CONFIG.ride.startup_timeout_milliseconds
+);
+const _: () = assert!(
+    BIKE_CONFIG.ride.startup_second_hall_timeout_milliseconds
+        >= BIKE_CONFIG.ride.minimum_running_hall_timeout_milliseconds
+);
+const _: () = assert!(
+    BIKE_CONFIG.ride.startup_second_hall_timeout_milliseconds
+        < BIKE_CONFIG.ride.startup_timeout_milliseconds
+);
 const _: () = assert!(
     BIKE_CONFIG.thermal.controller_derate_start_celsius
         < BIKE_CONFIG.thermal.controller_stop_celsius

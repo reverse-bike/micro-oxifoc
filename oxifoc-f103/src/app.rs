@@ -180,6 +180,8 @@ impl RideApp {
             current_valid: control.current_valid,
             fault_flags: control.fault_flags,
             safety_events: control.safety_events,
+            last_safety_loss_reason: control.last_safety_loss_reason,
+            output_active: control.output_active,
             phase_current_trips: control.phase_current_trips,
             hall_sequence: control.hall_sequence,
             hall_progress: control.hall_progress,
@@ -198,7 +200,9 @@ impl RideApp {
             );
         } else {
             foc::revoke_ride_authority();
-            if command.acknowledge_faults && peripherals::acknowledge_faults() {
+            if command.acknowledge_fault_mask != 0
+                && peripherals::acknowledge_faults(command.acknowledge_fault_mask)
+            {
                 foc::begin_fault_diagnostic_episode();
             }
         }
